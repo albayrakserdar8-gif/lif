@@ -52,11 +52,17 @@ pub fn key(k: Key, mods: Mods) -> InputEvent {
 }
 
 pub fn keyt(k: Key, mods: Mods, text: &str) -> InputEvent {
-    InputEvent::Key(KeyEvent { key: k, mods, action: KeyAction::Press, text: text.into() })
+    InputEvent::Key(KeyEvent { text: text.into(), ..KeyEvent::new(k, mods) })
 }
 
 pub fn keya(k: Key, mods: Mods, action: KeyAction, text: &str) -> InputEvent {
-    InputEvent::Key(KeyEvent { key: k, mods, action, text: text.into() })
+    InputEvent::Key(KeyEvent { action, text: text.into(), ..KeyEvent::new(k, mods) })
+}
+
+/// `e` (a key event) with kitty alternate keys.
+pub fn alts(e: InputEvent, shifted: Option<char>, base_layout: Option<char>) -> InputEvent {
+    let InputEvent::Key(k) = e else { panic!("not a key: {e:?}") };
+    InputEvent::Key(KeyEvent { shifted, base_layout, ..k })
 }
 
 /// A plain typed character.

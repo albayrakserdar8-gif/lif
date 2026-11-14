@@ -384,8 +384,8 @@ fn scrolling_narrow_pane_with_lr_margins() {
     }
     for lr in [false, true] {
         let mut f = f.clone();
-        let mut r = Renderer::new(full_caps());
-        r.set_lr_margins(lr);
+        let caps = OuterCaps { lr_margins: lr, ..full_caps() };
+        let mut r = Renderer::new(caps);
         let mut vt = Vt::new(21, 6);
         let run = |f: &PaneFrame, r: &mut Renderer, vt: &mut Vt| {
             let panes = [
@@ -1032,6 +1032,7 @@ fn rand_caps(rng: &mut Rng) -> OuterCaps {
         hyperlinks: rng.chance(0.5),
         overline: rng.chance(0.5),
         grapheme_clusters: rng.chance(0.3),
+        lr_margins: rng.chance(0.5),
         ..OuterCaps::default()
     }
 }
@@ -1052,8 +1053,7 @@ fn run_seed(seed: u64, steps: usize) -> (usize, usize) {
     let mut clients: Vec<Client> = (0..2)
         .map(|i| {
             let caps = rand_caps(&mut w.rng);
-            let mut r = Renderer::new(caps);
-            r.set_lr_margins(w.rng.chance(0.5));
+            let r = Renderer::new(caps);
             Client {
                 r,
                 vt: Vt::new(w.cols, w.rows),

@@ -29,6 +29,13 @@ pub struct OuterCaps {
     /// Grapheme-cluster width mode (2027).
     pub grapheme_clusters: bool,
     pub overline: bool,
+    /// Left and right margins (DECLRMM mode 69 / DECSLRM), which let a pane
+    /// narrower than the screen scroll in place.
+    pub lr_margins: bool,
+    /// In-band resize reports (mode 2048).
+    pub in_band_resize: bool,
+    /// Color-scheme change reports (mode 2031).
+    pub color_scheme_reports: bool,
 }
 
 impl Default for OuterCaps {
@@ -49,6 +56,9 @@ impl Default for OuterCaps {
             bracketed_paste: true,
             grapheme_clusters: false,
             overline: false,
+            lr_margins: false,
+            in_band_resize: false,
+            color_scheme_reports: false,
         }
     }
 }

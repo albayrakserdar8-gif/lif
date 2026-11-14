@@ -1,6 +1,6 @@
 //! Key tables shared by the legacy, xterm and kitty decoders.
 
-use lif_types::{Key, KeyAction, KeyEvent, KeypadKey, Mods};
+use lif_types::{Key, KeyAction, KeyEvent, KeypadKey, MediaKey, ModifierKey, Mods};
 
 use crate::InputEvent;
 
@@ -39,30 +39,30 @@ impl Text {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Kind {
-    Key(Key),
-    Other(u32),
-}
-
 /// A decoded key before it becomes an [`InputEvent`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct K {
-    pub kind: Kind,
+    pub key: Key,
     pub mods: Mods,
     pub action: KeyAction,
     pub text: Text,
+    /// Kitty alternate keys, see [`KeyEvent::shifted`] / [`KeyEvent::base_layout`].
+    pub shifted: Option<char>,
+    pub base_layout: Option<char>,
 }
 
 impl K {
     pub fn new(key: Key, mods: Mods) -> K {
-        K { kind: Kind::Key(key), mods, action: KeyAction::Press, text: Text::EMPTY }
+        K { key, mods, action: KeyAction::Press, text: Text::EMPTY, shifted: None, base_layout: None }
     }
 
     /// A key that types `c` (text implied).
     pub fn typed(c: char) -> K {
-        let text = if c.is_control() { Text::EMPTY } else { Text::of(c) };
-        K { kind: Kind::Key(Key::Char(c)), mods: Mods::NONE, action: KeyAction::Press, text }
+        let mut k = K::new(Key::Char(c), Mods::NONE);
+        if !c.is_control() {
+            k.text = Text::of(c);
+        }
+        k
     }
 
     /// The ESC-prefixed (legacy Alt) form of this key.
@@ -73,15 +73,14 @@ impl K {
     }
 
     pub fn into_event(self) -> InputEvent {
-        match self.kind {
-            Kind::Key(key) => InputEvent::Key(KeyEvent {
-                key,
-                mods: self.mods,
-                action: self.action,
-                text: if self.text.is_empty() { String::new() } else { String::from(self.text.as_str()) },
-            }),
-            Kind::Other(code) => InputEvent::OtherKey { code, mods: self.mods, action: self.action },
-        }
+        InputEvent::Key(KeyEvent {
+            key: self.key,
+            mods: self.mods,
+            action: self.action,
+            text: if self.text.is_empty() { String::new() } else { String::from(self.text.as_str()) },
+            shifted: self.shifted,
+            base_layout: self.base_layout,
+        })
     }
 }
 
@@ -125,8 +124,9 @@ pub(crate) fn action_param(p: u32) -> KeyAction {
     }
 }
 
-/// Kitty / fixterms / modifyOtherKeys key number to a key.
-pub(crate) fn code_key(code: u32) -> Option<Kind> {
+/// Kitty / fixterms / modifyOtherKeys key number to a key. `None` for
+/// control codes and for private-use codes kitty does not assign.
+pub(crate) fn code_key(code: u32) -> Option<Key> {
     use KeypadKey as P;
     let k = match code {
         9 => Key::Tab,
@@ -160,11 +160,15 @@ pub(crate) fn code_key(code: u32) -> Option<Kind> {
         57425 => Key::Keypad(P::Insert),
         57426 => Key::Keypad(P::Delete),
         57427 => Key::Keypad(P::Begin),
-        0xe000..=0xf8ff => return Some(Kind::Other(code)),
+        57428..=57440 => Key::Media(MediaKey::from_kitty_code(code)?),
+        57441..=57454 => Key::Modifier(ModifierKey::from_kitty_code(code)?),
+        // The rest of kitty's functional-key block: not a key we know, and
+        // not a character either.
+        0xe000..=0xf8ff => return None,
         0..=31 => return None,
         _ => Key::Char(char::from_u32(code)?),
     };
-    Some(Kind::Key(k))
+    Some(k)
 }
 
 /// Number of a `CSI n ~` key.
@@ -248,8 +252,8 @@ pub(crate) fn implied_text(k: &K, shifted: Option<char>, caps: bool) -> Text {
         return Text::EMPTY;
     }
     let shift = k.mods.contains(Mods::SHIFT);
-    match k.kind {
-        Kind::Key(Key::Char(c)) if !c.is_control() => {
+    match k.key {
+        Key::Char(c) if !c.is_control() => {
             let t = if shift {
                 shifted.unwrap_or_else(|| upper(c))
             } else if caps {
@@ -259,7 +263,7 @@ pub(crate) fn implied_text(k: &K, shifted: Option<char>, caps: bool) -> Text {
             };
             Text::of(t)
         }
-        Kind::Key(Key::Keypad(p)) if !shift => keypad_text(p).map(Text::of).unwrap_or(Text::EMPTY),
+        Key::Keypad(p) if !shift => keypad_text(p).map(Text::of).unwrap_or(Text::EMPTY),
         _ => Text::EMPTY,
     }
 }

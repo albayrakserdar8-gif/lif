@@ -28,9 +28,10 @@ impl KeyCode {
     }
 
     /// The binding key for an input event, or `None` for events that can never
-    /// match a binding (key releases, Super/Hyper chords).
+    /// match a binding (key releases, Super/Hyper chords, and the kitty-only
+    /// media and lone modifier keys, which tmux has no names for).
     pub fn from_event(ev: &KeyEvent) -> Option<KeyCode> {
-        if ev.action == KeyAction::Release {
+        if ev.action == KeyAction::Release || matches!(ev.key, Key::Media(_) | Key::Modifier(_)) {
             return None;
         }
         if ev.mods.contains(Mods::SUPER) || ev.mods.contains(Mods::HYPER) {
@@ -155,6 +156,8 @@ impl KeyCode {
             Key::PrintScreen => special(83),
             Key::Pause => special(84),
             Key::Menu => special(85),
+            Key::Media(m) => special(100 + u64::from(m.kitty_code())),
+            Key::Modifier(m) => special(100 + u64::from(m.kitty_code())),
         };
         (m, base)
     }
@@ -366,6 +369,10 @@ impl fmt::Display for KeyCode {
             Key::PrintScreen => "PrintScreen",
             Key::Pause => "Pause",
             Key::Menu => "Menu",
+            // Never produced by `parse` or `from_event`; a readable name
+            // for a code built by hand.
+            Key::Media(m) => return write!(f, "{m:?}"),
+            Key::Modifier(m) => return write!(f, "{m:?}"),
         };
         f.write_str(name)
     }

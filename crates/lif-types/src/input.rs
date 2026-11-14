@@ -57,6 +57,108 @@ pub enum Key {
     PrintScreen,
     Pause,
     Menu,
+    /// Media and volume keys (kitty protocol only).
+    Media(MediaKey),
+    /// A modifier pressed or released on its own (kitty protocol with
+    /// "report all keys as escape codes" only). `mods` is kept exactly as the
+    /// outer terminal reported it (kitty sets the key's own bit on press).
+    Modifier(ModifierKey),
+}
+
+/// Media keys of the kitty keyboard protocol, which numbers them 57428..=57440.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MediaKey {
+    Play,
+    Pause,
+    PlayPause,
+    Reverse,
+    Stop,
+    FastForward,
+    Rewind,
+    TrackNext,
+    TrackPrevious,
+    Record,
+    LowerVolume,
+    RaiseVolume,
+    MuteVolume,
+}
+
+impl MediaKey {
+    const ALL: [MediaKey; 13] = [
+        MediaKey::Play,
+        MediaKey::Pause,
+        MediaKey::PlayPause,
+        MediaKey::Reverse,
+        MediaKey::Stop,
+        MediaKey::FastForward,
+        MediaKey::Rewind,
+        MediaKey::TrackNext,
+        MediaKey::TrackPrevious,
+        MediaKey::Record,
+        MediaKey::LowerVolume,
+        MediaKey::RaiseVolume,
+        MediaKey::MuteVolume,
+    ];
+    const FIRST: u32 = 57428;
+
+    /// The kitty functional key number.
+    pub const fn kitty_code(self) -> u32 {
+        Self::FIRST + self as u32
+    }
+
+    pub fn from_kitty_code(code: u32) -> Option<MediaKey> {
+        Self::ALL.get(code.checked_sub(Self::FIRST)? as usize).copied()
+    }
+}
+
+/// Modifier keys of the kitty keyboard protocol, which numbers them
+/// 57441..=57454. Super is the Command / Windows key; Hyper and Meta are the
+/// X11 modifiers of those names; the ISO level shifts are AltGr-like keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModifierKey {
+    LeftShift,
+    LeftControl,
+    LeftAlt,
+    LeftSuper,
+    LeftHyper,
+    LeftMeta,
+    RightShift,
+    RightControl,
+    RightAlt,
+    RightSuper,
+    RightHyper,
+    RightMeta,
+    IsoLevel3Shift,
+    IsoLevel5Shift,
+}
+
+impl ModifierKey {
+    const ALL: [ModifierKey; 14] = [
+        ModifierKey::LeftShift,
+        ModifierKey::LeftControl,
+        ModifierKey::LeftAlt,
+        ModifierKey::LeftSuper,
+        ModifierKey::LeftHyper,
+        ModifierKey::LeftMeta,
+        ModifierKey::RightShift,
+        ModifierKey::RightControl,
+        ModifierKey::RightAlt,
+        ModifierKey::RightSuper,
+        ModifierKey::RightHyper,
+        ModifierKey::RightMeta,
+        ModifierKey::IsoLevel3Shift,
+        ModifierKey::IsoLevel5Shift,
+    ];
+    const FIRST: u32 = 57441;
+
+    /// The kitty functional key number.
+    pub const fn kitty_code(self) -> u32 {
+        Self::FIRST + self as u32
+    }
+
+    pub fn from_kitty_code(code: u32) -> Option<ModifierKey> {
+        Self::ALL.get(code.checked_sub(Self::FIRST)? as usize).copied()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -100,11 +202,21 @@ pub struct KeyEvent {
     /// The text the key produces with the current modifiers and layout, if
     /// any (e.g. `"A"` for Shift+a). Empty when unknown or none.
     pub text: String,
+    /// For a `Key::Char` pressed with Shift: the character the key produces
+    /// with Shift under the current layout (`'!'` for Shift+1 on a US
+    /// layout). Kitty "report alternate keys" (flag 4); `None` when the outer
+    /// terminal did not say.
+    pub shifted: Option<char>,
+    /// For a `Key::Char`: the key at the same position on the standard PC-101
+    /// (US) layout, when it differs from `key` (`'c'` for the Cyrillic `'с'`
+    /// key). Kitty "report alternate keys" (flag 4); `None` when the same or
+    /// unknown.
+    pub base_layout: Option<char>,
 }
 
 impl KeyEvent {
     pub fn new(key: Key, mods: Mods) -> Self {
-        Self { key, mods, action: KeyAction::Press, text: String::new() }
+        Self { key, mods, action: KeyAction::Press, text: String::new(), shifted: None, base_layout: None }
     }
 }
 

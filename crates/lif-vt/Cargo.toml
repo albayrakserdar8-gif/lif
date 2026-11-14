@@ -18,6 +18,10 @@ libghostty-vt = { workspace = true, optional = true }
 default = ["ghostty"]
 ghostty = ["dep:libghostty-vt"]
 
+[dev-dependencies]
+# Key round-trip tests start from the bytes an outer terminal sends.
+lif-input.workspace = true
+
 [[test]]
 name = "ghostty"
 required-features = ["ghostty"]

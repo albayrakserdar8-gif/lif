@@ -41,7 +41,10 @@ use libghostty_vt::terminal::{CompressionActivity, CompressionMode, CompressionR
 use libghostty_vt::{RenderState, Terminal, key, mouse};
 use lif_types::{KeyEvent, MouseEvent, PaneFrame, PixelSize, Size};
 
-use crate::{PaneModes, Scroll, TextRange, VtEngine, VtError, VtEvent, VtMemory, VtOptions};
+use crate::{
+    FALLBACK_BACKGROUND, FALLBACK_FOREGROUND, PaneModes, Rgb, Scroll, TextRange, VtEngine, VtError, VtEvent, VtMemory,
+    VtOptions,
+};
 
 use frame::{FrameScratch, Links};
 use osc::{OscEvent, OscWatch};
@@ -238,6 +241,23 @@ impl GhosttyVt {
         }
     }
 
+    fn apply_default_colors(
+        &mut self,
+        fg: Option<Rgb>,
+        bg: Option<Rgb>,
+        cursor: Option<Rgb>,
+    ) -> Result<(), libghostty_vt::Error> {
+        // libghostty leaves OSC 10 / 11 / 12 queries unanswered while a color
+        // is unset, and programs would then wait for a timeout.
+        let rgb = |(r, g, b): Rgb| libghostty_vt::color::Rgb { r, g, b };
+        let fg = fg.unwrap_or(FALLBACK_FOREGROUND);
+        self.term
+            .set_default_fg_color(Some(rgb(fg)))?
+            .set_default_bg_color(Some(rgb(bg.unwrap_or(FALLBACK_BACKGROUND))))?
+            .set_default_cursor_color(Some(rgb(cursor.unwrap_or(fg))))?;
+        Ok(())
+    }
+
     fn mode(&self, m: Mode) -> bool {
         self.term.mode(m).unwrap_or(false)
     }
@@ -296,6 +316,7 @@ impl VtEngine for GhosttyVt {
             compacted_at: None,
         };
         vt.install_effects().map_err(engine_err)?;
+        vt.apply_default_colors(opts.default_fg, opts.default_bg, opts.default_cursor).map_err(engine_err)?;
         Ok(vt)
     }
 
@@ -445,6 +466,11 @@ impl VtEngine for GhosttyVt {
         out.push(b';');
         osc::base64_encode(data, out);
         out.extend_from_slice(b"\x1b\\");
+    }
+
+    fn set_default_colors(&mut self, fg: Option<Rgb>, bg: Option<Rgb>, cursor: Option<Rgb>) {
+        // Only fails on allocation failure, and then the old colors stay.
+        let _ = self.apply_default_colors(fg, bg, cursor);
     }
 
     fn scroll(&mut self, to: Scroll) {

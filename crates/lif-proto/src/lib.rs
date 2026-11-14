@@ -33,6 +33,28 @@
 //! 5. Optional behavior is negotiated through [`Caps`], never by comparing
 //!    version numbers. `PROTOCOL_VERSION` only changes if the framing itself
 //!    changes.
+//!
+//! # Details the rules leave open
+//!
+//! - `ClientMsg::encode` / `ServerMsg::encode` return a `Result`: a
+//!   message whose payload would exceed `MAX_PAYLOAD` is
+//!   `ProtoError::TooLarge`, and an `Unknown` message (it only describes a
+//!   frame that was skipped) is `ProtoError::NotEncodable`. On error nothing
+//!   is appended.
+//! - An `ExitReason` byte this build does not know decodes as
+//!   `ExitReason::Error` rather than failing: the client only needs to know
+//!   the attachment is over, and the message says why.
+//! - `Size` and `PixelSize` each count as one field for rule 3: missing
+//!   entirely they decode to zero, but a payload that ends after `cols` (or
+//!   `width`) is an error. Rule 3 applies to top-level fields only; an
+//!   element of a `Vec` (e.g. one `env` pair) cut short is always an error.
+//! - A `bool` byte other than 0 or 1 is an error (`ProtoError::InvalidValue`).
+//! - Terminal data longer than one frame can hold (`MAX_BYTES_CHUNK`) is
+//!   sent as several consecutive `Input` / `Output` frames by
+//!   [`encode_input`] / [`encode_output`]; frame boundaries carry no
+//!   meaning and the receiver just writes the chunks in order. Encoding one
+//!   oversized `ClientMsg::Input` / `ServerMsg::Output` message directly
+//!   fails with `TooLarge` instead.
 #![forbid(unsafe_code)]
 
 mod codec;

@@ -160,16 +160,23 @@ pub struct Cursor {
 
 /// The visible contents of one pane, in engine-neutral form.
 ///
-/// A frame is owned by whoever renders the pane and is updated in place by
+/// A pane has exactly one frame, owned by the server and updated in place by
 /// `VtEngine::refresh`, which rewrites only the rows that changed and sets
-/// their `dirty` flag. The renderer clears the flags once it has emitted them.
+/// their `dirty` flag (it never clears one). Every client showing the pane
+/// reads the same frame, so no renderer may clear the flags. Each frame tick:
+///
+/// 1. the server refreshes every pane's frame once;
+/// 2. every client's renderer either renders the frame or skips it (a client
+///    that cannot take output now remembers the dirty rows itself), reading
+///    the flags only;
+/// 3. the server clears the flags (`PaneFrame::clear_dirty`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PaneFrame {
     pub size: Size,
     /// Exactly `size.rows` rows.
     pub rows: Vec<FrameRow>,
     /// Exactly `size.rows` flags; `dirty[y]` means row `y` changed since the
-    /// renderer last cleared it.
+    /// server last cleared the flags (the end of the previous frame tick).
     pub dirty: Vec<bool>,
     pub cursor: Cursor,
 }

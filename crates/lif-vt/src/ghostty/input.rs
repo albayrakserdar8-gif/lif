@@ -1,7 +1,9 @@
 //! lif input events -> libghostty key / mouse encoders.
 
 use libghostty_vt::Terminal;
-use libghostty_vt::key::{self, Action, Key as GKey, Mods as GMods, OptionAsAlt};
+use std::io::Write;
+
+use libghostty_vt::key::{self, Action, Key as GKey, KittyKeyFlags, Mods as GMods, OptionAsAlt};
 use libghostty_vt::mouse::{self, Button, EncoderSize, Position};
 use lif_types::{
     Key, KeyAction, KeyEvent, KeypadKey, Mods, MouseAction, MouseButton, MouseEvent, Size,
@@ -94,6 +96,37 @@ fn function_key(n: u8) -> Option<GKey> {
     F.get((n as usize).checked_sub(1)?).copied()
 }
 
+/// Media and modifier keys. libghostty's kitty table has no media keys and
+/// lacks Hyper, Meta and the ISO level shifts, so all of them are encoded
+/// here, by the rules libghostty applies to the functional keys it knows:
+/// nothing without kitty flags (there is no legacy encoding), releases only
+/// with "report event types", lone modifiers only with "report all keys as
+/// escape codes". `mods` is passed on as the outer terminal reported it.
+fn encode_kitty_functional(flags: KittyKeyFlags, code: u32, modifier: bool, k: &KeyEvent, out: &mut Vec<u8>) {
+    let events = flags.contains(KittyKeyFlags::REPORT_EVENTS);
+    if flags.is_empty()
+        || (k.action == KeyAction::Release && !events)
+        || (modifier && !flags.contains(KittyKeyFlags::REPORT_ALL))
+    {
+        return;
+    }
+    let mods = 1 + u32::from(k.mods.0 & 0x3f);
+    let event = match k.action {
+        _ if !events => 1,
+        KeyAction::Press => 1,
+        KeyAction::Repeat => 2,
+        KeyAction::Release => 3,
+    };
+    // Writing to a Vec cannot fail.
+    let _ = if event != 1 {
+        write!(out, "\x1b[{code};{mods}:{event}u")
+    } else if mods > 1 {
+        write!(out, "\x1b[{code};{mods}u")
+    } else {
+        write!(out, "\x1b[{code}u")
+    };
+}
+
 /// Text libghostty may use for a key: never a control character.
 fn usable_text(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_control() || ('\u{f700}'..='\u{f8ff}').contains(&c))
@@ -107,7 +140,10 @@ pub(super) fn encode_key(
     out: &mut Vec<u8>,
 ) {
     let (gkey, unshifted) = match k.key {
-        Key::Char(c) => (char_key(c), Some(c)),
+        // libghostty derives the kitty base-layout alternate from the
+        // physical key, so the base-layout key (when the outer terminal
+        // reported one) is the physical key.
+        Key::Char(c) => (char_key(k.base_layout.unwrap_or(c)), Some(c)),
         Key::Enter => (GKey::Enter, None),
         Key::Tab => (GKey::Tab, None),
         Key::Backspace => (GKey::Backspace, None),
@@ -133,13 +169,25 @@ pub(super) fn encode_key(
         Key::PrintScreen => (GKey::PrintScreen, None),
         Key::Pause => (GKey::Pause, None),
         Key::Menu => (GKey::ContextMenu, None),
+        Key::Media(m) => {
+            let flags = term.kitty_keyboard_flags().unwrap_or(KittyKeyFlags::DISABLED);
+            return encode_kitty_functional(flags, m.kitty_code(), false, k, out);
+        }
+        Key::Modifier(m) => {
+            let flags = term.kitty_keyboard_flags().unwrap_or(KittyKeyFlags::DISABLED);
+            return encode_kitty_functional(flags, m.kitty_code(), true, k, out);
+        }
     };
     let gm = mods(k.mods);
     // libghostty wants the layout text *before* Ctrl/Alt transforms; for a
-    // char key that is the reported text, or the char itself (shifted when
-    // Shift is held and the outer terminal did not say).
+    // char key that is the reported text, else the reported shifted key
+    // when Shift is held, else the char itself (uppercased under Shift). It
+    // also derives the kitty shifted-key alternate from this text.
+    let shifted = k.shifted.filter(|s| k.mods.contains(Mods::SHIFT) && !s.is_control());
     let text: Option<String> = if usable_text(&k.text) {
         Some(k.text.clone())
+    } else if let (Some(s), Some(_)) = (shifted, unshifted) {
+        Some(s.to_string())
     } else if let Some(c) = unshifted.filter(|c| !c.is_control()) {
         if k.mods.contains(Mods::SHIFT) && c.is_lowercase() {
             Some(c.to_uppercase().collect())

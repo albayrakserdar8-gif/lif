@@ -518,7 +518,7 @@ fn probe_from_replies() {
     let mut probe = CapsProbe::from_env("xterm-kitty", "truecolor", "");
     assert!(probe.caps().truecolor);
     assert!(!probe.caps().kitty_keyboard);
-    let replies: &[u8] = b"\x1b[?0u\x1b[?2026;2$y\x1b[?2027;0$y\x1b[?1016;2$y\x1b[?2031;2$y\x1b[?2048;2$y\
+    let replies: &[u8] = b"\x1b[?0u\x1b[?2026;2$y\x1b[?2027;0$y\x1b[?1016;2$y\x1b[?2031;2$y\x1b[?2048;2$y\x1b[?69;0$y\
         \x1bP>|kitty(0.39.1)\x1b\\\x1b]10;rgb:dddd/dddd/dddd\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\
         \x1b[6;20;10t\x1b[?62;52c";
     let mut p = InputParser::new();
@@ -535,7 +535,9 @@ fn probe_from_replies() {
     let c = probe.caps();
     assert!(c.kitty_keyboard && c.sync_output && c.sgr_pixel_mouse && c.osc52_write);
     assert!(!c.grapheme_clusters);
-    assert!(probe.in_band_resize() && probe.color_scheme_reports());
+    assert!(c.in_band_resize && c.color_scheme_reports);
+    // kitty does not implement DECLRMM.
+    assert!(!c.lr_margins);
     assert_eq!(probe.kitty_keyboard_flags(), Some(0));
     assert_eq!(probe.version(), Some("kitty(0.39.1)"));
     assert_eq!(probe.background(), Some(Rgb::new(0, 0, 0)));
@@ -547,4 +549,15 @@ fn probe_from_replies() {
     let mut probe = CapsProbe::from_env("xterm-256color", "", "Apple_Terminal");
     assert!(probe.apply(&TermResponse::PrimaryDa(vec![1, 2])));
     assert_eq!(probe.caps(), OuterCaps::default());
+
+    // xterm: DECLRMM known (reset), no in-band resize.
+    let mut probe = CapsProbe::from_env("xterm-256color", "", "");
+    let mut out = Vec::new();
+    InputParser::new().feed(b"\x1b[?69;2$y\x1b[?2048;0$y\x1b[?2031;0$y\x1b[?64;1;2c", &mut out);
+    for e in &out {
+        let InputEvent::Response(r) = e else { panic!("{e:?}") };
+        probe.apply(r);
+    }
+    let c = probe.caps();
+    assert!(probe.is_complete() && c.lr_margins && !c.in_band_resize && !c.color_scheme_reports);
 }

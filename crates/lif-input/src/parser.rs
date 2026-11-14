@@ -2,11 +2,11 @@
 
 use core::time::Duration;
 
-use lif_types::{Key, KeyAction, Mods, MouseAction, MouseButton, MouseEvent, PixelSize, Pos, Size};
+use lif_types::{Key, Mods, MouseAction, MouseButton, MouseEvent, PixelSize, Pos, Size};
 
 use crate::csi::{self, Csi, Scan};
 use crate::keys::{
-    K, Kind, Text, action_param, byte_key, caps_lock, code_key, implied_text, letter_key, mods_param, ss3_keypad,
+    K, Text, action_param, byte_key, caps_lock, code_key, implied_text, letter_key, mods_param, ss3_keypad,
     tilde_key,
 };
 use crate::strings::{self, StrKind};
@@ -750,8 +750,8 @@ fn tilde(c: &Csi) -> Tok {
             // xterm modifyOtherKeys: CSI 27 ; mods ; code ~
             let mp = c.param(1, 1);
             match code_key(c.param(2, 0)) {
-                Some(kind) => {
-                    let mut k = K { kind, mods: mods_param(mp), action: KeyAction::Press, text: Text::EMPTY };
+                Some(key) => {
+                    let mut k = K::new(key, mods_param(mp));
                     k.text = implied_text(&k, None, caps_lock(mp));
                     Tok::Key(k)
                 }
@@ -773,10 +773,11 @@ fn kitty(c: &Csi) -> Tok {
         return Tok::Unknown;
     }
     let code = c.sub(0, 0, 0);
-    let shifted = match c.sub(0, 1, 0) {
+    let alternate = |i| match c.sub(0, i, 0) {
         0 => None,
-        s => char::from_u32(s),
+        s => char::from_u32(s).filter(|ch| !ch.is_control()),
     };
+    let (shifted, base_layout) = (alternate(1), alternate(2));
     let mp = c.sub(1, 0, 1);
     let mut text = Text::EMPTY;
     for &cp in c.group(2) {
@@ -786,10 +787,10 @@ fn kitty(c: &Csi) -> Tok {
             text.push(ch);
         }
     }
-    let kind = if code == 0 {
+    let key = if code == 0 {
         // A pure text event (e.g. from an input method).
         match text.as_str().chars().next() {
-            Some(ch) => Kind::Key(Key::Char(ch)),
+            Some(ch) => Key::Char(ch),
             None => return Tok::Unknown,
         }
     } else {
@@ -798,7 +799,13 @@ fn kitty(c: &Csi) -> Tok {
             None => return Tok::Unknown,
         }
     };
-    let mut k = K { kind, mods: mods_param(mp), action: action_param(c.sub(1, 1, 1)), text };
+    let mut k = K::new(key, mods_param(mp));
+    k.action = action_param(c.sub(1, 1, 1));
+    k.text = text;
+    if let Key::Char(ch) = key {
+        k.shifted = shifted;
+        k.base_layout = base_layout.filter(|&b| b != ch);
+    }
     if k.text.is_empty() {
         k.text = implied_text(&k, shifted, caps_lock(mp));
     }

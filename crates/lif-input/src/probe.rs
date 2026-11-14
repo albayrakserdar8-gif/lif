@@ -11,8 +11,6 @@ pub struct CapsProbe {
     caps: OuterCaps,
     complete: bool,
     kitty_flags: Option<u32>,
-    in_band_resize: bool,
-    color_scheme_reports: bool,
     version: Option<String>,
     foreground: Option<Rgb>,
     background: Option<Rgb>,
@@ -38,8 +36,6 @@ impl CapsProbe {
             caps,
             complete: false,
             kitty_flags: None,
-            in_band_resize: false,
-            color_scheme_reports: false,
             version: None,
             foreground: None,
             background: None,
@@ -72,8 +68,9 @@ impl CapsProbe {
                     1006 => self.caps.sgr_mouse = on,
                     1004 => self.caps.focus_events = on,
                     2004 => self.caps.bracketed_paste = on,
-                    2031 => self.color_scheme_reports = on,
-                    2048 => self.in_band_resize = on,
+                    69 => self.caps.lr_margins = on,
+                    2031 => self.caps.color_scheme_reports = on,
+                    2048 => self.caps.in_band_resize = on,
                     _ => {}
                 }
             }
@@ -108,16 +105,6 @@ impl CapsProbe {
     /// The flags in effect when the terminal answered the kitty query.
     pub fn kitty_keyboard_flags(&self) -> Option<u32> {
         self.kitty_flags
-    }
-
-    /// Mode 2048 is supported; enable with [`crate::write_in_band_resize`].
-    pub fn in_band_resize(&self) -> bool {
-        self.in_band_resize
-    }
-
-    /// Mode 2031 is supported; enable with [`crate::write_color_scheme_reports`].
-    pub fn color_scheme_reports(&self) -> bool {
-        self.color_scheme_reports
     }
 
     /// XTVERSION answer, e.g. "kitty(0.39.1)".

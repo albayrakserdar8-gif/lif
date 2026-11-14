@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use lif_input::InputEvent;
-use lif_types::{Key, KeyAction as A, KeypadKey as P, Mods};
+use lif_types::{Key, KeyAction as A, KeypadKey as P, MediaKey, ModifierKey, Mods};
 
 const S: Mods = Mods::SHIFT;
 const AL: Mods = Mods::ALT;
@@ -207,10 +207,12 @@ fn kitty_protocol() {
         (b"\x1b[97u", keyt(Key::Char('a'), N, "a")),
         (b"\x1b[32u", keyt(Key::Char(' '), N, " ")),
         (b"\x1b[97;2u", keyt(Key::Char('a'), S, "A")),
-        (b"\x1b[97:65;2u", keyt(Key::Char('a'), S, "A")),
-        (b"\x1b[49:33;2u", keyt(Key::Char('1'), S, "!")),
-        (b"\x1b[97:65:97;2;65u", keyt(Key::Char('a'), S, "A")),
-        (b"\x1b[1092::97;1;1092u", keyt(Key::Char('ф'), N, "ф")),
+        (b"\x1b[97:65;2u", alts(keyt(Key::Char('a'), S, "A"), Some('A'), None)),
+        (b"\x1b[49:33;2u", alts(keyt(Key::Char('1'), S, "!"), Some('!'), None)),
+        // A base-layout key equal to the key itself carries no information.
+        (b"\x1b[97:65:97;2;65u", alts(keyt(Key::Char('a'), S, "A"), Some('A'), None)),
+        (b"\x1b[1092::97;1;1092u", alts(keyt(Key::Char('ф'), N, "ф"), None, Some('a'))),
+        (b"\x1b[1089:1057:99;6u", alts(key(Key::Char('с'), m(&[S, C])), Some('С'), Some('c'))),
         (b"\x1b[97;5u", key(Key::Char('a'), C)),
         (b"\x1b[97;3u", key(Key::Char('a'), AL)),
         (b"\x1b[97;9u", key(Key::Char('a'), Mods::SUPER)),
@@ -242,11 +244,17 @@ fn kitty_protocol() {
         (b"\x1b[57417u", key(Key::Keypad(P::Left), N)),
         (b"\x1b[57426u", key(Key::Keypad(P::Delete), N)),
         (b"\x1b[57427u", key(Key::Keypad(P::Begin), N)),
-        (b"\x1b[57428u", InputEvent::OtherKey { code: 57428, mods: N, action: A::Press }),
-        (b"\x1b[57440u", InputEvent::OtherKey { code: 57440, mods: N, action: A::Press }),
-        (b"\x1b[57441;2u", InputEvent::OtherKey { code: 57441, mods: S, action: A::Press }),
-        (b"\x1b[57442;1:3u", InputEvent::OtherKey { code: 57442, mods: N, action: A::Release }),
-        (b"\x1b[57454u", InputEvent::OtherKey { code: 57454, mods: N, action: A::Press }),
+        (b"\x1b[57428u", key(Key::Media(MediaKey::Play), N)),
+        (b"\x1b[57430;5u", key(Key::Media(MediaKey::PlayPause), C)),
+        (b"\x1b[57440u", key(Key::Media(MediaKey::MuteVolume), N)),
+        (b"\x1b[57441;2u", key(Key::Modifier(ModifierKey::LeftShift), S)),
+        (b"\x1b[57442;1:3u", keya(Key::Modifier(ModifierKey::LeftControl), N, A::Release, "")),
+        (b"\x1b[57446;33u", key(Key::Modifier(ModifierKey::LeftMeta), Mods::META)),
+        (b"\x1b[57453u", key(Key::Modifier(ModifierKey::IsoLevel3Shift), N)),
+        (b"\x1b[57454u", key(Key::Modifier(ModifierKey::IsoLevel5Shift), N)),
+        // Private-use codes kitty does not assign are no key.
+        (b"\x1b[57364u", InputEvent::Unknown(b"\x1b[57364u".to_vec())),
+        (b"\x1b[57455u", InputEvent::Unknown(b"\x1b[57455u".to_vec())),
         // Legacy-form functional keys with event types.
         (b"\x1b[1;5:3A", keya(Key::Up, C, A::Release, "")),
         (b"\x1b[1;1:2B", keya(Key::Down, N, A::Repeat, "")),

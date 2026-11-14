@@ -906,7 +906,6 @@ fn best_shift(dh: &[u64], mh: &[u64]) -> isize {
 pub struct Renderer {
     caps: OuterCaps,
     norm: Norm,
-    lr_margins: bool,
     scroll_opt: bool,
     full_pending: bool,
     layout_dirty: bool,
@@ -944,7 +943,6 @@ impl Renderer {
         Renderer {
             caps,
             norm: Norm::new(caps),
-            lr_margins: false,
             scroll_opt: true,
             full_pending: true,
             layout_dirty: true,
@@ -996,13 +994,6 @@ impl Renderer {
             self.o.caps = caps;
             self.full_pending = true;
         }
-    }
-
-    /// Whether the outer terminal supports DECLRMM/DECSLRM left and right
-    /// margins, which lets panes narrower than the screen scroll in place.
-    /// (`OuterCaps` has no such flag yet.)
-    pub fn set_lr_margins(&mut self, on: bool) {
-        self.lr_margins = on;
     }
 
     /// Scroll detection is on by default; off only for measurements.
@@ -1289,7 +1280,7 @@ impl Renderer {
             && (r.right() as usize) <= cols
             && !self.chrome.is_some_and(|c| c >= r.y && c < r.bottom())
             // DECSLRM needs left < right.
-            && ((r.x == 0 && r.cols as usize == cols) || (self.lr_margins && r.cols >= 2))
+            && ((r.x == 0 && r.cols as usize == cols) || (self.caps.lr_margins && r.cols >= 2))
     }
 
     /// Draw a pane whose rows mostly changed: compose all of it, look for

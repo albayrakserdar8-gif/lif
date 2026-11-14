@@ -23,6 +23,9 @@
 //!   with Shift. `text` is filled from the kitty text field when present and
 //!   otherwise implied for character / keypad keys pressed without
 //!   Ctrl/Alt/Super/Hyper/Meta.
+//! - Kitty alternate keys fill `KeyEvent::shifted` / `base_layout`; kitty's
+//!   media and modifier keys become `Key::Media` / `Key::Modifier`; codes in
+//!   kitty's private-use block that it does not assign are `Unknown`.
 //! - `CSI 29 ~` is Menu (foot, urxvt, VTE), not xterm's F16.
 //! - `CSI 1 ; m R`: see [`InputParser::expect_cursor_position`].
 //! - Mouse coordinates are converted to 0-based cells; SGR-pixel reports

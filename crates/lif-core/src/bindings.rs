@@ -3,7 +3,7 @@
 
 use crate::cmd::{CommandList, escape_arg, parse_string};
 use crate::keys::KeyCode;
-use lif_types::{KeyAction, KeyEvent};
+use lif_types::{Key, KeyAction, KeyEvent};
 use std::collections::{BTreeMap, HashMap};
 
 /// Name of the table keys are looked up in when no prefix is pending.
@@ -288,7 +288,10 @@ impl KeyState {
     ) -> KeyDecision {
         self.expire(now_ms);
         let Some(key) = KeyCode::from_event(ev) else {
-            if ev.action == KeyAction::Release && self.in_prefix() {
+            // Releases and lone modifiers (Shift on the way to `%`) belong to
+            // the key that follows the prefix, so they neither reach the pane
+            // nor end the prefix.
+            if (ev.action == KeyAction::Release || matches!(ev.key, Key::Modifier(_))) && self.in_prefix() {
                 return KeyDecision::Swallow;
             }
             return KeyDecision::SendToPane;
@@ -450,5 +453,28 @@ mod tests {
         assert!(b.unbind(ROOT_TABLE, &KeyCode::parse("M-h").unwrap()));
         assert!(!b.has_table(ROOT_TABLE));
         assert!(b.lookup(PREFIX_TABLE, &ev("c")).is_some());
+    }
+
+    #[test]
+    fn media_and_modifier_keys() {
+        use lif_types::{MediaKey, ModifierKey};
+        let b = KeyBindings::with_defaults();
+        let prefix = [KeyCode::parse("C-b").unwrap()];
+        let media = KeyEvent::new(Key::Media(MediaKey::PlayPause), Mods::NONE);
+        let shift = KeyEvent::new(Key::Modifier(ModifierKey::LeftShift), Mods::SHIFT);
+        assert_eq!(KeyCode::from_event(&media), None);
+        assert_eq!(KeyCode::from_event(&shift), None);
+        assert!(b.lookup(ROOT_TABLE, &media).is_none());
+        let mut s = KeyState::default();
+        assert_eq!(s.handle(&b, &prefix, 500, &media, 0), KeyDecision::SendToPane);
+        assert_eq!(s.handle(&b, &prefix, 500, &shift, 0), KeyDecision::SendToPane);
+        // Prefix, Shift, %: the lone Shift neither reaches the pane nor ends
+        // the prefix.
+        assert_eq!(s.handle(&b, &prefix, 500, &ev("C-b"), 0), KeyDecision::Swallow);
+        assert_eq!(s.handle(&b, &prefix, 500, &shift, 0), KeyDecision::Swallow);
+        assert!(s.in_prefix());
+        assert_eq!(run(&s.handle(&b, &prefix, 500, &ev("%"), 0)), "split-window -h");
+        // A hand-built code still has a name.
+        assert_eq!(KeyCode::new(Key::Media(MediaKey::PlayPause), Mods::NONE).to_string(), "PlayPause");
     }
 }

@@ -1,16 +1,11 @@
 //! Events produced by [`crate::InputParser`].
 
-use lif_types::{KeyAction, KeyEvent, Mods, MouseEvent, PixelSize, Size};
+use lif_types::{KeyEvent, MouseEvent, PixelSize, Size};
 
 /// One thing the client's terminal sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputEvent {
     Key(KeyEvent),
-    /// A kitty-protocol functional key that `lif_types::Key` cannot express
-    /// (media keys 57428..=57440, modifier keys 57441..=57454, other private
-    /// use codes). `code` is the kitty key number, so the event can be
-    /// re-encoded for a program that asked for the kitty protocol.
-    OtherKey { code: u32, mods: Mods, action: KeyAction },
     Mouse(MouseEvent),
     /// Bracketed paste started (`CSI 200 ~`). Followed by zero or more
     /// [`InputEvent::PasteData`] and then [`InputEvent::PasteEnd`].

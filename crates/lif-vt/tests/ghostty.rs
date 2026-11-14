@@ -42,6 +42,28 @@ fn key(k: Key, mods: Mods) -> KeyEvent {
     KeyEvent::new(k, mods)
 }
 
+/// The key event lif-input makes of `bytes` from an outer terminal that
+/// speaks the kitty protocol.
+fn parse_key(bytes: &[u8]) -> KeyEvent {
+    let mut p = lif_input::InputParser::new();
+    p.set_kitty_keyboard(true);
+    let mut out = Vec::new();
+    p.feed(bytes, &mut out);
+    match out.as_slice() {
+        [lif_input::InputEvent::Key(k)] => k.clone(),
+        other => panic!("{:?} parsed as {other:?}", String::from_utf8_lossy(bytes)),
+    }
+}
+
+/// Outer-terminal bytes -> KeyEvent -> bytes for a pane whose program pushed
+/// kitty `flags`.
+fn round_trip(flags: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut v = vt(20, 3);
+    v.feed(format!("\x1b[>{flags}u").as_bytes());
+    assert_eq!(v.modes().kitty_keyboard, flags);
+    enc_key(&mut v, parse_key(bytes))
+}
+
 fn enc_key(v: &mut GhosttyVt, k: KeyEvent) -> Vec<u8> {
     let mut out = Vec::new();
     v.encode_key(&k, &mut out);
@@ -415,6 +437,7 @@ fn scrollback_byte_cap() {
         size: Size::new(120, 40),
         pixels: PixelSize::default(),
         scrollback_bytes: cap,
+        ..Default::default()
     })
     .unwrap();
     let mut chunk = Vec::new();
@@ -530,4 +553,105 @@ fn engine_is_owned_and_static() {
     boxed.feed(b"\x1b[c");
     assert!(!replies(&mut boxed).is_empty());
     assert!(replies(panes.get_mut(&2).unwrap()).is_empty());
+}
+
+#[test]
+fn kitty_alternate_keys_round_trip() {
+    // lif pushes all kitty flags (31) to the outer terminal; a program that
+    // pushed the same flags gets the outer terminal's bytes back unchanged.
+    for b in [
+        &b"\x1b[1089:1057:99;2;1057u"[..], // Shift+с on a Russian layout
+        b"\x1b[49:33;2;33u",               // Shift+1 -> !
+        b"\x1b[1089::99;5u",               // Ctrl+с
+        b"\x1b[97:65;6u",                  // Ctrl+Shift+a
+        b"\x1b[1089:1057:99;2:3u",         // release
+    ] {
+        assert_eq!(round_trip(31, b), b, "{}", String::from_utf8_lossy(b));
+    }
+    // Alternates without the other flags (disambiguate + alternates + all keys).
+    assert_eq!(round_trip(13, b"\x1b[1089:1057:99;2;1057u"), b"\x1b[1089:1057:99;2u");
+    assert_eq!(round_trip(13, b"\x1b[49:33;2;33u"), b"\x1b[49:33;2u");
+    assert_eq!(round_trip(5, b"\x1b[1089::99;5u"), b"\x1b[1089::99;5u");
+    // Without flag 4 the alternates are dropped; without "report all keys"
+    // shifted text is plain text.
+    assert_eq!(round_trip(1, b"\x1b[1089::99;5u"), b"\x1b[1089;5u");
+    assert_eq!(round_trip(5, b"\x1b[1089:1057:99;2;1057u"), "С".as_bytes());
+    // Legacy: the base-layout key makes Ctrl+с the Ctrl+c a user expects.
+    assert_eq!(round_trip(0, b"\x1b[1089::99;5u"), b"\x03");
+    assert_eq!(round_trip(0, b"\x1b[49:33;2;33u"), b"!");
+}
+
+#[test]
+fn kitty_media_and_modifier_keys_round_trip() {
+    let media = b"\x1b[57430u"; // play/pause
+    let media_ctrl = b"\x1b[57430;5u";
+    let media_release = b"\x1b[57430;1:3u";
+    let shift = b"\x1b[57441;2u"; // left shift press
+    let shift_release = b"\x1b[57441;1:3u";
+    let iso3 = b"\x1b[57453;1:2u"; // ISO level 3 shift, repeat
+    for b in [&media[..], media_ctrl, media_release, shift, shift_release, iso3] {
+        assert_eq!(round_trip(31, b), b, "{}", String::from_utf8_lossy(b));
+    }
+    // Disambiguate only: media keys yes (presses), lone modifiers never.
+    assert_eq!(round_trip(1, media), media);
+    assert_eq!(round_trip(1, media_ctrl), media_ctrl);
+    assert_eq!(round_trip(1, media_release), b"");
+    assert_eq!(round_trip(1, shift), b"");
+    // Report all keys without event types: modifier presses, no releases,
+    // a repeat is a press.
+    assert_eq!(round_trip(9, shift), shift);
+    assert_eq!(round_trip(9, shift_release), b"");
+    assert_eq!(round_trip(9, iso3), b"\x1b[57453u");
+    // Legacy has no encoding for either.
+    assert_eq!(round_trip(0, media), b"");
+    assert_eq!(round_trip(0, shift), b"");
+}
+
+#[test]
+fn default_color_queries() {
+    let q = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x07";
+    // Never set: answered with the fallbacks (light gray on black), so a
+    // program never waits for a timeout.
+    let mut v = vt(10, 2);
+    v.feed(q);
+    assert_eq!(
+        replies(&mut v),
+        b"\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b]12;rgb:c0c0/c0c0/c0c0\x07"
+    );
+
+    // From the options (the outer terminal's colors, a light theme).
+    let mut v = GhosttyVt::new(&VtOptions {
+        size: Size::new(10, 2),
+        default_fg: Some((0x10, 0x20, 0x30)),
+        default_bg: Some((0xfa, 0xfb, 0xfc)),
+        default_cursor: Some((0xff, 0x00, 0x80)),
+        ..Default::default()
+    })
+    .unwrap();
+    v.feed(q);
+    assert_eq!(
+        replies(&mut v),
+        b"\x1b]10;rgb:1010/2020/3030\x1b\\\x1b]11;rgb:fafa/fbfb/fcfc\x1b\\\x1b]12;rgb:ffff/0000/8080\x07"
+    );
+
+    // Changed on the live engine; the cursor follows the foreground.
+    v.set_default_colors(Some((1, 2, 3)), Some((4, 5, 6)), None);
+    v.feed(q);
+    assert_eq!(
+        replies(&mut v),
+        b"\x1b]10;rgb:0101/0202/0303\x1b\\\x1b]11;rgb:0404/0505/0606\x1b\\\x1b]12;rgb:0101/0202/0303\x07"
+    );
+
+    // A color the program set wins until it resets it (OSC 111).
+    v.feed(b"\x1b]11;rgb:ff/00/00\x1b\\");
+    v.set_default_colors(Some((1, 2, 3)), Some((7, 7, 7)), None);
+    v.feed(b"\x1b]11;?\x1b\\");
+    assert_eq!(replies(&mut v), b"\x1b]11;rgb:ffff/0000/0000\x1b\\");
+    v.feed(b"\x1b]111\x1b\\\x1b]11;?\x1b\\");
+    assert_eq!(replies(&mut v), b"\x1b]11;rgb:0707/0707/0707\x1b\\");
+
+    // Back to unset: the fallbacks again.
+    v.set_default_colors(None, None, None);
+    v.feed(b"\x1b]11;?\x1b\\");
+    assert_eq!(replies(&mut v), b"\x1b]11;rgb:0000/0000/0000\x1b\\");
 }

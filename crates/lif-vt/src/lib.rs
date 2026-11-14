@@ -33,6 +33,16 @@ impl std::fmt::Display for VtError {
 
 impl std::error::Error for VtError {}
 
+/// An 8-bit-per-channel RGB color.
+pub type Rgb = (u8, u8, u8);
+
+/// Default foreground used when none is set, so that OSC 10 queries are
+/// always answered (light gray, like a VGA console).
+pub const FALLBACK_FOREGROUND: Rgb = (0xc0, 0xc0, 0xc0);
+/// Default background used when none is set, so that OSC 11 queries are
+/// always answered.
+pub const FALLBACK_BACKGROUND: Rgb = (0x00, 0x00, 0x00);
+
 #[derive(Clone, Debug)]
 pub struct VtOptions {
     pub size: Size,
@@ -40,11 +50,28 @@ pub struct VtOptions {
     pub pixels: PixelSize,
     /// Scrollback budget in bytes (not lines). 0 disables scrollback.
     pub scrollback_bytes: usize,
+    /// The default colors the pane reports to programs that ask (OSC 10 /
+    /// 11 / 12 queries, which vim and neovim use to pick a dark or light
+    /// theme). The server passes the outer terminal's colors as the
+    /// client's `CapsProbe` learned them. `None` reports
+    /// [`FALLBACK_FOREGROUND`] / [`FALLBACK_BACKGROUND`], and the cursor
+    /// color falls back to the foreground. They do not affect frames:
+    /// default-colored cells stay `Color::Default`.
+    pub default_fg: Option<Rgb>,
+    pub default_bg: Option<Rgb>,
+    pub default_cursor: Option<Rgb>,
 }
 
 impl Default for VtOptions {
     fn default() -> Self {
-        Self { size: Size::new(80, 24), pixels: PixelSize::default(), scrollback_bytes: 10 * 1024 * 1024 }
+        Self {
+            size: Size::new(80, 24),
+            pixels: PixelSize::default(),
+            scrollback_bytes: 10 * 1024 * 1024,
+            default_fg: None,
+            default_bg: None,
+            default_cursor: None,
+        }
     }
 }
 
@@ -141,7 +168,8 @@ pub trait VtEngine: Sized {
     /// whether anything (rows or cursor) changed.
     ///
     /// The engine tracks changes for exactly one frame: always pass the same
-    /// one. To render the pane for a second consumer, copy the frame.
+    /// one. Several clients share it; see `PaneFrame` for who clears the
+    /// flags.
     fn refresh(&mut self, frame: &mut PaneFrame) -> bool;
 
     /// Cheap check used by the event loop to decide whether to schedule a
@@ -169,6 +197,12 @@ pub trait VtEngine: Sized {
 
     /// Answer a [`VtEvent::ClipboardRead`]; appends the OSC 52 reply to `out`.
     fn clipboard_reply(&mut self, selection: u8, data: &[u8], out: &mut Vec<u8>);
+
+    /// Change the default colors (see [`VtOptions::default_fg`]), e.g. when
+    /// a client with a different outer terminal attaches. Colors a program
+    /// set itself (OSC 10 / 11 / 12) keep taking precedence until it resets
+    /// them.
+    fn set_default_colors(&mut self, fg: Option<Rgb>, bg: Option<Rgb>, cursor: Option<Rgb>);
 
     /// Move the viewport through the scrollback (copy mode).
     fn scroll(&mut self, to: Scroll);

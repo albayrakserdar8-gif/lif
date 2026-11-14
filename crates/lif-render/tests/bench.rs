@@ -329,8 +329,7 @@ fn bench_frames() {
             Rect::new(w0 + 1, h0 + 1, COLS - w0 - 1, ROWS - 1 - h0 - 1),
         ];
         let mut frames: Vec<PaneFrame> = rects.iter().map(|r| new_frame(*r, false)).collect();
-        let mut r = Renderer::new(caps());
-        r.set_lr_margins(opt);
+        let mut r = Renderer::new(OuterCaps { lr_margins: opt, ..caps() });
         let mut out = Vec::with_capacity(1 << 20);
         let (mut total, mut bytes, n) = (Duration::ZERO, 0, 20_000);
         let mut next = 0;

@@ -21,14 +21,17 @@ use lif_types::OuterCaps;
 /// the text the key produced under the user's layout.
 pub const KITTY_FLAGS: u8 = 31;
 
-/// The private modes lif asks about with DECRQM.
-pub const QUERIED_MODES: [u16; 5] = [2026, 2027, 1016, 2031, 2048];
+/// The private modes lif asks about with DECRQM. Mode 69 (DECLRMM) is how
+/// left/right margin support is detected: a terminal that answers it as
+/// set or reset implements DECSLRM, and one that does not know DECRQM never
+/// answers, which leaves the capability off.
+pub const QUERIED_MODES: [u16; 6] = [2026, 2027, 1016, 2031, 2048, 69];
 
 /// Queries sent on attach. DA1 goes last: every terminal answers it, and in
 /// order, so its answer means all others that will ever come have come.
 pub fn write_queries(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?u"); // kitty keyboard flags
-    out.extend_from_slice(b"\x1b[?2026$p\x1b[?2027$p\x1b[?1016$p\x1b[?2031$p\x1b[?2048$p");
+    out.extend_from_slice(b"\x1b[?2026$p\x1b[?2027$p\x1b[?1016$p\x1b[?2031$p\x1b[?2048$p\x1b[?69$p");
     out.extend_from_slice(b"\x1b[>0q"); // XTVERSION
     out.extend_from_slice(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\"); // default fg / bg
     out.extend_from_slice(b"\x1b[16t"); // cell size in pixels
@@ -141,13 +144,17 @@ pub fn write_mouse_pixels(enable: bool, caps: &OuterCaps, out: &mut Vec<u8>) {
     }
 }
 
-/// In-band resize reports (2048); see [`crate::CapsProbe::in_band_resize`].
-pub fn write_in_band_resize(enable: bool, out: &mut Vec<u8>) {
-    out.extend_from_slice(if enable { b"\x1b[?2048h" } else { b"\x1b[?2048l" });
+/// In-band resize reports (2048), only if [`OuterCaps::in_band_resize`].
+pub fn write_in_band_resize(enable: bool, caps: &OuterCaps, out: &mut Vec<u8>) {
+    if caps.in_band_resize {
+        out.extend_from_slice(if enable { b"\x1b[?2048h" } else { b"\x1b[?2048l" });
+    }
 }
 
-/// Color-scheme change notifications (2031); see
-/// [`crate::CapsProbe::color_scheme_reports`].
-pub fn write_color_scheme_reports(enable: bool, out: &mut Vec<u8>) {
-    out.extend_from_slice(if enable { b"\x1b[?2031h" } else { b"\x1b[?2031l" });
+/// Color-scheme change notifications (2031), only if
+/// [`OuterCaps::color_scheme_reports`].
+pub fn write_color_scheme_reports(enable: bool, caps: &OuterCaps, out: &mut Vec<u8>) {
+    if caps.color_scheme_reports {
+        out.extend_from_slice(if enable { b"\x1b[?2031h" } else { b"\x1b[?2031l" });
+    }
 }
