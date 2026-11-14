@@ -3,14 +3,44 @@
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
 
 use crate::sys;
+
+/// Restores the outer terminal when the server cannot (it crashed, hung,
+/// or the client is panicking): a self-contained superset of what
+/// `lif_input::setup` (`write_enter`, `write_mouse`, the mode switches and
+/// `write_leave`) can turn on, plus a few widely supported resets. Any
+/// terminal ignores sequences it does not implement, so a superset is safe.
+/// Kept here rather than built by `lif-input` so the client does not depend
+/// on the input parser; a test checks it covers everything `setup.rs` emits.
+///
+/// Order matters: CAN first aborts an escape sequence the server may have
+/// been cut off in the middle of; synchronized output ends first so the
+/// rest takes effect at once; the kitty pop comes before leaving the
+/// alternate screen because kitty keeps one flag stack per screen; leaving
+/// the alternate screen comes last and restores the shell's cursor.
+pub const FALLBACK_RESTORE: &[u8] = b"\x18\
+\x1b[?2026l\
+\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1016l\x1b[?1006l\
+\x1b[?2048l\x1b[?2031l\
+\x1b[<u\x1b[>4m\
+\x1b[?1004l\x1b[?2004l\
+\x1b>\
+\x1b[0 q\x1b[0m\x1b[?25h\x1b[?7h\
+\x1b[?1049l";
+
+/// How long the panic hook may spend writing [`FALLBACK_RESTORE`] to a
+/// terminal that does not take it.
+const PANIC_WRITE: Duration = Duration::from_millis(200);
 
 /// What to put back on one terminal.
 #[derive(Clone, Copy)]
 struct Saved {
     id: u64,
     tty: RawFd,
+    /// Where [`FALLBACK_RESTORE`] goes if we panic.
+    output: RawFd,
     termios: libc::termios,
     /// (fd, original fcntl flags) for the input and output fds.
     flags: [(RawFd, libc::c_int); 2],
@@ -39,7 +69,13 @@ fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |info| {
             // try_lock: a panic while the lock is held must not deadlock.
             if let Ok(active) = ACTIVE.try_lock() {
-                active.iter().for_each(Saved::restore);
+                let deadline = Instant::now() + PANIC_WRITE;
+                for s in active.iter() {
+                    // Before the modes: the fd is still non-blocking, so
+                    // the write is bounded.
+                    let _ = sys::write_all_until(s.output, FALLBACK_RESTORE, deadline);
+                    s.restore();
+                }
             }
             prev(info);
         }));
@@ -65,7 +101,7 @@ impl RawGuard {
             *n += 1;
             *n
         };
-        let saved = Saved { id, tty, termios, flags };
+        let saved = Saved { id, tty, output, termios, flags };
         // Registered before anything changes, so a failure half way is still undone.
         ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(saved);
         let guard = RawGuard { saved };
@@ -91,5 +127,34 @@ impl Drop for RawGuard {
     fn drop(&mut self) {
         self.saved.restore();
         ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.id != self.saved.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_hook_writes_the_fallback() {
+        let (mut m, mut s) = (-1, -1);
+        // SAFETY: valid out pointers; null name, termios and winsize mean defaults.
+        let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut::<libc::termios>(), std::ptr::null_mut()) };
+        assert_eq!(r, 0);
+        // A real panic: the hook runs before unwinding (and is all that runs
+        // with panic = "abort").
+        let res = std::panic::catch_unwind(|| {
+            let _g = RawGuard::enter(s, s, s).unwrap();
+            panic!("test panic while attached");
+        });
+        assert!(res.is_err());
+        let mut buf = [0u8; 1024];
+        // SAFETY: buf is valid for buf.len() bytes; the bytes are already queued.
+        let n = unsafe { libc::read(m, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n.max(0) as usize], FALLBACK_RESTORE);
+        // SAFETY: both fds came from openpty and are closed once.
+        unsafe {
+            libc::close(m);
+            libc::close(s);
+        }
     }
 }

@@ -6,7 +6,7 @@ use lif_types::{
     Attrs, CellWidth, Color, Key, KeyEvent, Mods, MouseAction, MouseButton, MouseEvent,
     PaneFrame, PixelSize, Pos, Size, Underline,
 };
-use lif_vt::{GhosttyVt, Scroll, TextRange, VtEngine, VtEvent, VtOptions};
+use lif_vt::{GhosttyVt, Scroll, TextOptions, TextRange, VtEngine, VtEvent, VtOptions};
 
 fn vt(cols: u16, rows: u16) -> GhosttyVt {
     GhosttyVt::new(&VtOptions { size: Size::new(cols, rows), ..Default::default() }).unwrap()
@@ -672,4 +672,229 @@ fn paste_chunks_carry_no_markers() {
     v.encode_paste_chunk(b"x\ny", &mut a);
     v.encode_paste(b"x\ny", &mut b);
     assert_eq!(a, b);
+}
+
+// ----- rows for copy mode ---------------------------------------------------
+
+fn abs_text(v: &GhosttyVt, y: usize) -> String {
+    let mut r = lif_types::FrameRow::default();
+    v.row(y, &mut r);
+    assert_eq!(r.cells.len(), v.size().cols as usize);
+    let mut s = String::new();
+    for x in 0..r.cells.len() {
+        r.push_cell_text(x, &mut s);
+    }
+    s.trim_end().to_string()
+}
+
+#[test]
+fn rows_of_scrollback_and_screen() {
+    let mut v = vt(10, 3);
+    v.feed(b"\x1b[1;31mred\x1b[0m plain\r\nab\xe4\xb8\xad\xe6\x96\x87cd\r\ne\xcc\x81x\r\n0123456789wrap\r\nlast");
+    // 5 lines, the 4th wrapped: 6 rows, 3 of them history.
+    assert_eq!(v.scrollback_rows(), 3);
+    let mut r = lif_types::FrameRow::default();
+    v.row(0, &mut r);
+    assert_eq!(abs_text(&v, 0), "red plain");
+    assert_eq!(r.cells[0].style.fg, Color::Indexed(1));
+    assert!(r.cells[0].style.attrs.contains(Attrs::BOLD));
+    assert_eq!(r.cells[4].style.fg, Color::Default);
+    assert!(!r.wrapped);
+    v.row(1, &mut r);
+    assert_eq!(abs_text(&v, 1), "ab\u{4e2d}\u{6587}cd");
+    assert_eq!(r.cells[2].width, CellWidth::Wide);
+    assert_eq!(r.cells[3].width, CellWidth::WideTail);
+    v.row(2, &mut r);
+    assert_eq!(abs_text(&v, 2), "e\u{301}x");
+    assert_eq!(r.cells[0].extra, 1);
+    assert_eq!(&*r.clusters[0], "e\u{301}");
+    v.row(3, &mut r);
+    assert!(r.wrapped, "soft-wrapped row");
+    assert_eq!(abs_text(&v, 3), "0123456789");
+    assert_eq!(abs_text(&v, 4), "wrap");
+    assert_eq!(abs_text(&v, 5), "last");
+    // Past the end: blank, the right width, no stale clusters.
+    v.row(2, &mut r);
+    v.row(99, &mut r);
+    assert!(r.clusters.is_empty() && !r.wrapped);
+    assert!(r.cells.iter().all(|c| *c == lif_types::Cell::BLANK));
+    // The screen rows read the same as the frame.
+    let f = frame(&mut v);
+    for y in 0..3 {
+        let mut r = lif_types::FrameRow::default();
+        v.row(3 + y, &mut r);
+        assert_eq!(r.cells, f.rows[y].cells, "row {y}");
+    }
+}
+
+#[test]
+fn prompts_from_osc_133() {
+    let mut v = vt(20, 3);
+    for i in 0..5 {
+        v.feed(format!("\x1b]133;A\x07$ cmd{i}\r\n\x1b]133;C\x07out{i}\r\nmore{i}\r\n").as_bytes());
+    }
+    // Rows: 0 "$ cmd0", 1 out0, 2 more0, 3 "$ cmd1", ...
+    assert_eq!(abs_text(&v, 3), "$ cmd1");
+    assert_eq!(v.find_prompt(0, true), Some(0));
+    assert_eq!(v.find_prompt(1, true), Some(3));
+    assert_eq!(v.find_prompt(5, false), Some(3));
+    assert_eq!(v.find_prompt(2, false), Some(0));
+    assert_eq!(v.find_prompt(13, true), None);
+    assert_eq!(v.find_prompt(1000, false), Some(12));
+}
+
+#[test]
+fn trimmed_rows_count_evictions() {
+    // libghostty evicts whole storage pages (about 1170 rows of 40 columns,
+    // about 512 KiB); 4 MiB holds several.
+    let mut v = GhosttyVt::new(&VtOptions { size: Size::new(40, 5), scrollback_bytes: 4 << 20, ..Default::default() })
+        .unwrap();
+    assert_eq!(v.trimmed_rows(), 0);
+    v.track_trimmed(true);
+    let mut n = 0u64;
+    let mut line = |v: &mut GhosttyVt| {
+        v.feed(format!("line {n:08}\r\n").as_bytes());
+        n += 1;
+    };
+    for _ in 0..100 {
+        line(&mut v);
+    }
+    assert_eq!(v.trimmed_rows(), 0, "nothing evicted yet");
+    // Absolute row of a line = its number - trimmed: always consistent.
+    for _ in 0..40_000 {
+        line(&mut v);
+    }
+    let t = v.trimmed_rows();
+    assert!(t > 0, "the 4 MiB scrollback must have evicted rows");
+    let check = |v: &GhosttyVt| {
+        let t = v.trimmed_rows() as usize;
+        for y in [0usize, 7, v.scrollback_rows() / 2] {
+            assert_eq!(abs_text(v, y), format!("line {:08}", y + t), "row {y} after {t} evicted");
+        }
+    };
+    check(&v);
+    // Many lines in one write (less than the scrollback holds).
+    let mut big = String::new();
+    for _ in 0..3000 {
+        big.push_str(&format!("line {n:08}\r\n"));
+        n += 1;
+    }
+    v.feed(big.as_bytes());
+    assert!(v.trimmed_rows() > t);
+    check(&v);
+    // One write bigger than the whole scrollback: every older row is gone,
+    // and the count says at least that many went.
+    let (t, h) = (v.trimmed_rows(), v.scrollback_rows() as u64);
+    let mut huge = String::new();
+    for _ in 0..100_000 {
+        huge.push_str(&format!("line {n:08}\r\n"));
+        n += 1;
+    }
+    v.feed(huge.as_bytes());
+    assert!(v.trimmed_rows() >= t + h, "{} < {t} + {h}", v.trimmed_rows());
+    // Clearing the scrollback evicts everything above the screen.
+    let (t, h) = (v.trimmed_rows(), v.scrollback_rows() as u64);
+    v.feed(b"\x1b[3J");
+    assert_eq!(v.scrollback_rows(), 0);
+    assert_eq!(v.trimmed_rows(), t + h);
+    // A resize reflows without counting evictions.
+    let t = v.trimmed_rows();
+    v.resize(Size::new(20, 5), PixelSize::default());
+    v.resize(Size::new(40, 5), PixelSize::default());
+    assert_eq!(v.trimmed_rows(), t);
+    // Off, nothing is counted.
+    v.track_trimmed(false);
+    let t = v.trimmed_rows();
+    for i in 0..20_000 {
+        v.feed(format!("more {i:08}\r\n").as_bytes());
+    }
+    assert_eq!(v.trimmed_rows(), t);
+}
+
+#[test]
+fn viewport_top_is_exact_and_holds_while_output_arrives() {
+    let mut v = vt(20, 4);
+    for i in 0..50 {
+        v.feed(format!("l{i}\r\n").as_bytes());
+    }
+    let h = v.scrollback_rows();
+    for top in [0, 1, 17, h - 1] {
+        v.set_viewport_top(top);
+        let f = frame(&mut v);
+        assert_eq!(row_text(&f, 0), abs_text(&v, top), "top {top}");
+        assert_eq!(v.viewport_offset(), h - top);
+    }
+    v.set_viewport_top(10);
+    v.feed(b"more\r\nand more\r\n");
+    let f = frame(&mut v);
+    assert_eq!(row_text(&f, 0), "l10", "the viewport stays on its rows");
+    // At the bottom it follows output again.
+    v.set_viewport_top(v.scrollback_rows());
+    v.feed(b"x\r\ny\r\n");
+    let f = frame(&mut v);
+    assert_eq!(v.viewport_offset(), 0);
+    assert_eq!(row_text(&f, 2), "y");
+}
+
+#[test]
+fn reading_a_row_restores_at_most_its_own_page() {
+    let mut v = GhosttyVt::new(&VtOptions { size: Size::new(80, 24), scrollback_bytes: 64 << 20, ..Default::default() })
+        .unwrap();
+    let mut s = String::new();
+    for i in 0..200_000u32 {
+        s.push_str(&format!("{i:08} the quick brown fox jumps over the lazy dog\r\n"));
+    }
+    // In read-sized pieces, as the server feeds it.
+    v.track_trimmed(true);
+    for chunk in s.as_bytes().chunks(64 * 1024) {
+        v.feed(chunk);
+    }
+    for _ in 0..10_000 {
+        v.compact();
+    }
+    let before = v.memory().compressed_pages;
+    if before < 3 {
+        // This build of libghostty does not compress (unsupported platform).
+        return;
+    }
+    let (h, t) = (v.scrollback_rows(), v.trimmed_rows() as usize);
+    for y in [5usize, h / 2, h - 30] {
+        assert!(abs_text(&v, y).starts_with(&format!("{:08}", y + t)), "row {y}: {}", abs_text(&v, y));
+    }
+    let after = v.memory().compressed_pages;
+    assert!(before - after <= 3, "three rows read, {} pages restored", before - after);
+}
+
+#[test]
+fn capture_keeps_spaces_and_styles_on_request() {
+    let mut v = vt(20, 3);
+    v.feed(b"a  \x1b[31mred\x1b[0m   \r\nb");
+    let plain = v.capture(TextRange::Screen, TextOptions::default());
+    assert_eq!(plain.lines().next(), Some("a  red"));
+    let keep = v.capture(TextRange::Screen, TextOptions { keep_trailing: true, ..Default::default() });
+    assert!(keep.lines().next().unwrap().starts_with("a  red   "), "{keep:?}");
+    let styled = v.capture(TextRange::Screen, TextOptions { styled: true, ..Default::default() });
+    assert!(styled.contains("\x1b[") && styled.contains("red"), "{styled:?}");
+    assert!(!styled.contains("\x1b]"), "only styles, no terminal state: {styled:?}");
+    assert!(!plain.contains('\x1b'));
+}
+
+#[test]
+fn row_scan_reads_the_same_rows_and_moves_the_viewport() {
+    let mut v = vt(20, 4);
+    for i in 0..300 {
+        v.feed(format!("r{i}\r\n").as_bytes());
+    }
+    let h = v.scrollback_rows();
+    assert_eq!(v.viewport_top(), h);
+    let (mut a, mut b) = (lif_types::FrameRow::default(), lif_types::FrameRow::default());
+    for y in (0..h + 4).rev().chain(0..h + 4) {
+        v.row_scan(y, &mut a);
+        v.row(y, &mut b);
+        assert_eq!(a, b, "row {y}");
+        let top = v.viewport_top();
+        assert!(top <= y && y < top + 4 || y >= h, "row {y} not in the viewport at {top}");
+    }
+    v.set_viewport_top(h);
+    assert_eq!(v.viewport_offset(), 0);
 }

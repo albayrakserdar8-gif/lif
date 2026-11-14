@@ -160,6 +160,7 @@ mod tests {
                 frame: f,
                 active: i == active,
                 selection: None,
+                matches: &[],
                 indicator: None,
             })
             .collect();

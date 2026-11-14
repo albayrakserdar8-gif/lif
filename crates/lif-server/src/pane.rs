@@ -83,6 +83,17 @@ pub(crate) struct PaneRt {
     /// Output arrived since the last name check (a program may have started).
     pub(crate) output_seen: bool,
     pub(crate) mode: Option<Box<dyn PaneMode>>,
+    /// The mode's search runs: step it once per loop turn.
+    pub(crate) searching: bool,
+    /// Who started the mode's current search (its messages go there).
+    pub(crate) search_client: Option<lif_core::ClientId>,
+    /// Rows per search step, adapted so a step takes about
+    /// `SEARCH_STEP_TIME` however costly rows are to read.
+    pub(crate) search_rows: usize,
+    /// A copy-mode drag rests on an edge: scroll again at this time.
+    pub(crate) autoscroll_at: Option<Instant>,
+    /// The copy-mode settings the mode has (see `Server::sync_mode_config`).
+    pub(crate) mode_cfg: Option<(u64, bool, String, bool)>,
     /// A streamed paste is open: whether it was bracketed.
     pub(crate) paste_bracketed: Option<bool>,
     /// Refreshed during the current frame tick.
@@ -116,6 +127,11 @@ impl PaneRt {
             name_recheck: None,
             output_seen: false,
             mode: None,
+            searching: false,
+            search_client: None,
+            search_rows: lif_copy::DEFAULT_SEARCH_STEP_ROWS,
+            autoscroll_at: None,
+            mode_cfg: None,
             paste_bracketed: None,
             refreshed: false,
         }
@@ -179,13 +195,29 @@ impl PaneRt {
     /// Lets the mode see new output / a new size.
     pub(crate) fn update_mode(&mut self) {
         if let Some(m) = self.mode.as_mut() {
-            m.update(&mut ModeCtx { engine: &mut self.engine, rows: self.size.rows });
+            m.update(&mut ModeCtx { engine: &mut self.engine });
         }
     }
 
     pub(crate) fn leave_mode(&mut self) {
         if let Some(mut m) = self.mode.take() {
-            m.leave(&mut ModeCtx { engine: &mut self.engine, rows: self.size.rows });
+            let view = m.is_view();
+            m.leave(&mut ModeCtx { engine: &mut self.engine });
+            self.engine.track_trimmed(false);
+            if view {
+                // The terminal's frame comes back in place of the mode's.
+                self.frame.mark_all_dirty();
+            }
         }
+        self.searching = false;
+        self.search_client = None;
+        self.autoscroll_at = None;
+        self.mode_cfg = None;
+    }
+
+    /// Run `f` on the pane's mode, if it has one.
+    pub(crate) fn with_mode<R>(&mut self, f: impl FnOnce(&mut dyn PaneMode, &mut ModeCtx<'_>) -> R) -> Option<R> {
+        let m = self.mode.as_deref_mut()?;
+        Some(f(m, &mut ModeCtx { engine: &mut self.engine }))
     }
 }

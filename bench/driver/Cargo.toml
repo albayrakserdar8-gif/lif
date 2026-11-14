@@ -1,0 +1,16 @@
+[package]
+name = "lifbench-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "PTY driver and probes for the lif benchmark harness"
+
+# Standalone on purpose: the harness must build without the main workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+debug = false

@@ -41,8 +41,8 @@ pub use bindings::{Binding, KeyBindings, KeyDecision, KeyState};
 pub use cmd::{Arg, Args, CmdError, Command, CommandList, escape_arg, parse, parse_list, parse_string};
 pub use exec::expand_prompt_template;
 pub use host::{
-    CaptureRange, CopyModeOptions, DetachReason, Host, LinePos, PaneInfo, PaneInput, Prompt, Redraw, SpawnCommand,
-    SpawnSpec,
+    CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, LinePos, PaneInfo, PaneInput, Prompt,
+    Redraw, SpawnCommand, SpawnSpec,
 };
 pub use ids::{ClientId, PaneId, SessionId, WindowId};
 pub use keys::KeyCode;
@@ -51,6 +51,12 @@ pub use model::{
     Client, ClientInfo, ClientView, CmdContext, CmdOutput, Model, Pane, PasteBuffer, Session, Window,
 };
 pub use time::WallClock;
+
+/// A tmux style string (`fg=black,bg=green,bold`) applied to the default
+/// style, as the status line applies them; unknown words are ignored.
+pub fn parse_style(spec: &str) -> lif_types::Style {
+    status::parse_style(spec)
+}
 
 #[cfg(test)]
 mod tests;

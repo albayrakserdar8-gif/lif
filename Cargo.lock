@@ -69,6 +69,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lif-client",
+ "lif-config",
  "lif-core",
  "lif-proto",
  "lif-pty",
@@ -82,8 +83,10 @@ name = "lif-client"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lif-input",
  "lif-proto",
  "lif-types",
+ "lif-vt",
 ]
 
 [[package]]
@@ -145,6 +148,8 @@ name = "lif-server"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lif-config",
+ "lif-copy",
  "lif-core",
  "lif-input",
  "lif-proto",

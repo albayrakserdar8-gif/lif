@@ -30,6 +30,10 @@ const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Size of the PTY read buffer (one engine `feed`).
 const READ_BUF: usize = 64 * 1024;
 
+/// About how long one step of a copy-mode search may take before the loop
+/// looks at its descriptors again.
+const SEARCH_STEP_TIME: Duration = Duration::from_millis(2);
+
 pub(crate) struct Server {
     poll: Poll,
     events: Events,
@@ -73,6 +77,15 @@ impl Server {
         {
             let _ = model.set_global_option("default-shell", &shell);
         }
+        model.set_server_info(std::process::id(), opts.socket.to_string_lossy());
+        // tmux picks mode-keys from the VISUAL / EDITOR of the client that
+        // starts the server. lif's clients do not send those variables, but
+        // the server inherits the starting client's environment, which is
+        // the same thing.
+        let visual = std::env::var("VISUAL").ok();
+        let editor = std::env::var("EDITOR").ok();
+        let keys = lif_copy::ModeKeys::from_editor(visual.as_deref(), editor.as_deref());
+        let _ = model.set_global_option("mode-keys", if keys == lif_copy::ModeKeys::Vi { "vi" } else { "emacs" });
         let rt = Rt::new(poll.registry().try_clone()?, reaper, opts.socket.to_string_lossy().into_owned());
         let now = Instant::now();
         let mut s = Server {
@@ -100,15 +113,31 @@ impl Server {
             scratch_views: Vec::new(),
         };
         log!("server {} started on {}", std::process::id(), s.opts.socket.display());
-        for line in crate::load_startup_commands() {
+        for line in crate::load_startup_commands(&s.opts) {
             match lif_core::parse_string(&line) {
                 Ok(list) => {
                     if let Err(e) = s.run_commands(None, &list) {
-                        log!("startup command {line:?}: {e}");
+                        log!("startup command {line:?} failed");
+                        for l in e.0.lines() {
+                            log!("  {l}");
+                        }
                     }
                 }
                 Err(e) => log!("startup command {line:?}: {e}"),
             }
+        }
+        // Every problem of the configuration (warnings too) is in the
+        // message log; the first client to attach sees the first one.
+        let problems: Vec<&str> = s.model.messages().collect();
+        if let Some(first) = problems.first() {
+            for p in &problems {
+                log!("config: {p}");
+            }
+            let more = match problems.len() {
+                1 => String::new(),
+                n => format!(" (and {} more, see show-messages)", n - 1),
+            };
+            s.rt.startup_message = Some(format!("{first}{more}"));
         }
         Ok(s)
     }
@@ -228,9 +257,36 @@ impl Server {
         }
         self.scratch_clients = clients;
         self.timers(now);
+        self.step_searches();
         self.sync_views();
         self.frame_tick(now);
         self.remove_dead_clients();
+    }
+
+    /// One bounded step of every copy-mode search under way, once per turn
+    /// of the loop (which polls with a zero timeout while any runs), so
+    /// input and output of every pane and client keep flowing during a
+    /// search through a huge history. Each pane's step size adapts so a
+    /// step takes about [`SEARCH_STEP_TIME`] however costly its rows are.
+    fn step_searches(&mut self) {
+        let mut ids = std::mem::take(&mut self.scratch_panes);
+        ids.clear();
+        ids.extend(self.rt.panes.values().filter(|p| p.searching).map(|p| p.id));
+        for &id in &ids {
+            let Some(p) = self.rt.panes.get(&id) else { continue };
+            let (rows, client) = (p.search_rows, p.search_client);
+            let t = Instant::now();
+            let act = self.with_mode(id, |m, ctx| m.search_step(rows, ctx));
+            let took = t.elapsed().as_secs_f64();
+            if let Some(p) = self.rt.panes.get_mut(&id)
+                && took > 0.0
+            {
+                let want = rows as f64 * SEARCH_STEP_TIME.as_secs_f64() / took;
+                p.search_rows = (want as usize).clamp(64, 200_000);
+            }
+            self.mode_action(client, id, act);
+        }
+        self.scratch_panes = ids;
     }
 
     /// The nearest deadline, or `None` (sleep until I/O) when nothing is pending.
@@ -242,11 +298,12 @@ impl Server {
             }
         };
         for p in self.rt.panes.values() {
-            if p.read_more {
+            if p.read_more || p.searching {
                 return Some(now);
             }
             min(p.compact_at);
             min(p.name_recheck);
+            min(p.autoscroll_at);
         }
         for c in self.rt.clients.values() {
             if c.read_more && c.blocked_on.is_none() {
@@ -560,7 +617,21 @@ impl Server {
             .and_then(|h| h.env.iter().find(|(k, _)| k == "LIF_PANE"))
             .and_then(|(_, v)| PaneId::parse(v));
         let ctx = CmdContext { client, pane, now: sys::wall_clock() };
+        // A copy mode the commands open gets the settings of the pane they
+        // most likely target. (Only then: compiling the copy-mode key table
+        // parses its defaults, which a server that never enters copy mode
+        // does without.)
+        let target = pane.or_else(|| client.and_then(|c| self.rt.clients.get(&c)?.att.as_ref()?.active_pane));
+        if let Some(p) = target
+            && list.commands().iter().any(|c| c.name() == "copy-mode")
+        {
+            self.sync_mode_config(p);
+        }
         let r = self.model.execute_list(list, &ctx, &mut self.rt);
+        // Options may have changed the styles views are drawn with.
+        if list.commands().iter().any(|c| matches!(c.name(), "set-option" | "set-window-option" | "source-file")) {
+            self.rt.views_stale = true;
+        }
         self.after_model();
         r
     }
@@ -569,6 +640,22 @@ impl Server {
     /// environments of sessions that are gone, bring views up to date.
     pub(crate) fn after_model(&mut self) {
         self.rt.respawn_stash = None;
+        if !self.rt.mode_actions.is_empty() {
+            for (c, p, a) in std::mem::take(&mut self.rt.mode_actions) {
+                self.mode_action(c, p, a);
+            }
+        }
+        if !self.rt.mode_changed.is_empty() {
+            let key = self.rt.copy_cfg.key.clone();
+            for p in std::mem::take(&mut self.rt.mode_changed) {
+                if let Some(pr) = self.rt.panes.get_mut(&p)
+                    && pr.mode.is_some()
+                {
+                    pr.mode_cfg = Some(key.clone());
+                }
+                self.model.pane_changed(p, &mut self.rt);
+            }
+        }
         if self.rt.session_env.len() > self.model.sessions().count() {
             let model = &self.model;
             self.rt.session_env.retain(|s, _| model.session(*s).is_some());

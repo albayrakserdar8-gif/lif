@@ -300,17 +300,21 @@ pub(crate) fn commands_from_args(values: &[Arg]) -> Result<CommandList, CmdError
 /// Quote a string the way tmux prints arguments (`args_escape`): an empty
 /// string becomes `''`, a single special character gets a backslash,
 /// strings with blanks or any of `#';${}%` (or `$`) are double-quoted,
-/// strings with only `"` single-quoted.
+/// strings with only `"` single-quoted (unless they also hold a backslash
+/// or a control character: single quotes take those literally, so such
+/// strings are double-quoted with escapes instead). The result always reads
+/// back as `s` (see the round-trip test).
 pub fn escape_arg(s: &str) -> String {
     const DQUOTED: &str = " #';${}%";
     const SQUOTED: &str = " \"";
     if s.is_empty() {
         return "''".to_string();
     }
+    let needs_escape = s.contains(|c: char| c == '\\' || (c as u32) < 0x20 || c == '\x7f');
     let quotes = if s.contains(|c| DQUOTED.contains(c)) {
         '"'
     } else if s.contains(|c| SQUOTED.contains(c)) {
-        '\''
+        if needs_escape { '"' } else { '\'' }
     } else {
         '\0'
     };

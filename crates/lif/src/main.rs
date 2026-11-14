@@ -1,7 +1,10 @@
 //! `lif`: the command-line client, and the server it starts.
 //!
-//! `lif [-2uvV] [-L socket-name] [-S socket-path] [command [flags...]]`.
+//! `lif [-2uvV] [-f file] [-L socket-name] [-S socket-path] [command [flags...]]`.
 //! No command means `new-session`, as in tmux.
+//!
+//! Three commands are the binary's own and need no server:
+//! `check-config [file]`, `print-config` and `migrate-tmux-conf [file]`.
 
 mod start;
 
@@ -12,11 +15,13 @@ use std::process::exit;
 use lif_client::{CommandOutcome, attach_loop, connect_with, hello_from_env, resolve_socket_path, run_command, secure_dir};
 use lif_proto::{ExitReason, Hello};
 
-const USAGE: &str = "usage: lif [-2uvV] [-L socket-name] [-S socket-path] [command [flags]]";
+const USAGE: &str = "usage: lif [-2uvV] [-f file] [-L socket-name] [-S socket-path] [command [flags]]";
 
 struct Cli {
     socket: Option<PathBuf>,
     label: Option<String>,
+    /// `-f`: the configuration file a server started now reads.
+    config: Option<PathBuf>,
     verbose: bool,
     argv: Vec<String>,
 }
@@ -27,7 +32,7 @@ fn usage() -> ! {
 }
 
 fn parse_cli(args: Vec<String>) -> Cli {
-    let mut cli = Cli { socket: None, label: None, verbose: false, argv: Vec::new() };
+    let mut cli = Cli { socket: None, label: None, config: None, verbose: false, argv: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -49,7 +54,7 @@ fn parse_cli(args: Vec<String>) -> Cli {
                 'v' => cli.verbose = true,
                 // tmux's -2 (256 colors) and -u (UTF-8) are always on in lif.
                 '2' | 'u' => {}
-                f @ ('S' | 'L') => {
+                f @ ('S' | 'L' | 'f') => {
                     let rest: String = flags[j + 1..].iter().collect();
                     let value = if !rest.is_empty() {
                         rest
@@ -60,10 +65,10 @@ fn parse_cli(args: Vec<String>) -> Cli {
                             None => usage(),
                         }
                     };
-                    if f == 'S' {
-                        cli.socket = Some(PathBuf::from(value));
-                    } else {
-                        cli.label = Some(value);
+                    match f {
+                        'S' => cli.socket = Some(PathBuf::from(value)),
+                        'f' => cli.config = Some(PathBuf::from(value)),
+                        _ => cli.label = Some(value),
                     }
                     j = flags.len();
                     continue;
@@ -116,8 +121,91 @@ fn hello(socket: &Path) -> Hello {
     h
 }
 
+/// `~/.tmux.conf`, or a relative name if `HOME` is not set.
+fn home_file(name: &str) -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// The commands that work on configuration files without a server.
+/// Returns the exit status, or `None` if `argv` is not one of them.
+fn config_command(argv: &[String]) -> Option<i32> {
+    let (name, args) = argv.split_first()?;
+    let path_arg = |args: &[String]| -> Result<Option<PathBuf>, i32> {
+        match args {
+            [] => Ok(None),
+            [p] => Ok(Some(PathBuf::from(p))),
+            _ => {
+                eprintln!("usage: lif {name} [file]");
+                Err(1)
+            }
+        }
+    };
+    Some(match name.as_str() {
+        "print-config" => {
+            if !args.is_empty() {
+                eprintln!("usage: lif print-config");
+                return Some(1);
+            }
+            print!("{}", lif_config::example());
+            0
+        }
+        "check-config" => {
+            let path = match path_arg(args) {
+                Ok(p) => p.or_else(lif_config::default_path),
+                Err(code) => return Some(code),
+            };
+            let Some(path) = path else {
+                eprintln!("lif: no configuration file to check (set LIF_CONFIG or HOME)");
+                return Some(1);
+            };
+            if lif_config::looks_like_tmux_conf(&path.to_string_lossy()) {
+                eprintln!(
+                    "{}: this looks like a tmux configuration file, but lif reads TOML; convert it with: lif migrate-tmux-conf {}",
+                    path.display(),
+                    path.display()
+                );
+                return Some(1);
+            }
+            if !path.exists() {
+                eprintln!("{}: No such file or directory", path.display());
+                return Some(1);
+            }
+            let cfg = lif_config::Config::load_file(&path);
+            print!("{}", cfg.report());
+            if cfg.has_errors() { 1 } else { 0 }
+        }
+        "migrate-tmux-conf" => {
+            let path = match path_arg(args) {
+                Ok(p) => p.unwrap_or_else(|| home_file(".tmux.conf")),
+                Err(code) => return Some(code),
+            };
+            let text = match std::fs::read(&path) {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => {
+                    eprintln!("{}: {e}", path.display());
+                    return Some(1);
+                }
+            };
+            let m = lif_config::migrate_tmux_conf(&text);
+            print!("{}", m.toml);
+            for u in &m.untranslated {
+                eprintln!("{}:{}: not translated ({}): {}", path.display(), u.line, u.reason, u.text);
+            }
+            0
+        }
+        _ => return None,
+    })
+}
+
 fn main() {
     let cli = parse_cli(std::env::args().skip(1).collect());
+    if let Some(code) = config_command(&cli.argv) {
+        let _ = io::stdout().flush();
+        exit(code);
+    }
     let list = match lif_core::parse_list(&cli.argv) {
         Ok(l) => l,
         Err(e) => {
@@ -145,7 +233,7 @@ fn main() {
                 eprintln!("no server running on {}", socket.display());
                 exit(1);
             }
-            if let Err(e) = start::start_server(&socket, cli.verbose) {
+            if let Err(e) = start::start_server(&socket, cli.verbose, cli.config.as_deref()) {
                 eprintln!("lif: server failed to start: {e}");
                 exit(1);
             }

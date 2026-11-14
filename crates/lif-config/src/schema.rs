@@ -96,6 +96,8 @@ pub(crate) static TOP: &[Opt] = &[
     o("tiled-layout-max-columns", "tiled-layout-max-columns", Int),
     o("visual-bell", "visual-bell", Choice(&["off", "on", "both"])),
     o("window-size", "window-size", Choice(&["largest", "smallest", "manual", "latest"])),
+    o("word-separators", "word-separators", Str),
+    o("wrap-search", "wrap-search", Bool),
 ];
 
 /// `[status]`: the status line.
@@ -127,6 +129,8 @@ pub(crate) static THEME: &[Opt] = &[
     o("active-border", "pane-active-border-style", Style),
     o("selection", "mode-style", Style),
     o("message", "message-style", Style),
+    o("match", "copy-mode-match-style", Style),
+    o("current-match", "copy-mode-current-match-style", Style),
 ];
 
 /// Key tables a `[keys.NAME]` section may name.
@@ -188,35 +192,6 @@ impl<'t> Lines<'t> {
         let col = self.text[self.starts[line]..off].chars().count() + 1;
         (line as u32 + 1, col as u32)
     }
-}
-
-/// Quote a word for the command language so that it reads back exactly.
-/// lif-core's `escape_arg` single-quotes strings whose only special
-/// character is `"` but still backslash-escapes control characters and
-/// backslashes inside the quotes, where the lexer reads them literally; such
-/// strings get a double-quoted form instead.
-pub(crate) fn quote(s: &str) -> String {
-    let q = escape_arg(s);
-    let back = parse_string(&format!("set-option -g status-left {q}"));
-    if back.ok().and_then(|l| l.commands().first().and_then(|c| c.args().value(1).map(|v| v == s))) == Some(true) {
-        return q;
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '$' => out.push_str("\\$"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Translate a file into commands and diagnostics.
@@ -435,7 +410,7 @@ impl Tr<'_> {
         }
         let what = format!("`{label}`");
         let flag = if opt.server { "-s" } else { "-g" };
-        self.push(0, at, format!("set-option {flag} {} {}", opt.option, quote(&text)), &what);
+        self.push(0, at, format!("set-option {flag} {} {}", opt.option, escape_arg(&text)), &what);
         if opt.option == "prefix"
             && let Some(code) = KeyCode::parse(&text)
         {
@@ -444,7 +419,7 @@ impl Tr<'_> {
             if Some(code) != KeyCode::parse("C-b") {
                 self.push(1, at, "unbind-key -T prefix C-b".to_string(), &what);
             }
-            self.push(1, at, format!("bind-key -T prefix {} send-prefix", quote(&text)), &what);
+            self.push(1, at, format!("bind-key -T prefix {} send-prefix", escape_arg(&text)), &what);
         }
     }
 
@@ -548,7 +523,7 @@ impl Tr<'_> {
             return self.err(k.span().start, msg);
         }
         seen.push((table.to_string(), code, k.span().start));
-        let key = quote(&code.to_string());
+        let key = escape_arg(&code.to_string());
         let what = format!("key `{name}` in {section}");
         let at = v.span().start;
         match binding_value(v) {
@@ -560,10 +535,10 @@ impl Tr<'_> {
                 }
                 if let Some(n) = note {
                     c.push_str("-N ");
-                    c.push_str(&quote(&n));
+                    c.push_str(&escape_arg(&n));
                     c.push(' ');
                 }
-                c.push_str(&format!("-T {table} {key} {}", quote(&cmd)));
+                c.push_str(&format!("-T {table} {key} {}", escape_arg(&cmd)));
                 self.push(2, at, c, &what);
             }
             Err((pos, msg)) => self.err(pos, format!("{what}: {msg}")),
@@ -700,11 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn every_key_is_a_lif_core_option_except_known_theme_gaps() {
+    fn every_key_is_a_lif_core_option() {
         let known = lif_options();
-        let gaps = ["pane-border-style", "pane-active-border-style", "mode-style", "message-style"];
         for opt in TOP.iter().chain(STATUS).chain(THEME) {
-            assert!(known.iter().any(|k| k == opt.option) || gaps.contains(&opt.option), "{} is not a lif-core option", opt.option);
+            assert!(known.iter().any(|k| k == opt.option), "{} is not a lif-core option", opt.option);
         }
         let server = ["buffer-limit", "escape-time", "exit-empty", "set-clipboard"];
         for opt in TOP {

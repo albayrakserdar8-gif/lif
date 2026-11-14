@@ -52,15 +52,19 @@ fn copy_mode_scrolls_and_exits() {
     t.wait_for("position indicator", secs(10), |t| t.lines()[0].trim_end().ends_with(']'));
     t.write(b"\x1b[5~");
     t.wait_for("scrolled up a page", secs(10), |t| t.screen().contains("row60") && !t.screen().contains("row99"));
-    assert!(t.lines()[0].contains("[22/"), "{}", t.lines()[0]);
-    t.write(b"g");
+    // tmux's page-up moves a screen less two rows (23 - 2 here).
+    assert!(t.lines()[0].contains("[21/"), "{}", t.lines()[0]);
+    // emacs keys (no VISUAL / EDITOR in the test environment): M-< is
+    // history-top.
+    t.write(b"\x1b<");
     t.wait_for("top of history", secs(10), |t| t.screen().contains("row0\n") || t.lines().iter().any(|l| l.starts_with("row0 ") || l == "row0"));
     t.write(b"q");
     t.wait_for("back to live", secs(10), |t| t.screen().contains("row99") && !t.lines()[0].trim_end().ends_with(']'));
     // The wheel scrolls through the same mode and leaves it at the bottom.
     t.wait_for("mouse on", secs(10), |t| t.modes().mouse_tracking);
     t.write(b"\x1b[<64;10;10M");
-    t.wait_for("wheel scrolled", secs(10), |t| t.lines()[0].contains("[3/"));
+    // tmux's WheelUpPane: copy-mode -e, then five lines per notch.
+    t.wait_for("wheel scrolled", secs(10), |t| t.lines()[0].contains("[5/"));
     t.write(b"\x1b[<65;10;10M");
     t.wait_for("wheel back at bottom leaves the mode", secs(10), |t| !t.lines()[0].trim_end().ends_with(']'));
 }

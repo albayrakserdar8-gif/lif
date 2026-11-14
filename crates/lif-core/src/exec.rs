@@ -1,9 +1,11 @@
 //! Command execution.
 
 use crate::bindings::{Binding, PREFIX_TABLE, ROOT_TABLE};
-use crate::cmd::{Arg, Args, CmdError, Command, CommandList, commands_from_args, escape_arg};
+use crate::cmd::{Arg, Args, CmdError, Command, CommandList, commands_from_args, escape_arg, parse_string};
 use crate::format;
-use crate::host::{CaptureRange, CopyModeOptions, DetachReason, Host, LinePos, PaneInput, Prompt, Redraw};
+use crate::host::{
+    CaptureRange, ConfigError, CopyModeOptions, DetachReason, Host, LinePos, PaneInput, Prompt, Redraw,
+};
 use crate::ids::{ClientId, PaneId, SessionId, WindowId};
 use crate::keys::KeyCode;
 use crate::layout::{Axis, Direction, Layout, Preset, PresetParams, SizeSpec, SplitSize};
@@ -390,8 +392,17 @@ impl Model {
                 }
                 text(s)
             }
+            "show-messages" => {
+                let mut out = String::new();
+                for m in &self.messages {
+                    out.push_str(m);
+                    out.push('\n');
+                }
+                text(out)
+            }
             "show-options" => self.cmd_show_options(a, a.has('w'), ctx),
             "show-window-options" => self.cmd_show_options(a, true, ctx),
+            "source-file" => self.cmd_source_file(a, ctx, host),
             "split-window" => self.cmd_split(a, ctx, host),
             "start-server" => ok(),
             "swap-pane" => self.cmd_swap_pane(a, ctx, host),
@@ -1670,6 +1681,15 @@ impl Model {
             .into_iter()
             .map(|k| if a.has('F') { self.expand_found(&f, ctx, &*host, &k) } else { k })
             .collect();
+        if a.has('X') {
+            let Some((name, rest)) = keys.split_first() else { return err("no command specified") };
+            // tmux prints copy-mode arguments after `--` (`goto-line -- "%%"`).
+            let rest = match rest.first() {
+                Some(d) if d == "--" => &rest[1..],
+                _ => rest,
+            };
+            return host.mode_command(ctx.client, p, name, rest, count).map(|()| CmdOutput::default()).map_err(CmdError);
+        }
         if a.has('H') {
             let mut bytes = Vec::with_capacity(keys.len());
             for k in &keys {
@@ -1696,6 +1716,57 @@ impl Model {
         ok()
     }
 
+    /// tmux's `source-file` for lif's TOML files: every command that can
+    /// run does; problems (the file's and the commands') are logged for
+    /// `show-messages` and returned as the error, one per line.
+    fn cmd_source_file(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let mut out = String::new();
+        let mut errors: Vec<String> = Vec::new();
+        for path in a.strings(0) {
+            let path = if a.has('F') {
+                let c = self.fctx(&*host, None, None, None, ctx.client, ctx.now);
+                format::expand(&path, &c)
+            } else {
+                path
+            };
+            let file = match host.read_config(&path) {
+                Ok(f) => f,
+                Err(ConfigError::Missing(_)) if a.has('q') => continue,
+                Err(ConfigError::Missing(m) | ConfigError::Invalid(m)) => {
+                    self.log_message(m.clone());
+                    errors.push(m);
+                    continue;
+                }
+            };
+            for (is_error, d) in file.diagnostics {
+                self.log_message(d.clone());
+                if is_error {
+                    errors.push(d);
+                } else {
+                    out.push_str(&d);
+                    out.push('\n');
+                }
+            }
+            if a.has('n') {
+                continue;
+            }
+            for (cmd, at) in &file.commands {
+                if a.has('v') {
+                    out.push_str(&format!("{at}: {cmd}\n"));
+                }
+                match parse_string(cmd).and_then(|l| self.execute_list(&l, ctx, host)) {
+                    Ok(o) => out.push_str(&o.stdout),
+                    Err(e) => {
+                        let m = format!("{at}: {e}");
+                        self.log_message(m.clone());
+                        errors.push(m);
+                    }
+                }
+            }
+        }
+        if errors.is_empty() { text(out) } else { Err(CmdError(errors.join("\n"))) }
+    }
+
     fn cmd_capture(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let p = need_pane(&f)?;
@@ -1711,6 +1782,7 @@ impl Model {
             end: pos(a.get('E'), LinePos::ScreenEnd, LinePos::ScreenEnd)?,
             join_wrapped: a.has('J'),
             keep_trailing: a.has('N') || a.has('J'),
+            styled: a.has('e'),
         };
         let out = host.capture_pane(p, range);
         if a.has('p') {

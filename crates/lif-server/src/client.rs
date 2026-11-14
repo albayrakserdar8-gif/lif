@@ -89,6 +89,16 @@ pub(crate) struct Attached {
     pub(crate) paste: Option<PaneId>,
     /// OSC 52 reads relayed to this terminal, in order.
     pub(crate) clip_reads: VecDeque<(PaneId, u8)>,
+    /// Styles of borders and copy-mode overlays (from the options).
+    pub(crate) theme: lif_render::Theme,
+    /// `message-style`: messages and prompts.
+    pub(crate) msg_style: lif_types::Style,
+    /// A pane in a mode holds the mouse while a button is down over it:
+    /// drags past its edges still go to it (and scroll it).
+    pub(crate) mode_drag: Option<(PaneId, lif_types::Rect)>,
+    /// A left button press on a pane not in a mode: a drag from it starts
+    /// copy mode with a selection (tmux's MouseDrag1Pane: copy-mode -M).
+    pub(crate) mouse_press: Option<(PaneId, lif_types::Rect, lif_types::MouseEvent)>,
 }
 
 pub(crate) struct ClientRt {
@@ -102,6 +112,8 @@ pub(crate) struct ClientRt {
     out_pos: usize,
     /// WRITABLE interest is registered.
     pub(crate) want_write: bool,
+    /// The socket holds part of a frame (told to the panic hook).
+    pub(crate) mid_frame: bool,
     /// Close once `out` is flushed (Exit was sent).
     pub(crate) closing: bool,
     /// Remove at the end of the iteration.
@@ -124,12 +136,19 @@ impl ClientRt {
             out: Vec::new(),
             out_pos: 0,
             want_write: false,
+            mid_frame: false,
             closing: false,
             dead: false,
             blocked_on: None,
             read_more: false,
             att: None,
         }
+    }
+
+    /// Some but not all of the queued bytes went out: the socket may hold
+    /// part of a frame.
+    pub(crate) fn partly_sent(&self) -> bool {
+        self.out_pos > 0 && self.out_pos < self.out.len()
     }
 
     pub(crate) fn out_pending(&self) -> bool {

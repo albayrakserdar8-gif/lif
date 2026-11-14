@@ -315,7 +315,25 @@ pub fn reference(scene: &Scene<'_>, caps: OuterCaps) -> Shot {
                 let selected = p
                     .selection
                     .is_some_and(|s| s.contains(px as u16, py as u16));
-                let sel_or = |st: Style| if selected { scene.theme.selection } else { st };
+                // Matches go under the selection; a current one wins.
+                let (mut matched, mut current) = (false, false);
+                for m in p.matches {
+                    if m.y as usize == py && (m.x0 as usize..=m.x1 as usize).contains(&px) {
+                        matched = true;
+                        current |= m.current;
+                    }
+                }
+                let sel_or = |st: Style| {
+                    if selected {
+                        scene.theme.selection
+                    } else if current {
+                        scene.theme.current_match
+                    } else if matched {
+                        scene.theme.search_match
+                    } else {
+                        st
+                    }
+                };
                 let Some(cell) = cell else {
                     g[y * cols + x] = ECell::styled_blank(sel_or(Style::default()));
                     x += 1;

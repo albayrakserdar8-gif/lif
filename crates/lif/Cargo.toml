@@ -16,6 +16,7 @@ lif-proto.workspace = true
 lif-client.workspace = true
 lif-server.workspace = true
 lif-core.workspace = true
+lif-config.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

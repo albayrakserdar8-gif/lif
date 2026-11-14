@@ -10,23 +10,52 @@
 //! the terminal takes it. So the client holds at most one read
 //! (`lif_proto::READ_CHUNK`) of output, and a slow terminal pushes back on
 //! the server through the socket buffer.
+//!
+//! Leaving. When the server sends `Exit` it has already sent the bytes that
+//! restore the outer terminal. When the client leaves on its own the server
+//! still owns that knowledge, so on SIGTERM / SIGINT / SIGQUIT the client
+//! sends `Detach` and keeps relaying until `Exit` (or the socket closes),
+//! for at most [`SERVER_WAIT`]. Only then, if the server did not restore
+//! the terminal, it writes [`FALLBACK_RESTORE`] itself. That phase is the
+//! only one with poll timeouts: the steady state still has no timers. After
+//! SIGHUP or end of input the terminal is gone: nothing is written to it and
+//! `Detach` gets [`HANGUP_FLUSH`] at most.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::time::{Duration, Instant};
 
 use lif_proto::{encode_input, type_id, ClientMsg, ExitReason, ServerMsg};
 use lif_types::{PixelSize, Size};
 
 use crate::conn::Connection;
-use crate::signals::SignalPipe;
+use crate::signals::{self, SignalPipe};
 use crate::sys;
-use crate::term::RawGuard;
+use crate::term::{RawGuard, FALLBACK_RESTORE};
 
 /// Size of the terminal read buffer.
 const READ_BUF: usize = 64 * 1024;
 
 /// Stop reading the terminal while this much is waiting for the socket.
 const SOCK_HIGH: usize = 64 * 1024;
+
+/// How long a client leaving on a signal waits for the server's `Exit`
+/// (relaying the restore bytes before it). A healthy local server answers
+/// in well under a millisecond and its restore sequence is a few hundred
+/// bytes, so this only expires when the server is hung or a large frame is
+/// stuck behind a terminal that does not read; it is short enough that
+/// `kill` still feels immediate and far below the SIGTERM-to-SIGKILL grace
+/// of service managers and shells closing.
+const SERVER_WAIT: Duration = Duration::from_millis(400);
+
+/// Upper bound for the whole shutdown on a signal: [`SERVER_WAIT`], then
+/// the rest for writing [`FALLBACK_RESTORE`] (about 150 bytes, which a
+/// live terminal takes at once).
+const SHUTDOWN: Duration = Duration::from_millis(500);
+
+/// After a hangup only `Detach` is left to send; it normally goes out at
+/// once and this bounds the case of a socket buffer full of input.
+const HANGUP_FLUSH: Duration = Duration::from_millis(100);
 
 /// The terminal the loop drives. Separate fds so tests can use a PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +81,11 @@ impl TermFds {
 pub enum ExitCause {
     /// The server sent `Exit`.
     Server,
-    /// SIGHUP or SIGTERM; the client sent `Detach`.
+    /// A terminating signal (SIGTERM, SIGINT, SIGQUIT, SIGHUP); the client
+    /// sent `Detach`. Except after SIGHUP it waited for the server to
+    /// restore the terminal, and restored it itself if the server did not
+    /// answer; `reason` and `message` come from the server's `Exit` if
+    /// it answered.
     Signal(i32),
     /// The terminal input reached end of file or failed (the terminal went
     /// away); the client sent `Detach`.
@@ -66,25 +99,74 @@ pub struct ExitInfo {
     pub reason: ExitReason,
     /// From the server's `Exit`; already printed to the terminal.
     pub message: String,
+    /// A terminating signal received while attached, including one that
+    /// arrived during cleanup after the server's `Exit`. [`attach_loop`]
+    /// re-raises it before returning; callers of [`attach_loop_with`]
+    /// decide themselves.
+    pub signal: Option<i32>,
 }
 
-/// [`attach_loop_with`] on stdin / stdout.
+impl ExitInfo {
+    fn detached(cause: ExitCause) -> ExitInfo {
+        ExitInfo { cause, reason: ExitReason::Detached, message: String::new(), signal: None }
+    }
+}
+
+/// [`attach_loop_with`] on stdin / stdout, for the lif binary.
+///
+/// If a terminating signal ended (or arrived during the end of) the
+/// attachment, it is re-raised once the terminal is restored, under the
+/// disposition the process had before attaching. With the default one the
+/// process dies by that signal, which is what its parent (a shell, a
+/// service manager) expects of a process it sent SIGTERM; if the
+/// disposition was "ignore" this returns normally. A normal detach returns.
 pub fn attach_loop(conn: Connection) -> io::Result<ExitInfo> {
-    attach_loop_with(conn, TermFds::stdio())
+    let (result, signal) = attach(conn, TermFds::stdio());
+    if let Some(sig) = signal {
+        signals::reraise(sig);
+    }
+    result
 }
 
 /// Relays between the terminal and the server until the server sends
 /// `Exit`, a signal or terminal hangup detaches, or an error occurs. The
 /// terminal is in raw mode for the duration and restored on every path
 /// (including panics); the `Exit` message is printed after restoring.
-pub fn attach_loop_with(mut conn: Connection, fds: TermFds) -> io::Result<ExitInfo> {
-    let signals = SignalPipe::install()?;
-    let guard = RawGuard::enter(fds.tty, fds.input, fds.output)?;
-    conn.stream.set_nonblocking(true)?;
-    let result = Relay::new().run(&mut conn, &fds, &signals);
+///
+/// The outer terminal's modes (alternate screen, mouse, keyboard
+/// protocol, ...) are restored by the server's bytes when it answers, and
+/// with [`FALLBACK_RESTORE`] when it does not (it closed the connection,
+/// broke the protocol, or did not answer `Detach` within the shutdown
+/// timeout), unless the terminal itself is gone.
+pub fn attach_loop_with(conn: Connection, fds: TermFds) -> io::Result<ExitInfo> {
+    attach(conn, fds).0
+}
+
+/// The attachment and its cleanup; also returns the terminating signal to
+/// re-raise, if any (on the error path too).
+fn attach(mut conn: Connection, fds: TermFds) -> (io::Result<ExitInfo>, Option<i32>) {
+    let signals = match SignalPipe::install() {
+        Ok(s) => s,
+        Err(e) => return (Err(e), None),
+    };
+    let guard = match RawGuard::enter(fds.tty, fds.input, fds.output) {
+        Ok(g) => g,
+        Err(e) => return (Err(e), signals.finish()),
+    };
+    let mut relay = Relay::new();
+    let result = match conn.stream.set_nonblocking(true) {
+        Ok(()) => relay.attach(&mut conn, &fds, &signals),
+        Err(e) => Err(e),
+    };
     drop(guard);
-    drop(signals);
-    let exit = result?;
+    // A signal that arrived after the loop stopped looking (e.g. right
+    // behind the server's Exit) is still in the pipe.
+    let late = signals.finish();
+    let signal = relay.signal.or(late);
+    let exit = match result {
+        Ok(exit) => exit,
+        Err(e) => return (Err(e), signal),
+    };
     if !exit.message.is_empty() {
         let mut line = exit.message.clone().into_bytes();
         line.push(b'\n');
@@ -92,7 +174,17 @@ pub fn attach_loop_with(mut conn: Connection, fds: TermFds) -> io::Result<ExitIn
         // message must not turn a clean exit into an error.
         let _ = sys::write_all(fds.output, &line);
     }
-    Ok(exit)
+    (Ok(ExitInfo { signal, ..exit }), signal)
+}
+
+/// How the steady-state loop ended.
+enum End {
+    /// The server sent `Exit`.
+    Exit(ExitInfo),
+    /// SIGTERM / SIGINT / SIGQUIT: the terminal is still there.
+    Leave(i32),
+    /// The terminal is gone (SIGHUP, input EOF or error).
+    Hangup(ExitCause),
 }
 
 struct Relay {
@@ -105,6 +197,10 @@ struct Relay {
     input_open: bool,
     resize_pending: bool,
     last_size: (Size, PixelSize),
+    /// The terminal failed or hung up: never write to it again.
+    term_dead: bool,
+    /// The terminating signal that ended the loop.
+    signal: Option<i32>,
 }
 
 impl Relay {
@@ -117,6 +213,8 @@ impl Relay {
             input_open: true,
             resize_pending: false,
             last_size: Default::default(),
+            term_dead: false,
+            signal: None,
         }
     }
 
@@ -124,14 +222,49 @@ impl Relay {
         self.sock_out.len() - self.sock_pos
     }
 
-    fn run(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe) -> io::Result<ExitInfo> {
+    /// The loop and the way out of it. Writes [`FALLBACK_RESTORE`] on every
+    /// path where the terminal is alive and the server did not restore it.
+    fn attach(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe) -> io::Result<ExitInfo> {
+        let sock = conn.stream.as_raw_fd();
+        match self.run(conn, fds, signals) {
+            Ok(End::Exit(exit)) => Ok(exit),
+            Ok(End::Leave(sig)) => {
+                self.signal = Some(sig);
+                let start = Instant::now();
+                let cause = ExitCause::Signal(sig);
+                match self.shutdown(conn, fds, signals, start + SERVER_WAIT) {
+                    Ok(Some(exit)) => Ok(ExitInfo { cause, ..exit }),
+                    // Timed out, or the server is gone: we leave anyway.
+                    Ok(None) | Err(_) => {
+                        self.write_fallback(fds.output, start + SHUTDOWN);
+                        Ok(ExitInfo::detached(cause))
+                    }
+                }
+            }
+            Ok(End::Hangup(cause)) => {
+                if let ExitCause::Signal(sig) = cause {
+                    self.signal = Some(sig);
+                }
+                // Best effort: the server also notices the closed socket.
+                let _ = ClientMsg::Detach.encode(&mut self.sock_out);
+                let _ = self.flush_sock_until(sock, Instant::now() + HANGUP_FLUSH);
+                Ok(ExitInfo::detached(cause))
+            }
+            Err(e) => {
+                self.write_fallback(fds.output, Instant::now() + SHUTDOWN);
+                Err(e)
+            }
+        }
+    }
+
+    fn run(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe) -> io::Result<End> {
         // The terminal may have changed size between Hello and now.
         self.last_size = (conn.hello_size, conn.hello_pixels);
         self.resize_pending = true;
         let sock = conn.stream.as_raw_fd();
         loop {
             if let Some(exit) = self.write_frames(conn, fds)? {
-                return Ok(exit);
+                return Ok(End::Exit(exit));
             }
             if self.resize_pending && self.sock_pending() < SOCK_HIGH {
                 self.resize_pending = false;
@@ -173,10 +306,19 @@ impl Relay {
                 let mut leave = None;
                 signals.drain(|sig| match sig {
                     libc::SIGWINCH => self.resize_pending = true,
-                    sig => leave = Some(sig),
+                    // A hangup wins: the terminal is gone whatever else came.
+                    libc::SIGHUP => leave = Some(sig),
+                    sig => {
+                        leave.get_or_insert(sig);
+                    }
                 });
-                if let Some(sig) = leave {
-                    return Ok(self.detach(sock, ExitCause::Signal(sig)));
+                match leave {
+                    Some(libc::SIGHUP) => {
+                        self.term_dead = true;
+                        return Ok(End::Hangup(ExitCause::Signal(libc::SIGHUP)));
+                    }
+                    Some(sig) => return Ok(End::Leave(sig)),
+                    None => {}
                 }
             }
             if ready(3) {
@@ -185,16 +327,83 @@ impl Relay {
             }
             if ready(2) && !self.read_input(fds.input)? {
                 self.input_open = false;
-                return Ok(self.detach(sock, ExitCause::InputClosed));
+                self.term_dead = true;
+                return Ok(End::Hangup(ExitCause::InputClosed));
             }
             if ready(1) && pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 && !self.out_blocked {
                 match conn.dec.read_from(&mut conn.stream) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed the connection")),
+                    Ok(0) => return Err(server_closed()),
                     Ok(_) => {}
                     Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
                     Err(e) => return Err(e),
                 }
             }
+        }
+    }
+
+    /// Sends `Detach` and relays server output until `Exit` (`Some`) or
+    /// `deadline` (`None`). The terminal input is no longer read: keys
+    /// typed now stay queued for the shell.
+    fn shutdown(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe, deadline: Instant) -> io::Result<Option<ExitInfo>> {
+        let sock = conn.stream.as_raw_fd();
+        ClientMsg::Detach.encode(&mut self.sock_out)?;
+        loop {
+            if let Some(exit) = self.write_frames(conn, fds)? {
+                return Ok(Some(exit));
+            }
+            self.flush_sock(sock)?;
+            let Some(timeout) = sys::poll_ms(deadline) else { return Ok(None) };
+            let mut sock_events = 0;
+            if !self.out_blocked {
+                sock_events |= libc::POLLIN;
+            }
+            if self.sock_pending() > 0 {
+                sock_events |= libc::POLLOUT;
+            }
+            let entry = |fd: RawFd, events: libc::c_short| libc::pollfd { fd: if events == 0 { -1 } else { fd }, events, revents: 0 };
+            let mut pfds = [
+                entry(signals.fd(), libc::POLLIN),
+                entry(sock, sock_events),
+                entry(fds.output, if self.out_blocked { libc::POLLOUT } else { 0 }),
+            ];
+            // SAFETY: pfds is a valid array of pollfd of the given length.
+            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if pfds[0].revents != 0 {
+                let mut hangup = false;
+                // Further SIGTERMs change nothing: we are already leaving.
+                signals.drain(|sig| hangup |= sig == libc::SIGHUP);
+                if hangup {
+                    self.term_dead = true;
+                    return Ok(None);
+                }
+            }
+            if pfds[2].revents != 0 {
+                self.out_blocked = false;
+            }
+            if pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 && !self.out_blocked {
+                match conn.dec.read_from(&mut conn.stream) {
+                    Ok(0) => return Err(server_closed()),
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
+    /// The server did not restore the terminal: do it ourselves, unless the
+    /// terminal is gone. Bounded by `deadline` for a terminal that does not
+    /// read.
+    fn write_fallback(&self, output: RawFd, deadline: Instant) {
+        if !self.term_dead {
+            let _ = sys::write_all_until(output, FALLBACK_RESTORE, deadline);
         }
     }
 
@@ -209,7 +418,10 @@ impl Relay {
                     Ok(n) => conn.dec.consume_data(n),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.out_blocked = true,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.term_dead = true;
+                        return Err(e);
+                    }
                 }
                 continue;
             }
@@ -217,7 +429,7 @@ impl Relay {
             let msg = frame.decode::<ServerMsg>();
             conn.dec.consume_frame();
             if let ServerMsg::Exit { reason, message } = msg? {
-                return Ok(Some(ExitInfo { cause: ExitCause::Server, reason, message }));
+                return Ok(Some(ExitInfo { cause: ExitCause::Server, reason, message, signal: None }));
             }
             // Anything else is meaningless while attached (or unknown, rule 2).
         }
@@ -273,12 +485,18 @@ impl Relay {
         Ok(())
     }
 
-    /// Sends `Detach` as best it can without blocking: we are leaving
-    /// anyway, and the server also notices the closed socket.
-    fn detach(&mut self, sock: RawFd, cause: ExitCause) -> ExitInfo {
-        let _ = ClientMsg::Detach.encode(&mut self.sock_out);
-        let _ = self.flush_sock(sock);
-        ExitInfo { cause, reason: ExitReason::Detached, message: String::new() }
+    /// [`Relay::flush_sock`], waiting for the socket up to `deadline`.
+    fn flush_sock_until(&mut self, sock: RawFd, deadline: Instant) -> io::Result<()> {
+        loop {
+            self.flush_sock(sock)?;
+            if self.sock_pending() == 0 {
+                return Ok(());
+            }
+            let ms = sys::poll_ms(deadline).ok_or(io::ErrorKind::TimedOut)?;
+            let mut p = libc::pollfd { fd: sock, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: one valid pollfd.
+            unsafe { libc::poll(&mut p, 1, ms) };
+        }
     }
 
     fn size_changed(&mut self, tty: RawFd) -> Option<(Size, PixelSize)> {
@@ -290,4 +508,8 @@ impl Relay {
         self.last_size = now;
         Some(now)
     }
+}
+
+fn server_closed() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "server closed the connection")
 }

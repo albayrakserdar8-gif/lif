@@ -7,22 +7,29 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use lif_core::{
-    CaptureRange, ClientId, CopyModeOptions, DetachReason, Host, LinePos, PaneId, PaneInfo, PaneInput, Prompt, Redraw,
-    SessionId, SpawnCommand, SpawnSpec,
+    CaptureRange, ClientId, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, LinePos, PaneId, PaneInfo,
+    PaneInput, Prompt, Redraw, SessionId, SpawnCommand, SpawnSpec,
 };
 use lif_input::{CapsProbe, InputParser};
 use lif_proto::{ExitReason, ServerMsg};
 use lif_pty::{ChildReaper, Pty, SpawnOptions};
 use lif_render::Renderer;
-use lif_types::{PaneFrame, PixelSize, Size, Span, StyledLine};
-use lif_vt::{Rgb, TextRange, VtEngine, VtOptions};
+use lif_types::{PaneFrame, PixelSize, Pos, Size, Span, StyledLine};
+use lif_vt::{Rgb, TextOptions, TextRange, VtEngine, VtOptions};
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
 
 use crate::client::{Attached, ClientRt, DisplayPanes, Message, emergency_bytes, leave_bytes};
-use crate::mode::{Engine, ModeCtx, new_copy_mode};
+use crate::mode::{Engine, ModeAction, ModeCtx, new_copy_mode};
 use crate::pane::PaneRt;
-use crate::prompt::{PromptState, message_style};
+use crate::prompt::PromptState;
+
+/// Copy mode's settings for one combination of the options it reads.
+pub(crate) struct CopyConfig {
+    /// (key bindings generation, vi keys, word-separators, wrap-search).
+    pub(crate) key: (u64, bool, String, bool),
+    pub(crate) cfg: lif_copy::Config,
+}
 
 pub(crate) const PANE_TOKEN: usize = 1 << 32;
 pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
@@ -57,6 +64,15 @@ pub(crate) struct Rt {
     pub(crate) prompt_history: Vec<String>,
     pub(crate) scratch: Vec<u8>,
     pub(crate) server_env_zellij: Vec<OsString>,
+    /// Settings new copy modes get (the server keeps them current).
+    pub(crate) copy_cfg: CopyConfig,
+    /// What modes asked for during a model call, carried out after it
+    /// returns (a copy needs the model's paste buffers): (client, pane, what).
+    pub(crate) mode_actions: Vec<(Option<ClientId>, PaneId, ModeAction)>,
+    /// Panes that entered or left a mode during a model call.
+    pub(crate) mode_changed: Vec<PaneId>,
+    /// Configuration problems found at start-up, for the first client.
+    pub(crate) startup_message: Option<String>,
 }
 
 pub(crate) fn pane_token(p: PaneId) -> Token {
@@ -82,6 +98,21 @@ impl Rt {
             prompt_history: Vec::new(),
             scratch: Vec::new(),
             server_env_zellij,
+            // Built from the model on first use (the key never matches).
+            copy_cfg: CopyConfig {
+                key: (u64::MAX, false, String::new(), true),
+                cfg: lif_copy::Config {
+                    mode_keys: lif_copy::ModeKeys::Emacs,
+                    table: std::rc::Rc::new(lif_copy::KeyTable::new()),
+                    word_separators: String::new(),
+                    wrap_search: true,
+                    mouse: lif_copy::MouseConfig::default(),
+                    search_step_rows: lif_copy::DEFAULT_SEARCH_STEP_ROWS,
+                },
+            },
+            mode_actions: Vec::new(),
+            mode_changed: Vec::new(),
+            startup_message: None,
         }
     }
 
@@ -120,7 +151,13 @@ impl Rt {
     /// Flush a client's output and keep WRITABLE interest in step with it.
     pub(crate) fn flush_client(&mut self, id: ClientId) {
         let Some(c) = self.clients.get_mut(&id) else { return };
-        match c.flush() {
+        let result = c.flush();
+        let mid = c.partly_sent();
+        if mid != c.mid_frame {
+            c.mid_frame = mid;
+            crate::panic::set_mid_frame(std::os::fd::AsRawFd::as_raw_fd(&c.stream), mid);
+        }
+        match result {
             Ok(pending) => {
                 if pending != c.want_write {
                     c.want_write = pending;
@@ -225,7 +262,14 @@ impl Rt {
             active_pane: None,
             paste: None,
             clip_reads: Default::default(),
+            theme: lif_render::Theme::default(),
+            msg_style: crate::prompt::message_style(),
+            mode_drag: None,
+            mouse_press: None,
         });
+        if let Some(text) = self.startup_message.take() {
+            att.message = Some(Message { line: vec![Span::new(text, att.msg_style)], expires: None });
+        }
         c.send(&ServerMsg::Attached);
         let mut b = Vec::new();
         lif_input::write_queries(&mut b);
@@ -354,13 +398,11 @@ impl Host for Rt {
         if let Some(p) = self.panes.get_mut(&pane) {
             match input {
                 PaneInput::Key(k) => {
-                    if let Some(m) = p.mode.as_mut() {
-                        let a = m.key(k, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
-                        if a == crate::mode::ModeAction::Exit {
-                            p.leave_mode();
-                        }
-                    } else {
-                        p.engine.encode_key(k, &mut buf);
+                    // send-keys into a pane in a mode drives the mode, as in
+                    // tmux.
+                    match p.with_mode(|m, ctx| m.key(k, ctx)) {
+                        Some(a) => self.mode_actions.push((None, pane, a)),
+                        None => p.engine.encode_key(k, &mut buf),
                     }
                 }
                 PaneInput::Text(t) => buf.extend_from_slice(t.as_bytes()),
@@ -414,7 +456,8 @@ impl Host for Rt {
         if b < a {
             std::mem::swap(&mut a, &mut b);
         }
-        let text = p.engine.text(TextRange::Rows { start: a as usize, end: b as usize + 1 }, range.join_wrapped);
+        let opts = TextOptions { join_wrapped: range.join_wrapped, keep_trailing: range.keep_trailing, styled: range.styled };
+        let text = p.engine.capture(TextRange::Rows { start: a as usize, end: b as usize + 1 }, opts);
         let mut out = String::with_capacity(text.len() + 64);
         let mut lines = 0i64;
         if !text.is_empty() {
@@ -471,23 +514,45 @@ impl Host for Rt {
         self.views_stale = true;
     }
 
-    fn enter_copy_mode(&mut self, _client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions) {
+    fn enter_copy_mode(&mut self, client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         if opts.cancel {
-            p.leave_mode();
-        } else if let Some(m) = p.mode.as_mut() {
-            m.reenter(opts, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
+            if p.mode.is_some() {
+                p.leave_mode();
+                self.mode_changed.push(pane);
+            }
+        } else if let Some(a) = p.with_mode(|m, ctx| m.reenter(opts, ctx)) {
+            self.mode_actions.push((client, pane, a));
         } else {
-            let m = new_copy_mode(opts, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
-            p.mode = Some(m);
+            enter_copy(p, opts, &self.copy_cfg.cfg);
+            self.mode_changed.push(pane);
         }
         self.views_stale = true;
         self.mark_all(true);
     }
 
+    fn mode_command(
+        &mut self,
+        client: Option<ClientId>,
+        pane: PaneId,
+        command: &str,
+        args: &[String],
+        count: u32,
+    ) -> Result<(), String> {
+        let p = self.panes.get_mut(&pane).ok_or("not in a mode")?;
+        let arg = args.first().map(|s| s.as_str());
+        let a = p.with_mode(|m, ctx| m.command(command, arg, count, ctx)).ok_or("not in a mode")??;
+        self.mode_actions.push((client, pane, a));
+        Ok(())
+    }
+
+    fn read_config(&mut self, path: &str) -> Result<ConfigFile, ConfigError> {
+        read_config(path)
+    }
+
     fn show_message(&mut self, client: ClientId, text: &str, duration_ms: u64) {
         let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
-        let line = vec![Span::new(text.replace(['\n', '\r'], " "), message_style())];
+        let line = vec![Span::new(text.replace(['\n', '\r'], " "), a.msg_style)];
         let expires = (duration_ms > 0).then(|| Instant::now() + std::time::Duration::from_millis(duration_ms));
         a.message = Some(Message { line, expires });
         a.needs_frame = true;
@@ -545,4 +610,62 @@ impl Host for Rt {
         log!("model asked for shutdown");
         self.shutdown = true;
     }
+}
+
+/// Put `p` into copy mode, the cursor where the program's is.
+pub(crate) fn enter_copy(p: &mut PaneRt, opts: CopyModeOptions, cfg: &lif_copy::Config) {
+    // The frame is only refreshed at frame ticks; bring its cursor up to
+    // date (the dirty flags this sets are drawn at the next tick).
+    p.engine.refresh(&mut p.frame);
+    let last = p.size.rows.saturating_sub(1);
+    let cursor = p.frame.cursor.pos.unwrap_or(Pos { x: 0, y: last });
+    // Copy mode keeps its positions on their text while the scrollback
+    // limit evicts rows; counting them costs a little per feed, so only now.
+    p.engine.track_trimmed(true);
+    p.mode = Some(new_copy_mode(opts, cfg, cursor, &mut ModeCtx { engine: &mut p.engine }));
+}
+
+/// Expand a leading `~/` with `$HOME`, as tmux does for file names.
+fn expand_home(path: &str) -> PathBuf {
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+/// `source-file`: lif's TOML configuration, translated by lif-config.
+pub(crate) fn read_config(path: &str) -> Result<ConfigFile, ConfigError> {
+    let file = expand_home(path);
+    let hint = || {
+        ConfigError::Invalid(format!(
+            "{path}: this looks like a tmux configuration file, but lif reads TOML; \
+             convert it with: lif migrate-tmux-conf {path} > ~/.config/lif/config.toml"
+        ))
+    };
+    if lif_config::looks_like_tmux_conf(path) {
+        return Err(hint());
+    }
+    match std::fs::metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::Missing(format!("{path}: No such file or directory")));
+        }
+        Err(e) => return Err(ConfigError::Invalid(format!("{path}: {e}"))),
+        Ok(_) => {}
+    }
+    let cfg = lif_config::Config::load_file(&file);
+    // Not TOML at all, but tmux commands: point at the translator rather
+    // than at a TOML syntax error.
+    if cfg.commands.is_empty()
+        && cfg.has_errors()
+        && let Ok(text) = std::fs::read_to_string(&file)
+        && let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'))
+        && lif_core::parse_string(first).is_ok_and(|l| !l.is_empty())
+        && !first.contains('=')
+    {
+        return Err(hint());
+    }
+    let name = file.display().to_string();
+    let commands = cfg.commands.iter().map(|e| (e.command.clone(), format!("{name}:{}:{}", e.line, e.column))).collect();
+    let diagnostics = cfg.diagnostics.iter().map(|d| (d.severity == lif_config::Severity::Error, format!("{name}:{d}"))).collect();
+    Ok(ConfigFile { commands, diagnostics })
 }

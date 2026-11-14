@@ -18,5 +18,7 @@ lif-pty.workspace = true
 lif-core.workspace = true
 lif-input.workspace = true
 lif-render.workspace = true
+lif-copy.workspace = true
+lif-config.workspace = true
 libc.workspace = true
 mio.workspace = true

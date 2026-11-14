@@ -14,3 +14,9 @@ workspace = true
 lif-types.workspace = true
 lif-proto.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+# Checks that FALLBACK_RESTORE undoes everything lif-input's setup enables.
+lif-input.workspace = true
+# Replays the fallback through a real terminal emulator to check the modes.
+lif-vt.workspace = true

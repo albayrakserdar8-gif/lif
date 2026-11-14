@@ -155,6 +155,30 @@ pub struct CaptureRange {
     pub join_wrapped: bool,
     /// Keep trailing spaces (`-N` / `-J`).
     pub keep_trailing: bool,
+    /// Include escape sequences for colors and attributes (`-e`).
+    pub styled: bool,
+}
+
+/// A configuration file translated into commands, for `source-file`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigFile {
+    /// Commands in the order they run, each with where it came from
+    /// (`path:line:column`), which prefixes its error if it fails.
+    pub commands: Vec<(String, String)>,
+    /// Problems found while reading it, already formatted
+    /// (`path:line:column: error: ...`), in file order, each marked as an
+    /// error (`true`) or a warning. The commands that could be read still
+    /// run.
+    pub diagnostics: Vec<(bool, String)>,
+}
+
+/// Why a configuration file could not be read at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// It does not exist (`source-file -q` stays quiet about this).
+    Missing(String),
+    /// Anything else, with the message to show.
+    Invalid(String),
 }
 
 /// Why a client is being detached. The server maps these to its exit
@@ -291,6 +315,28 @@ pub trait Host {
     /// mode). `client` is the client that asked, if any. Copy mode itself is
     /// the server's.
     fn enter_copy_mode(&mut self, client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions);
+
+    /// `send-keys -X`: run the copy-mode command named `command` (tmux's
+    /// name) with `args`, `count` times, in `pane`'s mode. `client` is the
+    /// client that asked, if any. The error is the message to report; tmux's
+    /// for a pane in no mode is `not in a mode`.
+    fn mode_command(
+        &mut self,
+        client: Option<ClientId>,
+        pane: PaneId,
+        command: &str,
+        args: &[String],
+        count: u32,
+    ) -> Result<(), String> {
+        let _ = (client, pane, command, args, count);
+        Err("not in a mode".to_string())
+    }
+
+    /// `source-file`: read and translate a configuration file. The model
+    /// runs the commands and reports what failed.
+    fn read_config(&mut self, path: &str) -> Result<ConfigFile, ConfigError> {
+        Err(ConfigError::Invalid(format!("{path}: configuration files are not supported here")))
+    }
 
     /// Show `text` on `client`'s status line for `duration_ms` (0: until the
     /// next key press).

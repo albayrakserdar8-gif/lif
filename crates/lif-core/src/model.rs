@@ -311,7 +311,15 @@ pub struct Model {
     pub(crate) buffers: Vec<PasteBuffer>,
     pub(crate) next_buffer: u32,
     pub(crate) counter: u64,
+    /// `#{pid}` and `#{socket_path}`, as the server reported them.
+    pub(crate) server_pid: u32,
+    pub(crate) socket_path: String,
+    /// The message log (`show-messages`), oldest first.
+    pub(crate) messages: std::collections::VecDeque<String>,
 }
+
+/// Messages kept for `show-messages` (tmux's `message-limit` default).
+const MESSAGE_LIMIT: usize = 1000;
 
 pub(crate) fn short_host(h: &str) -> &str {
     h.split('.').next().unwrap_or(h)
@@ -339,7 +347,31 @@ impl Model {
             buffers: Vec::new(),
             next_buffer: 0,
             counter: 0,
+            server_pid: 0,
+            socket_path: String::new(),
+            messages: std::collections::VecDeque::new(),
         }
+    }
+
+    /// The server's process id and socket, for `#{pid}` and
+    /// `#{socket_path}`.
+    pub fn set_server_info(&mut self, pid: u32, socket_path: impl Into<String>) {
+        self.server_pid = pid;
+        self.socket_path = socket_path.into();
+    }
+
+    /// Add a line to the message log `show-messages` prints (configuration
+    /// problems go there). The oldest lines are dropped past 1000.
+    pub fn log_message(&mut self, text: impl Into<String>) {
+        if self.messages.len() >= MESSAGE_LIMIT {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(text.into());
+    }
+
+    /// The message log, oldest first.
+    pub fn messages(&self) -> impl Iterator<Item = &str> {
+        self.messages.iter().map(|s| s.as_str())
     }
 
     // ----- read access -------------------------------------------------
@@ -1313,6 +1345,8 @@ impl Vars for Fctx<'_> {
             "host" => return Some(m.hostname.clone()),
             "host_short" => return Some(short_host(&m.hostname).to_string()),
             "version" => return Some(env!("CARGO_PKG_VERSION").to_string()),
+            "pid" => return Some(m.server_pid.to_string()),
+            "socket_path" => return Some(m.socket_path.clone()),
             _ => {}
         }
         // Like tmux, fall back to options.

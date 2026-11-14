@@ -38,7 +38,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub use tmux::{Migration, Untranslated, migrate_tmux_conf};
+pub use tmux::{Migration, Untranslated, looks_like_tmux_conf, migrate_tmux_conf};
 
 /// The documented example configuration, every key explained.
 pub const EXAMPLE: &str = include_str!("../config.example.toml");

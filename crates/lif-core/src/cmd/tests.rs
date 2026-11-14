@@ -142,3 +142,35 @@ fn round_trip_through_printing() {
         assert_eq!(once, twice, "{s}");
     }
 }
+
+#[test]
+fn escape_arg_round_trips() {
+    // xorshift64*, so failures reproduce.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    const ALPHABET: &[char] = &[
+        'a', 'Z', '0', '-', ' ', '"', '\'', '\\', '$', '#', ';', '{', '}', '%', '~', '\n', '\t', '\r', '\x01', '\x1b',
+        '\x7f', '\0', 'é', '中', '👍', '\u{301}', '=', ',', '!', '*',
+    ];
+    let check = |s: &str| {
+        let q = escape_arg(s);
+        let line = format!("display-message -- {q}");
+        let list = parse_string(&line).unwrap_or_else(|e| panic!("{s:?} escaped as {q:?}: {e}"));
+        let got = list.commands().first().and_then(|c| c.args().value(0)).map(str::to_string);
+        assert_eq!(got.as_deref(), Some(s), "{s:?} escaped as {q:?}");
+    };
+    // The reported case: only `"` special, plus a backslash or a control.
+    for s in ["a\"b\\c", "\"\n", "x\"\x01", "\\\"", "\"\x7f\""] {
+        check(s);
+    }
+    for _ in 0..20_000 {
+        let len = (next() % 8) as usize + 1;
+        let s: String = (0..len).map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize]).collect();
+        check(&s);
+    }
+}

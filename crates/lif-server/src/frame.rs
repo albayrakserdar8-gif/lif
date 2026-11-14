@@ -11,13 +11,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use lif_core::{ClientId, PaneId};
-use lif_render::{Message, Scene, ScenePane, StatusBar, StatusPosition, pane_cursor};
-use lif_types::{Cursor, Pos, Rect, Size};
+use lif_render::{Message, Scene, ScenePane, StatusBar, StatusPosition, Theme, pane_cursor};
+use lif_types::{Cursor, Pos, Rect, Size, Style};
 use lif_vt::VtEngine;
 
 use crate::client::ClientRt;
 use crate::pane::PaneRt;
-use crate::prompt::message_style;
 use crate::server::Server;
 use crate::{MIN_FRAME_INTERVAL, SYNC_TIMEOUT};
 
@@ -61,11 +60,17 @@ impl Server {
         for &id in &ids {
             let Some(view) = self.model.client_view(id) else { continue };
             let mouse = self.model.option_text("mouse", Some(view.session), None).as_deref() == Some("on");
+            let (theme, msg_style) = self.theme(view.session, view.active_pane);
             let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { continue };
             let old = a.active_pane;
             let new = view.active_pane;
             let focused = a.focused;
             a.mouse_opt = mouse;
+            if a.theme != theme || a.msg_style != msg_style {
+                a.theme = theme;
+                a.msg_style = msg_style;
+                a.status_stale = true;
+            }
             a.view = Some(view);
             a.active_pane = Some(new);
             a.needs_frame = true;
@@ -77,6 +82,26 @@ impl Server {
             }
         }
         self.scratch_views = ids;
+    }
+
+    /// The styles lif draws its own decorations in, from the options of
+    /// the session and of the window holding `pane` (tmux's
+    /// `pane-border-style`, `pane-active-border-style`, `mode-style`,
+    /// `copy-mode-match-style`, `copy-mode-current-match-style`,
+    /// `message-style`). Only computed when views are, never per frame.
+    fn theme(&self, session: lif_core::SessionId, pane: PaneId) -> (Theme, Style) {
+        let w = self.model.pane(pane).map(|p| p.window());
+        let style = |name: &str| lif_core::parse_style(&self.model.option_text(name, Some(session), w).unwrap_or_default());
+        let mode = style("mode-style");
+        let theme = Theme {
+            border: style("pane-border-style"),
+            active_border: style("pane-active-border-style"),
+            selection: mode,
+            indicator: mode,
+            search_match: style("copy-mode-match-style"),
+            current_match: style("copy-mode-current-match-style"),
+        };
+        (theme, style("message-style"))
     }
 
     pub(crate) fn timers(&mut self, now: Instant) {
@@ -112,6 +137,19 @@ impl Server {
             }
         }
         self.scratch_clients = ids;
+        let mut scroll = Vec::new();
+        for p in self.rt.panes.values() {
+            if p.autoscroll_at.is_some_and(|d| d <= now) {
+                scroll.push(p.id);
+            }
+        }
+        for id in scroll {
+            if let Some(p) = self.rt.panes.get_mut(&id) {
+                p.autoscroll_at = None;
+            }
+            let act = self.with_mode(id, |m, ctx| m.autoscroll_tick(ctx));
+            self.mode_action(None, id, act);
+        }
         let mut renamed = Vec::new();
         for p in self.rt.panes.values_mut() {
             if p.compact_at.is_some_and(|d| d <= now) {
@@ -221,6 +259,9 @@ impl Server {
         for pid in &refreshed {
             if let Some(p) = self.rt.panes.get_mut(pid) {
                 p.frame.clear_dirty();
+                if let Some(m) = p.mode.as_mut() {
+                    m.clear_frame_dirty();
+                }
                 p.refreshed = false;
             }
         }
@@ -321,7 +362,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
     let mut sp = recycle(scratch);
     let mut prompt_col = 0;
     if let Some(p) = a.prompt.as_ref() {
-        prompt_col = p.render(&mut a.prompt_line);
+        prompt_col = p.render(&mut a.prompt_line, a.msg_style);
     }
     {
         let Some(view) = a.view.as_ref() else {
@@ -334,25 +375,27 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
             let Some(rect) = clip(*rect, size) else { continue };
             let label = a.display_panes.as_ref().and_then(|d| d.labels.get(i)).map(|(_, l)| l.as_str());
             let mode = p.mode.as_deref();
-            let indicator = label.or_else(|| mode.and_then(|m| m.indicator()));
+            let ov = mode.map(|m| m.overlays());
+            let indicator = label.or_else(|| ov.map(|o| o.indicator.as_str()).filter(|s| !s.is_empty()));
             let active = *pid == view.active_pane;
             if active {
-                active_cursor = match mode {
-                    Some(m) => match m.cursor() {
-                        Some(pos) if pos.x < rect.cols && pos.y < rect.rows => {
-                            Cursor { pos: Some(Pos { x: rect.x + pos.x, y: rect.y + pos.y }), visible: true, ..Default::default() }
-                        }
-                        _ => Cursor::default(),
+                active_cursor = match ov {
+                    Some(o) if o.cursor.x < rect.cols && o.cursor.y < rect.rows => Cursor {
+                        pos: Some(Pos { x: rect.x + o.cursor.x, y: rect.y + o.cursor.y }),
+                        visible: true,
+                        ..Default::default()
                     },
+                    Some(_) => Cursor::default(),
                     None => pane_cursor(rect, &p.frame),
                 };
             }
             sp.push(ScenePane {
                 id: pid.0 as u64,
                 rect,
-                frame: &p.frame,
+                frame: mode.and_then(|m| m.frame()).unwrap_or(&p.frame),
                 active,
-                selection: mode.and_then(|m| m.selection()),
+                selection: ov.and_then(|o| o.selection),
+                matches: ov.map_or(&[], |o| o.matches.as_slice()),
                 indicator,
             });
         }
@@ -366,11 +409,12 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
             },
         });
         let message = if a.prompt.is_some() {
-            Some(Message { line: &a.prompt_line, fill: message_style() })
+            Some(Message { line: &a.prompt_line, fill: a.msg_style })
         } else {
-            a.message.as_ref().map(|m| Message { line: &m.line, fill: message_style() })
+            a.message.as_ref().map(|m| Message { line: &m.line, fill: a.msg_style })
         };
         let mut scene = Scene::new(size, &sp);
+        scene.theme = a.theme;
         scene.status = status;
         scene.message = message;
         scene.cursor = active_cursor;

@@ -4,7 +4,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use lif_types::{PaneFrame, Size};
+use lif_types::{FrameRow, PaneFrame, Size};
 use lif_vt::{GhosttyVt, Scroll, VtEngine, VtOptions};
 
 fn data() -> (Vec<u8>, Vec<u8>) {
@@ -67,6 +67,94 @@ fn per_iter_us(n: u32, mut f: impl FnMut()) -> f64 {
         f();
     }
     t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+}
+
+/// A copy-mode search reads every row in turn (`VtEngine::row_scan`).
+#[test]
+#[ignore]
+fn bench_scan() {
+    for (cols, mib) in [(80u16, 10usize), (80, 300), (200, 100)] {
+        let mut v = GhosttyVt::new(&VtOptions { size: Size::new(cols, 24), scrollback_bytes: mib << 20, ..Default::default() })
+            .unwrap();
+        let mut s = Vec::new();
+        for i in 0..400_000u32 {
+            s.extend_from_slice(format!("{i}\r\n").as_bytes());
+        }
+        for chunk in s.chunks(64 * 1024) {
+            v.feed(chunk);
+        }
+        let h = v.scrollback_rows();
+        let mut r = FrameRow::default();
+        let top = v.viewport_top();
+        let t = Instant::now();
+        for y in (0..h).rev() {
+            v.row_scan(y, &mut r);
+            black_box(&r);
+        }
+        let back = t.elapsed();
+        v.set_viewport_top(top);
+        let t = Instant::now();
+        for y in (0..h).step_by(97) {
+            v.row(y, &mut r);
+            black_box(&r);
+        }
+        let random = t.elapsed().as_secs_f64() * 1e6 / (h / 97) as f64;
+        println!(
+            "scan {cols} cols, {mib} MiB ({h} rows): row_scan backward {:.0} ms ({:.2} us/row); row() scattered {random:.1} us/row",
+            back.as_secs_f64() * 1e3,
+            back.as_secs_f64() * 1e6 / h as f64
+        );
+    }
+}
+
+/// Copy mode reads scrollback rows one at a time (`VtEngine::row`).
+#[test]
+#[ignore]
+fn bench_rows() {
+    for (cols, mib) in [(80u16, 10usize), (200, 100)] {
+        let mut v = GhosttyVt::new(&VtOptions { size: Size::new(cols, 50), scrollback_bytes: mib << 20, ..Default::default() })
+            .unwrap();
+        let mut s = Vec::new();
+        for i in 0..2_000_000u32 {
+            s.extend_from_slice(
+                format!("\x1b[3{}m{i:08}\x1b[0m the quick brown fox jumps over the lazy dog \u{4e2d}\u{6587}\r\n", i % 8)
+                    .as_bytes(),
+            );
+        }
+        for chunk in s.chunks(64 * 1024) {
+            v.feed(chunk);
+        }
+        let h = v.scrollback_rows();
+        let mut r = FrameRow::default();
+        for (name, compact) in [("plain", false), ("compressed", true)] {
+            for (where_, y) in [("oldest", 3usize), ("middle", h / 2), ("newest", h - 1)] {
+                if compact {
+                    for _ in 0..100_000 {
+                        v.compact();
+                    }
+                }
+                // The first read of a compressed page restores it.
+                let t = Instant::now();
+                v.row(y, &mut r);
+                let first = t.elapsed().as_secs_f64() * 1e6;
+                let us = per_iter_us(2_000, || {
+                    v.row(black_box(y), &mut r);
+                    black_box(&r);
+                });
+                // Copy mode keeps the viewport on the rows it shows.
+                v.set_viewport_top(y.saturating_sub(5));
+                let shown = per_iter_us(2_000, || {
+                    v.row(black_box(y), &mut r);
+                    black_box(&r);
+                });
+                v.set_viewport_top(h);
+                println!(
+                    "row() {cols} cols, {mib} MiB scrollback ({h} rows, {} pages compressed), {name:10} {where_:6}: first {first:7.1} us, then {us:6.2} us/row, {shown:6.2} us/row when in the viewport",
+                    v.memory().compressed_pages
+                );
+            }
+        }
+    }
 }
 
 #[test]

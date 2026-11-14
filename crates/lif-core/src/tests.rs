@@ -26,6 +26,11 @@ struct TestHost {
     bells: Vec<ClientId>,
     captures: Vec<CaptureRange>,
     shutdown: bool,
+    /// Panes in a mode, and the `send-keys -X` calls they got.
+    in_mode: Vec<PaneId>,
+    mode_commands: Vec<(PaneId, String, Vec<String>, u32)>,
+    /// What `read_config` returns, by path.
+    configs: HashMap<String, ConfigFile>,
 }
 
 impl Host for TestHost {
@@ -91,6 +96,23 @@ impl Host for TestHost {
     fn redraw(&mut self, _what: Redraw) {}
     fn shutdown(&mut self) {
         self.shutdown = true;
+    }
+    fn mode_command(
+        &mut self,
+        _client: Option<ClientId>,
+        pane: PaneId,
+        command: &str,
+        args: &[String],
+        count: u32,
+    ) -> Result<(), String> {
+        if !self.in_mode.contains(&pane) {
+            return Err("not in a mode".into());
+        }
+        self.mode_commands.push((pane, command.to_string(), args.to_vec(), count));
+        Ok(())
+    }
+    fn read_config(&mut self, path: &str) -> Result<ConfigFile, ConfigError> {
+        self.configs.get(path).cloned().ok_or_else(|| ConfigError::Missing(format!("{path}: No such file or directory")))
     }
 }
 
@@ -954,4 +976,92 @@ fn random_commands_keep_the_model_consistent() {
             }
         }
     }
+}
+
+#[test]
+fn copy_mode_tables_and_send_keys_x() {
+    let mut t = T::with_session();
+    // The default tables are tmux's (list-keys -T copy-mode-vi, tmux 3.8).
+    let vi = t.ok("list-keys -T copy-mode-vi");
+    for line in [
+        "bind-key -T copy-mode-vi v                 send-keys -X rectangle-toggle",
+        "bind-key -T copy-mode-vi Enter             send-keys -X copy-pipe-and-cancel",
+        "bind-key -T copy-mode-vi /                 command-prompt -P -T search -p \"(search down)\" { send-keys -X search-forward -- \"%%\" }",
+    ] {
+        let want: Vec<&str> = line.split_whitespace().collect();
+        assert!(vi.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == want), "{line}\n{vi}");
+    }
+    assert!(t.ok("list-keys -T copy-mode").contains("C-s"));
+    // Rebinding and unbinding go through the model like any table.
+    t.ok("bind -T copy-mode-vi y send-keys -X copy-selection-and-cancel");
+    assert!(t.ok("list-keys -T copy-mode-vi y").contains("copy-selection-and-cancel"));
+    t.ok("unbind -T copy-mode-vi y");
+    assert!(t.ok("list-keys -T copy-mode-vi").lines().all(|l| !l.contains(" y ")));
+    // send-keys -X: tmux's error outside a mode, and the call inside one.
+    assert_eq!(t.err("send-keys -X cursor-up"), "not in a mode");
+    let p = PaneId(0);
+    t.h.in_mode.push(p);
+    t.ok("send-keys -X -N 3 cursor-up");
+    t.ok("send-keys -X search-backward -- foo");
+    t.ok("send -t %0 -X begin-selection");
+    assert_eq!(
+        t.h.mode_commands,
+        vec![
+            (p, "cursor-up".into(), vec![], 3),
+            (p, "search-backward".into(), vec!["foo".into()], 1),
+            (p, "begin-selection".into(), vec![], 1),
+        ]
+    );
+    // The flags tmux's default prompts use parse.
+    assert!(parse_string("command-prompt -Pi -I \"#{pane_search_string}\" -T search -p x { send -X a }").is_ok());
+    // mode-keys, word-separators and the styles are options.
+    t.ok("set -g mode-keys vi");
+    assert_eq!(t.ok("show -gv mode-keys"), "vi\n");
+    assert_eq!(t.ok("show -gv mode-style"), "bg=yellow,fg=black\n");
+    t.ok("set -g pane-active-border-style fg=red,bold");
+    assert_eq!(t.ok("show -gv pane-active-border-style"), "fg=red,bold\n");
+    t.ok("set -g word-separators ' -'");
+    assert_eq!(t.ok("show -gv word-separators"), " -\n");
+    assert_eq!(parse_style("fg=red,bold").fg, lif_types::Color::Indexed(1));
+}
+
+#[test]
+fn source_file_runs_commands_and_reports_problems() {
+    let mut t = T::with_session();
+    t.h.configs.insert(
+        "/c.toml".into(),
+        ConfigFile {
+            commands: vec![
+                ("set -g base-index 1".into(), "/c.toml:1:1".into()),
+                ("set -g no-such-option 1".into(), "/c.toml:2:1".into()),
+                ("set -g status-left x".into(), "/c.toml:3:1".into()),
+            ],
+            diagnostics: vec![
+                (false, "/c.toml:4:1: warning: something odd".into()),
+                (true, "/c.toml:5:1: error: something wrong".into()),
+            ],
+        },
+    );
+    let e = t.err("source-file /c.toml");
+    assert_eq!(e, "/c.toml:5:1: error: something wrong\n/c.toml:2:1: invalid option: no-such-option");
+    // Everything that could run did.
+    assert_eq!(t.ok("show -gv base-index"), "1\n");
+    assert_eq!(t.ok("show -gv status-left"), "x\n");
+    let log = t.ok("show-messages");
+    assert!(log.contains("warning: something odd") && log.contains("invalid option"), "{log}");
+    // Missing files: an error, unless -q.
+    assert_eq!(t.err("source-file /nope.toml"), "/nope.toml: No such file or directory");
+    t.ok("source-file -q /nope.toml");
+    // -n only checks.
+    t.ok("set -g base-index 0");
+    let _ = t.run("source-file -n /c.toml");
+    assert_eq!(t.ok("show -gv base-index"), "0\n");
+}
+
+#[test]
+fn server_formats() {
+    let mut t = T::with_session();
+    t.m.set_server_info(4242, "/tmp/lif-501/default");
+    assert_eq!(t.ok("display -p '#{pid} #{socket_path}'"), "4242 /tmp/lif-501/default\n");
+    assert_eq!(t.ok("display -p '#{version}'"), format!("{}\n", env!("CARGO_PKG_VERSION")));
 }

@@ -133,6 +133,7 @@ fn bench_frames() {
                 frame: f,
                 active: true,
                 selection: None,
+                matches: &[],
                 indicator: None,
             }];
             let mut scene = Scene::new(Size::new(COLS, ROWS), &panes);
@@ -249,6 +250,7 @@ fn bench_frames() {
             frame: &f,
             active: true,
             selection: None,
+                matches: &[],
             indicator: None,
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
@@ -275,6 +277,7 @@ fn bench_frames() {
             frame: &blank,
             active: true,
             selection: None,
+                matches: &[],
             indicator: None,
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
@@ -298,6 +301,7 @@ fn bench_frames() {
             frame: &g,
             active: true,
             selection: None,
+                matches: &[],
             indicator: None,
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
@@ -347,6 +351,7 @@ fn bench_frames() {
                     frame: f,
                     active: k == 0,
                     selection: None,
+                matches: &[],
                     indicator: None,
                 })
                 .collect();

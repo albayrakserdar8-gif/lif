@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use lif_client::*;
 use lif_proto::*;
-use lif_types::{PixelSize, Size};
+use lif_types::{OuterCaps, PixelSize, Size};
+use lif_vt::{GhosttyVt, VtEngine, VtOptions};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -383,7 +384,7 @@ fn relay_is_byte_exact_both_ways() {
     assert!(got_screen == screen, "screen bytes differ");
     assert_eq!(got_keys.len(), LEN);
     assert!(got_keys == keys, "keyboard bytes differ");
-    assert_eq!(exit, ExitInfo { cause: ExitCause::Server, reason: ExitReason::Detached, message: String::new() });
+    assert_eq!(exit, ExitInfo { cause: ExitCause::Server, reason: ExitReason::Detached, message: String::new(), signal: None });
     assert_eq!(modes(pty.slave.as_raw_fd()), before);
     println!(
         "relay: {} MiB each way through a PTY in {:.0} ms ({:.0} MiB/s combined), {} Input frames",
@@ -457,7 +458,7 @@ fn exit_restores_modes_then_prints_message() {
     });
     let exit = join(client(path.clone(), pty.fds(), Size::new(80, 24)), "client").unwrap();
     join(srv, "server");
-    assert_eq!(exit, ExitInfo { cause: ExitCause::Server, reason: ExitReason::SessionEnded, message: "[exited]".into() });
+    assert_eq!(exit, ExitInfo { cause: ExitCause::Server, reason: ExitReason::SessionEnded, message: "[exited]".into(), signal: None });
     assert_eq!(modes(s), before);
     // Output processing is back on, so the message's newline became CRLF.
     let got = read_master(pty.master.as_raw_fd(), |g| g.ends_with(b"\r\n"));
@@ -483,7 +484,10 @@ fn abrupt_server_close_is_an_error_and_restores_modes() {
     let err = res.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     assert_eq!(modes(s), before);
-    assert_eq!(read_master(pty.master.as_raw_fd(), |g| g.len() >= 7), b"partial");
+    // The server never restored the terminal, so the client did.
+    let want = [b"partial", FALLBACK_RESTORE].concat();
+    assert_eq!(read_master(pty.master.as_raw_fd(), |g| g.len() >= want.len()), want);
+    assert_eq!(drain_master(pty.master.as_raw_fd()), b"");
     let _ = std::fs::remove_file(path);
 }
 
@@ -515,55 +519,445 @@ fn sigwinch_sends_resize() {
     let _ = std::fs::remove_file(path);
 }
 
+/// What a real server sends on attach: everything lif may turn on.
+fn enter_bytes() -> Vec<u8> {
+    let caps = OuterCaps {
+        sync_output: true,
+        kitty_keyboard: true,
+        focus_events: true,
+        sgr_mouse: true,
+        sgr_pixel_mouse: true,
+        bracketed_paste: true,
+        in_band_resize: true,
+        color_scheme_reports: true,
+        ..OuterCaps::default()
+    };
+    let mut v = Vec::new();
+    lif_input::write_enter(&caps, &mut v);
+    lif_input::write_mouse(true, true, &caps, &mut v);
+    lif_input::write_mouse_pixels(true, &caps, &mut v);
+    v.extend_from_slice(b"\x1b[?25l\x1b[1;31mready");
+    v
+}
+
+/// What a real server sends on detach (fixed bytes, so a test can tell
+/// them from the client's fallback).
+const SERVER_RESTORE: &[u8] = b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1016l\x1b[?1006l\x1b[<u\x1b[?1004l\x1b[?2004l\x1b>\x1b[0m\x1b[?25h\x1b[?1049l<server>";
+
+/// Whatever the master has right now.
+fn drain_master(fd: RawFd) -> Vec<u8> {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: buf is valid for buf.len() bytes.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return got;
+        }
+        got.extend_from_slice(&buf[..n as usize]);
+    }
+}
+
+/// Feeds what the outer terminal received into a real emulator and checks
+/// it is back to what a shell expects.
+fn assert_terminal_clean(bytes: &[u8]) {
+    let mut vt = GhosttyVt::new(&VtOptions { size: Size::new(80, 24), scrollback_bytes: 0, ..Default::default() }).unwrap();
+    vt.feed(bytes);
+    let m = vt.modes();
+    assert!(!m.alt_screen, "still on the alternate screen");
+    assert!(!m.mouse_tracking, "mouse tracking still on");
+    assert!(!m.bracketed_paste, "bracketed paste still on");
+    assert!(!m.focus_events, "focus events still on");
+    assert_eq!(m.kitty_keyboard, 0, "kitty keyboard flags still pushed");
+    assert!(!m.app_keypad, "keypad still in application mode");
+}
+
+/// Server side up to the client's `Detach` (input and resizes are skipped).
+fn until_detach(s: &mut Server) {
+    loop {
+        match s.recv() {
+            ClientMsg::Detach => return,
+            ClientMsg::Input(_) | ClientMsg::Resize { .. } => {}
+            m => panic!("unexpected {m:?}"),
+        }
+    }
+}
+
+fn kill_self(sig: i32) {
+    // SAFETY: plain kill(2). Callers hold the exclusive lock and have seen
+    // the loop relay output, so its handler is installed and no other loop
+    // runs.
+    unsafe { libc::kill(libc::getpid(), sig) };
+}
+
 #[test]
-fn sigterm_detaches_and_restores_modes() {
+fn signal_waits_for_the_server_to_restore_the_terminal() {
     let _g = exclusive();
-    for sig in [libc::SIGTERM, libc::SIGHUP] {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT] {
         let pty = Pty::new(80, 24);
         let s = pty.slave.as_raw_fd();
         let before = modes(s);
         let (path, l) = listen();
         let srv = serve(l, |mut s| {
             s.attach();
-            s.send(&ServerMsg::Output(b"ready".to_vec()));
-            s.recv()
+            s.send(&ServerMsg::Output(enter_bytes()));
+            until_detach(&mut s);
+            s.send(&ServerMsg::Output(SERVER_RESTORE.to_vec()));
+            s.send(&ServerMsg::Exit { reason: ExitReason::Detached, message: String::new() });
         });
         let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
-        read_master(pty.master.as_raw_fd(), |g| g == b"ready");
-        // SAFETY: the loop's handler is installed (it has relayed output), and
-        // the exclusive lock keeps every other loop out.
-        unsafe { libc::kill(libc::getpid(), sig) };
-        assert_eq!(join(srv, "server"), ClientMsg::Detach);
+        let m = pty.master.as_raw_fd();
+        let mut got = read_master(m, |g| g.ends_with(b"ready"));
+        let t0 = Instant::now();
+        kill_self(sig);
+        join(srv, "server");
         let exit = join(cl, "client").unwrap();
-        assert_eq!(exit, ExitInfo { cause: ExitCause::Signal(sig), reason: ExitReason::Detached, message: String::new() });
+        let dt = t0.elapsed();
+        assert_eq!(exit, ExitInfo { cause: ExitCause::Signal(sig), reason: ExitReason::Detached, message: String::new(), signal: Some(sig) });
+        got.extend(drain_master(m));
+        // Exactly the server's bytes: no fallback on top.
+        assert!(got == [enter_bytes(), SERVER_RESTORE.to_vec()].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
         assert_eq!(modes(s), before);
+        assert_terminal_clean(&got);
+        println!("signal {sig}: cooperative detach took {:.2} ms", dt.as_secs_f64() * 1000.0);
         let _ = std::fs::remove_file(path);
     }
 }
 
 #[test]
-fn terminal_hangup_detaches() {
-    let _g = shared();
+fn signal_with_a_silent_server_writes_the_fallback() {
+    let _g = exclusive();
     let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    let (path, l) = listen();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let srv = serve(l, move |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(enter_bytes()));
+        until_detach(&mut s);
+        // Hung: holds the connection open and never answers.
+        let _ = done_rx.recv_timeout(TIMEOUT);
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    let m = pty.master.as_raw_fd();
+    let mut got = read_master(m, |g| g.ends_with(b"ready"));
+    let t0 = Instant::now();
+    kill_self(libc::SIGTERM);
+    let exit = join(cl, "client").unwrap();
+    let dt = t0.elapsed();
+    done_tx.send(()).unwrap();
+    join(srv, "server");
+    assert_eq!(exit, ExitInfo { cause: ExitCause::Signal(libc::SIGTERM), reason: ExitReason::Detached, message: String::new(), signal: Some(libc::SIGTERM) });
+    assert!(dt >= Duration::from_millis(390), "gave up after {dt:?}, before the server had its chance");
+    assert!(dt < Duration::from_millis(1500), "took {dt:?}");
+    got.extend(drain_master(m));
+    assert!(got == [&enter_bytes()[..], FALLBACK_RESTORE].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_eq!(modes(s), before);
+    assert_terminal_clean(&got);
+    println!("silent server: fallback written after {:.0} ms", dt.as_secs_f64() * 1000.0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn signal_then_server_closes_writes_the_fallback() {
+    let _g = exclusive();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
     let (path, l) = listen();
     let srv = serve(l, |mut s| {
         s.attach();
+        s.send(&ServerMsg::Output(enter_bytes()));
+        // Crashes on Detach: half of the restore, then the socket closes.
+        until_detach(&mut s);
+        let mut out = Vec::new();
+        encode_output(b"\x1b[?1003l\x1b[", &mut out);
+        s.stream.write_all(&out).unwrap();
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    let m = pty.master.as_raw_fd();
+    let mut got = read_master(m, |g| g.ends_with(b"ready"));
+    let t0 = Instant::now();
+    kill_self(libc::SIGTERM);
+    join(srv, "server");
+    let exit = join(cl, "client").unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(exit.cause, ExitCause::Signal(libc::SIGTERM));
+    // No waiting for a server that is gone.
+    assert!(dt < Duration::from_millis(300), "took {dt:?}");
+    got.extend(drain_master(m));
+    assert!(got == [&enter_bytes()[..], b"\x1b[?1003l\x1b[", FALLBACK_RESTORE].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_eq!(modes(s), before);
+    assert_terminal_clean(&got);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn abrupt_close_while_attached_writes_the_fallback() {
+    let _g = shared();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    let (path, l) = listen();
+    let srv = serve(l, |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(enter_bytes()));
+    });
+    let res = join(client(path.clone(), pty.fds(), Size::new(80, 24)), "client");
+    join(srv, "server");
+    assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(modes(s), before);
+    let got = drain_master(pty.master.as_raw_fd());
+    assert!(got == [&enter_bytes()[..], FALLBACK_RESTORE].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_terminal_clean(&got);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sighup_detaches_without_touching_the_terminal() {
+    let _g = exclusive();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    let (path, l) = listen();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let srv = serve(l, move |mut s| {
+        s.attach();
         s.send(&ServerMsg::Output(b"ready".to_vec()));
-        loop {
-            match s.recv() {
-                ClientMsg::Resize { .. } => {}
-                m => return m,
-            }
-        }
+        until_detach(&mut s);
+        // Never answers; the client must not wait for it.
+        let _ = done_rx.recv_timeout(TIMEOUT);
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    let m = pty.master.as_raw_fd();
+    read_master(m, |g| g == b"ready");
+    let t0 = Instant::now();
+    kill_self(libc::SIGHUP);
+    let exit = join(cl, "client").unwrap();
+    let dt = t0.elapsed();
+    done_tx.send(()).unwrap();
+    join(srv, "server");
+    assert_eq!(exit, ExitInfo { cause: ExitCause::Signal(libc::SIGHUP), reason: ExitReason::Detached, message: String::new(), signal: Some(libc::SIGHUP) });
+    assert!(dt < Duration::from_millis(200), "took {dt:?}");
+    assert_eq!(drain_master(m), b"", "wrote to a hung-up terminal");
+    assert_eq!(modes(s), before);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn terminal_hangup_detaches_promptly() {
+    let _g = shared();
+    let pty = Pty::new(80, 24);
+    let (path, l) = listen();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (detach_tx, detach_rx) = mpsc::channel::<()>();
+    let srv = serve(l, move |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(b"ready".to_vec()));
+        until_detach(&mut s);
+        detach_tx.send(()).unwrap();
+        // A silent server must not delay the client.
+        let _ = done_rx.recv_timeout(TIMEOUT);
     });
     let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
     read_master(pty.master.as_raw_fd(), |g| g == b"ready");
     let Pty { master, slave } = pty;
+    let t0 = Instant::now();
     drop(master);
-    assert_eq!(join(srv, "server"), ClientMsg::Detach);
-    assert_eq!(join(cl, "client").unwrap().cause, ExitCause::InputClosed);
+    let exit = join(cl, "client").unwrap();
+    let dt = t0.elapsed();
+    detach_rx.recv_timeout(TIMEOUT).expect("Detach never arrived");
+    done_tx.send(()).unwrap();
+    join(srv, "server");
+    assert_eq!(exit.cause, ExitCause::InputClosed);
+    assert_eq!(exit.signal, None);
+    assert!(dt < Duration::from_millis(200), "took {dt:?}");
     drop(slave);
     let _ = std::fs::remove_file(path);
+}
+
+/// Types into the terminal until the client stops reading it (its queue for
+/// a server that does not read is full). Returns the bytes accepted.
+fn flood_until_stalled(m: RawFd) -> usize {
+    let chunk = vec![b'k'; 4096];
+    let mut sent = 0;
+    loop {
+        // SAFETY: chunk is valid for chunk.len() bytes.
+        let n = unsafe { libc::write(m, chunk.as_ptr().cast(), chunk.len()) };
+        if n > 0 {
+            sent += n as usize;
+            assert!(sent < 64 << 20, "the client never stopped reading the terminal");
+            continue;
+        }
+        let mut p = libc::pollfd { fd: m, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut p, 1, 300) } == 0 {
+            return sent;
+        }
+    }
+}
+
+#[test]
+fn detach_behind_a_full_socket_is_delivered() {
+    let _g = exclusive();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    let (path, l) = listen();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let srv = serve(l, move |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(enter_bytes()));
+        // Not reading: the client's queue and the socket buffer fill up.
+        go_rx.recv_timeout(TIMEOUT).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let mut input = 0;
+        loop {
+            match s.recv() {
+                ClientMsg::Input(b) => input += b.len(),
+                ClientMsg::Resize { .. } => {}
+                ClientMsg::Detach => break,
+                m => panic!("unexpected {m:?}"),
+            }
+        }
+        s.send(&ServerMsg::Output(SERVER_RESTORE.to_vec()));
+        s.send(&ServerMsg::Exit { reason: ExitReason::Detached, message: String::new() });
+        input
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    let m = pty.master.as_raw_fd();
+    let mut got = read_master(m, |g| g.ends_with(b"ready"));
+    let typed = flood_until_stalled(m);
+    kill_self(libc::SIGTERM);
+    go_tx.send(()).unwrap();
+    let input = join(srv, "server");
+    let exit = join(cl, "client").unwrap();
+    println!("typed {typed} bytes before the client stopped reading; the server got {input} before Detach");
+    assert!(input > 64 * 1024, "the socket was not full ({input} bytes queued)");
+    assert_eq!(exit.cause, ExitCause::Signal(libc::SIGTERM));
+    got.extend(drain_master(m));
+    assert!(got == [enter_bytes(), SERVER_RESTORE.to_vec()].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_eq!(modes(s), before);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn detach_behind_a_full_socket_times_out_cleanly() {
+    let _g = exclusive();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    let (path, l) = listen();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let srv = serve(l, move |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(enter_bytes()));
+        // Never reads again.
+        let _ = done_rx.recv_timeout(TIMEOUT);
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    let m = pty.master.as_raw_fd();
+    let mut got = read_master(m, |g| g.ends_with(b"ready"));
+    flood_until_stalled(m);
+    let t0 = Instant::now();
+    kill_self(libc::SIGTERM);
+    let exit = join(cl, "client").unwrap();
+    let dt = t0.elapsed();
+    done_tx.send(()).unwrap();
+    join(srv, "server");
+    assert_eq!(exit.cause, ExitCause::Signal(libc::SIGTERM));
+    assert!(dt < Duration::from_millis(1500), "took {dt:?}");
+    got.extend(drain_master(m));
+    assert!(got == [&enter_bytes()[..], FALLBACK_RESTORE].concat(), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_eq!(modes(s), before);
+    println!("stuck socket: gave up after {:.0} ms", dt.as_secs_f64() * 1000.0);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Set in the environment of a re-executed test binary that plays the lif
+/// binary: `attach_loop` on its stdin / stdout (a PTY), socket path here.
+const CHILD_ENV: &str = "LIF_CLIENT_TEST_CHILD_SOCKET";
+
+#[test]
+fn child_attach_loop() {
+    let Some(path) = std::env::var_os(CHILD_ENV) else { return };
+    let mut c = connect_with(&path, hello(Size::new(80, 24))).unwrap();
+    assert_eq!(run_command(&mut c, ["attach"]).unwrap(), CommandOutcome::Attached);
+    let exit = attach_loop(c).unwrap();
+    // Only reached when no signal ended the attachment.
+    std::process::exit(if exit.signal.is_some() { 99 } else { 0 });
+}
+
+/// Runs [`child_attach_loop`] in a child process on a fresh PTY; returns
+/// its wait status and everything the terminal received.
+fn run_child(serve_fn: impl FnOnce(Server) + Send + 'static, kill_after_ready: Option<i32>) -> (i32, Vec<u8>) {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    let pty = Pty::new(80, 24);
+    let (path, l) = listen();
+    let srv = serve(l, serve_fn);
+    let dup = || Stdio::from(pty.slave.try_clone().unwrap());
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_attach_loop", "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, &path)
+        .stdin(dup())
+        .stdout(dup())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let m = pty.master.as_raw_fd();
+    let mut got = read_master(m, |g| g.ends_with(b"ready"));
+    if let Some(sig) = kill_after_ready {
+        // SAFETY: kill(2) on our own child.
+        unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        got.extend(drain_master(m));
+        assert!(Instant::now() < deadline, "child did not exit");
+        thread::sleep(Duration::from_millis(2));
+    };
+    got.extend(drain_master(m));
+    join(srv, "server");
+    let _ = std::fs::remove_file(path);
+    (status.into_raw(), got)
+}
+
+#[test]
+fn sigterm_kills_the_client_by_the_signal_after_restoring() {
+    let (status, got) = run_child(
+        |mut s| {
+            s.attach();
+            s.send(&ServerMsg::Output(enter_bytes()));
+            until_detach(&mut s);
+            s.send(&ServerMsg::Output(SERVER_RESTORE.to_vec()));
+            s.send(&ServerMsg::Exit { reason: ExitReason::Detached, message: String::new() });
+        },
+        Some(libc::SIGTERM),
+    );
+    assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM, "wait status {status:#x}");
+    assert!(got.ends_with(SERVER_RESTORE), "terminal got {:?}", String::from_utf8_lossy(&got));
+    assert_terminal_clean(&got);
+}
+
+#[test]
+fn normal_detach_exits_zero() {
+    let (status, got) = run_child(
+        |mut s| {
+            s.attach();
+            s.send(&ServerMsg::Output(enter_bytes()));
+            thread::sleep(Duration::from_millis(50));
+            s.send(&ServerMsg::Output(SERVER_RESTORE.to_vec()));
+            s.send(&ServerMsg::Exit { reason: ExitReason::Detached, message: String::new() });
+        },
+        None,
+    );
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "wait status {status:#x}");
+    assert_terminal_clean(&got);
 }
 
 #[test]

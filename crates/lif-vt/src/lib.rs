@@ -7,7 +7,7 @@
 //! server feeds it the bytes it read from the PTY and writes back whatever
 //! [`VtEngine::drain_replies`] hands out.
 
-use lif_types::{KeyEvent, MouseEvent, PaneFrame, PixelSize, Size};
+use lif_types::{FrameRow, KeyEvent, MouseEvent, PaneFrame, PixelSize, Size};
 
 #[cfg(feature = "ghostty")]
 mod ghostty;
@@ -129,6 +129,19 @@ pub struct VtMemory {
     pub resident_bytes: usize,
     /// Of which compressed.
     pub compressed_bytes: usize,
+    /// Scrollback storage pages held compressed.
+    pub compressed_pages: usize,
+}
+
+/// How [`VtEngine::capture`] formats text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextOptions {
+    /// Join soft-wrapped rows into one line.
+    pub join_wrapped: bool,
+    /// Keep spaces at the end of lines (`capture-pane -N`).
+    pub keep_trailing: bool,
+    /// Include SGR sequences for colors and attributes (`capture-pane -e`).
+    pub styled: bool,
 }
 
 /// Which lines [`VtEngine::text`] returns.
@@ -237,6 +250,60 @@ pub trait VtEngine: Sized {
     /// Plain text of `range`, one `\n` per hard line break. Soft-wrapped rows
     /// are joined when `join_wrapped` is set; trailing blanks are trimmed.
     fn text(&self, range: TextRange, join_wrapped: bool) -> String;
+
+    /// [`VtEngine::text`] with more choices: trailing spaces kept, and SGR
+    /// sequences for styles. One `\n` per line.
+    fn capture(&self, range: TextRange, opts: TextOptions) -> String;
+
+    /// Write absolute row `abs_row` into `out`: exactly `size().cols`
+    /// cells with their text, widths, grapheme clusters and styles, and
+    /// whether the row soft-wraps. Row 0 is the oldest row of the scrollback
+    /// still held, row `scrollback_rows()` the top of the screen; rows past
+    /// the end come out blank. Hyperlink ids are not filled in (0).
+    ///
+    /// Cost: touches only the storage page holding the row (a compressed
+    /// page is restored, no other one is) and allocates nothing per cell.
+    /// `out`'s buffers are reused.
+    fn row(&self, abs_row: usize, out: &mut FrameRow);
+
+    /// [`VtEngine::row`] for reading many rows in order (a copy-mode
+    /// search): the viewport is moved so that the rows around `abs_row` are
+    /// cheap to reach, which makes a scan cost about the same per row
+    /// however deep in the history it is. The caller puts the viewport back
+    /// with [`VtEngine::set_viewport_top`] when done ([`VtEngine::viewport_top`]
+    /// says where it was).
+    fn row_scan(&mut self, abs_row: usize, out: &mut FrameRow);
+
+    /// The absolute row at the top of the viewport (`scrollback_rows()`
+    /// when it shows the live screen).
+    fn viewport_top(&self) -> usize {
+        self.scrollback_rows().saturating_sub(self.viewport_offset())
+    }
+
+    /// The nearest row at or after `from` (`forward`) or at or before it
+    /// that starts a shell prompt (OSC 133;A), as an absolute row.
+    fn find_prompt(&self, from: usize, forward: bool) -> Option<usize>;
+
+    /// Rows evicted from the top of the scrollback (by the scrollback limit
+    /// or by clearing the scrollback) while counting is on (see
+    /// [`VtEngine::track_trimmed`]), a monotonic count. An absolute row `r`
+    /// read when the count was `t0` is row `r - (t1 - t0)` when it is `t1`.
+    /// Exact, except that a single `feed` evicting the whole scrollback
+    /// counts only the rows that were there before it (all of which are
+    /// gone, so no position survives).
+    fn trimmed_rows(&self) -> u64;
+
+    /// Count evicted rows from now on (`true`) or stop. Counting costs a
+    /// little on every `feed` (about 7% of the throughput of a 100 MB
+    /// `cat`), so the server turns it on only while a pane is in copy mode,
+    /// which is the only reader. Off by default.
+    fn track_trimmed(&mut self, on: bool);
+
+    /// Show the rows starting at absolute row `top` (exactly). `top` at or
+    /// past `scrollback_rows()` shows the live screen and follows output, as
+    /// `Scroll::Bottom` does; any other value stays on the same rows while
+    /// output arrives.
+    fn set_viewport_top(&mut self, top: usize);
 
     /// Window title set by the program (OSC 0/2); empty if none.
     fn title(&self) -> &str;

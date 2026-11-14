@@ -124,6 +124,12 @@ pub fn migrate_tmux_conf(text: &str) -> Migration {
     Migration { toml: out.render(), untranslated }
 }
 
+/// Whether `path` names a tmux configuration file rather than a lif one:
+/// `.tmux.conf`, `tmux.conf`, or anything ending in `.conf`.
+pub fn looks_like_tmux_conf(path: &str) -> bool {
+    path.ends_with(".conf")
+}
+
 /// Whether a line ends in an unescaped backslash (continued on the next).
 fn continues(line: &str) -> bool {
     line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
@@ -184,7 +190,17 @@ impl Out {
                     if rest.is_empty() {
                         return Err("bind-key without a command".to_string());
                     }
-                    let c = toml_str(&command_text(rest)?);
+                    let text = command_text(rest)?;
+                    if let Ok(list) = parse_string(&text)
+                        && list.commands().iter().any(|c| {
+                            c.name() == "source-file" && c.args().strings(0).iter().any(|p| looks_like_tmux_conf(p))
+                        })
+                    {
+                        return Err("source-file of a tmux configuration file: lif reloads its own config.toml \
+                                    (source-file ~/.config/lif/config.toml)"
+                            .to_string());
+                    }
+                    let c = toml_str(&text);
                     if a.has('r') || a.get('N').is_some() {
                         let mut v = format!("{{ command = {c}");
                         if a.has('r') {

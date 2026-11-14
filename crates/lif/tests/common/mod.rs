@@ -60,7 +60,11 @@ impl Env {
     }
 
     pub const REMOVE: &'static [&'static str] =
-        &["LIF", "LIF_PANE", "TMUX", "TMUX_PANE", "ENV", "PROMPT_COMMAND", "TERM_PROGRAM", "COLORTERM", "LIF_SOCKET"];
+        &[
+            "LIF", "LIF_PANE", "TMUX", "TMUX_PANE", "ENV", "PROMPT_COMMAND", "TERM_PROGRAM", "COLORTERM", "LIF_SOCKET",
+            // The server reads these at start-up (config file, mode-keys).
+            "LIF_CONFIG", "XDG_CONFIG_HOME", "VISUAL", "EDITOR",
+        ];
 
     pub fn command(&self) -> Command {
         let mut c = Command::new(BIN);

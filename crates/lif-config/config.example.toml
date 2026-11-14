@@ -33,7 +33,14 @@ repeat-time = 500
 mouse = true
 
 # Copy mode keys: "emacs" or "vi" (the copy-mode or copy-mode-vi table).
+# When this line is left out, vi if $VISUAL (or else $EDITOR) contains "vi"
+# when the server starts, as in tmux.
 mode-keys = "emacs"
+
+# Characters that end a word in copy mode (besides spaces), and whether a
+# search wraps around the top or bottom of the history.
+word-separators = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~"
+wrap-search = true
 
 # Whether copying sets the outer terminal's clipboard (OSC 52):
 # "off", "external" (lif sets it, programs in panes may not) or "on".
@@ -156,13 +163,15 @@ current-window = { underline = true }
 last-window = "default"
 activity = { reverse = true }
 bell = { reverse = true }
-# Pane borders, the copy-mode selection and messages are drawn in lif's
-# built-in colors for now; these keys are accepted but have no effect yet
-# (lif reports a warning for them):
-# border = { fg = "default" }
-# active-border = { fg = "green" }
-# selection = { fg = "black", bg = "yellow" }
-# message = { fg = "black", bg = "yellow" }
+# Pane borders (and the border next to the active pane), the copy-mode
+# selection and position indicator, messages and prompts, and copy-mode
+# search matches (every match, and the one the cursor is on).
+border = "default"
+active-border = "fg=green"
+selection = "bg=yellow,fg=black"
+message = "bg=yellow,fg=black"
+match = "bg=cyan,fg=black"
+current-match = "bg=magenta,fg=black"
 
 # ---------------------------------------------------------- key bindings ----
 

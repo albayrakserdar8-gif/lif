@@ -13,6 +13,12 @@
 //! * Keys: [`CopyMode::handle_key`]; mouse: [`CopyMode::handle_mouse`];
 //!   `send-keys -X`: [`CopyMode::run_command`] with [`Command::from_name`].
 //!   Each returns an [`Outcome`].
+//! * Key tables: the model's `copy-mode` / `copy-mode-vi` tables (lif-core's
+//!   `KeyBindings`, which also hold tmux's defaults) are the only source of
+//!   bindings, so the configuration file, `bind-key -T` and `list-keys -T`
+//!   all see the same keys. [`KeyTable::from_bindings`] compiles a table
+//!   for [`Config::table`]; bindings it cannot express ([`Action::from_commands`]
+//!   returns `None`) are run by the server as commands.
 //! * Prompts ([`Outcome::Prompt`]): the server shows the prompt and
 //!   reports back with [`CopyMode::prompt_changed`] (incremental search,
 //!   on every edit), [`CopyMode::prompt_again`] (C-s / C-r inside an
@@ -39,7 +45,7 @@ mod search;
 mod view;
 
 pub use command::Command;
-pub use keys::{Action, EMACS_DEFAULTS, KeyTable, LEFT_OUT, ModeKeys, VI_DEFAULTS};
+pub use keys::{Action, KeyTable, LEFT_OUT, ModeKeys};
 pub use mode::{
     Config, CopyMode, DEFAULT_SEARCH_STEP_ROWS, DEFAULT_WORD_SEPARATORS, DragEnd, Enter, MouseConfig, Outcome, Overlays,
     SelectionOverlay, SelectionShape,

@@ -8,12 +8,17 @@ use lif_types::{Key, KeyAction, KeyEvent, MouseAction, MouseButton, MouseEvent, 
 use lif_vt::{VtEngine, VtEvent};
 
 use crate::client::Drag;
-use crate::mode::{ModeAction, ModeCtx, new_copy_mode};
-use crate::prompt::PromptAction;
+use crate::mode::{ModeAction, ModeCtx, new_view_mode};
+use crate::prompt::{PromptAction, PromptState};
 use crate::server::Server;
 
-/// Lines one wheel notch scrolls.
+/// Lines one wheel notch scrolls in a full-screen program that does not
+/// use the mouse (sent as arrow keys).
 const WHEEL_LINES: i32 = 3;
+
+/// How often a copy-mode drag resting on a pane's edge scrolls (tmux's
+/// rate).
+pub(crate) const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Server {
     pub(crate) fn client_input(&mut self, id: ClientId, bytes: &[u8], now: Instant) {
@@ -46,7 +51,7 @@ impl Server {
     fn input_event(&mut self, id: ClientId, ev: InputEvent, now: Instant) {
         match ev {
             InputEvent::Key(k) => self.key(id, &k, now),
-            InputEvent::Mouse(m) => self.mouse(id, &m),
+            InputEvent::Mouse(m) => self.mouse(id, &m, now),
             InputEvent::PasteStart => self.paste_start(id),
             InputEvent::PasteData(d) => self.paste_data(id, &d),
             InputEvent::PasteEnd => self.paste_end(id),
@@ -87,6 +92,32 @@ impl Server {
                 PromptAction::Run(s) => {
                     self.rt.needs_frame(id);
                     self.run_string(id, &s);
+                }
+                PromptAction::CopyChanged(pane, text) => {
+                    if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                        a.prompt = Some(p);
+                        a.needs_frame = true;
+                    }
+                    let act = self.with_mode(pane, |m, ctx| m.prompt_changed(&text, ctx));
+                    self.mode_action(Some(id), pane, act);
+                }
+                PromptAction::CopyAgain(pane, forward) => {
+                    if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                        a.prompt = Some(p);
+                        a.needs_frame = true;
+                    }
+                    let act = self.with_mode(pane, |m, ctx| m.prompt_again(forward, ctx));
+                    self.mode_action(Some(id), pane, act);
+                }
+                PromptAction::CopyAccept(pane, text) => {
+                    self.rt.needs_frame(id);
+                    let act = self.with_mode(pane, |m, ctx| m.prompt_accept(&text, ctx));
+                    self.mode_action(Some(id), pane, act);
+                }
+                PromptAction::CopyCancel(pane) => {
+                    self.rt.needs_frame(id);
+                    let act = self.with_mode(pane, |m, ctx| m.prompt_cancel(ctx));
+                    self.mode_action(Some(id), pane, act);
                 }
             }
             return;
@@ -137,12 +168,11 @@ impl Server {
     }
 
     fn key_to_pane(&mut self, client: ClientId, pane: PaneId, key: &KeyEvent) {
-        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
-        if let Some(m) = p.mode.as_mut() {
-            let action = m.key(key, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
-            self.mode_action(pane, action);
+        if self.rt.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
+            self.key_to_mode(client, pane, key);
             return;
         }
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
         p.engine.encode_key(key, &mut b);
@@ -159,35 +189,184 @@ impl Server {
         }
     }
 
-    pub(crate) fn mode_action(&mut self, pane: PaneId, action: ModeAction) {
+    /// A key for a pane in a mode: through the copy-mode key table (the
+    /// model's `copy-mode` or `copy-mode-vi` table, per `mode-keys`).
+    /// Bindings copy mode understands go to the mode; others run as
+    /// commands, as tmux runs them.
+    fn key_to_mode(&mut self, client: ClientId, pane: PaneId, key: &KeyEvent) {
+        if key.action == KeyAction::Release || matches!(key.key, Key::Modifier(_)) {
+            return;
+        }
+        let vi = self.sync_mode_config(pane);
+        let Some(p) = self.rt.panes.get(&pane) else { return };
+        let Some(m) = p.mode.as_deref() else { return };
+        let (pending, view) = (m.pending(), m.is_view());
+        if view && !pending && (matches!(key.key, Key::Escape | Key::Char('q')) && key.mods.is_empty()) {
+            self.mode_action(Some(client), pane, ModeAction::Exit);
+            return;
+        }
+        if !pending {
+            let table = if vi { lif_core::bindings::COPY_MODE_VI_TABLE } else { lif_core::bindings::COPY_MODE_TABLE };
+            let run = self
+                .model
+                .bindings()
+                .lookup(table, key)
+                .filter(|b| lif_copy::Action::from_commands(&b.commands).is_none())
+                .map(|b| b.commands.clone());
+            if let Some(list) = run {
+                if let Err(e) = self.run_commands(Some(client), &list).map(|o| self.show_output(client, &o.stdout)) {
+                    let d = self.display_time();
+                    self.rt.show_message(client, &e.to_string(), d);
+                }
+                return;
+            }
+        }
+        let act = self.with_mode(pane, |m, ctx| m.key(key, ctx));
+        self.mode_action(Some(client), pane, act);
+    }
+
+    /// Run `f` on `pane`'s mode; `ModeAction::None` without one.
+    pub(crate) fn with_mode(
+        &mut self,
+        pane: PaneId,
+        f: impl FnOnce(&mut dyn crate::mode::PaneMode, &mut ModeCtx<'_>) -> ModeAction,
+    ) -> ModeAction {
+        self.rt.panes.get_mut(&pane).and_then(|p| p.with_mode(f)).unwrap_or(ModeAction::None)
+    }
+
+    /// Keep copy mode's settings (key table, mode-keys, word separators,
+    /// wrap-search) in step with the options of `pane`'s window and give
+    /// them to its mode when they changed. Returns whether keys are vi.
+    pub(crate) fn sync_mode_config(&mut self, pane: PaneId) -> bool {
+        let w = self.model.pane(pane).map(|p| p.window());
+        let s = w.and_then(|w| self.model.window(w)).map(|w| w.session());
+        let opt = |n: &str| self.model.option_text(n, s, w).unwrap_or_default();
+        let vi = opt("mode-keys") == "vi";
+        let key = (self.model.bindings().generation(), vi, opt("word-separators"), opt("wrap-search") != "off");
+        if self.rt.copy_cfg.key != key {
+            let keys = if vi { lif_copy::ModeKeys::Vi } else { lif_copy::ModeKeys::Emacs };
+            let mut cfg = lif_copy::Config::new(keys);
+            cfg.table = std::rc::Rc::new(lif_copy::KeyTable::from_bindings(self.model.bindings(), keys.table_name()));
+            cfg.word_separators.clone_from(&key.2);
+            cfg.wrap_search = key.3;
+            self.rt.copy_cfg = crate::host::CopyConfig { key, cfg };
+        }
+        let gen_key = &self.rt.copy_cfg.key;
+        if let Some(p) = self.rt.panes.get_mut(&pane)
+            && p.mode.is_some()
+            && p.mode_cfg.as_ref() != Some(gen_key)
+        {
+            p.mode_cfg = Some(gen_key.clone());
+            let cfg = &self.rt.copy_cfg.cfg;
+            p.with_mode(|m, ctx| m.set_config(cfg, ctx));
+        }
+        vi
+    }
+
+    /// Carry out what a mode asked for. `client` is who caused it, if
+    /// anyone: prompts and messages go there (or to every client showing
+    /// the pane).
+    pub(crate) fn mode_action(&mut self, client: Option<ClientId>, pane: PaneId, action: ModeAction) {
         match action {
-            ModeAction::Stay => {}
+            ModeAction::None | ModeAction::Redraw => {}
             ModeAction::Exit => {
                 if let Some(p) = self.rt.panes.get_mut(&pane) {
                     p.leave_mode();
                 }
+                for c in self.rt.clients.values_mut() {
+                    if let Some(a) = c.att.as_mut() {
+                        if a.prompt.as_ref().and_then(|p| p.copy_pane()) == Some(pane) {
+                            a.prompt = None;
+                        }
+                        if a.mode_drag.is_some_and(|(p, _)| p == pane) {
+                            a.mode_drag = None;
+                        }
+                    }
+                }
                 self.model.pane_changed(pane, &mut self.rt);
             }
-            ModeAction::Copy { data, exit } => {
-                self.clipboard_write(pane, b'c', &data, true);
+            ModeAction::Copy { data, append, exit } => {
+                let data = if append && let Some(top) = self.model.buffers().first() {
+                    let (name, mut all) = (top.name.clone(), top.data.clone());
+                    all.extend_from_slice(&data);
+                    self.model.set_buffer(Some(&name), all.clone());
+                    all
+                } else {
+                    self.model.set_buffer(None, data.clone());
+                    data
+                };
+                self.clipboard_write(b'c', &data, true);
                 if exit {
-                    self.mode_action(pane, ModeAction::Exit);
+                    self.mode_action(client, pane, ModeAction::Exit);
                 }
+            }
+            ModeAction::Prompt { label, initial, incremental } => {
+                for c in self.mode_clients(client, pane) {
+                    if let Some(a) = self.rt.clients.get_mut(&c).and_then(|c| c.att.as_mut()) {
+                        a.prompt = Some(PromptState::copy(pane, label, initial.clone(), incremental));
+                        a.needs_frame = true;
+                    }
+                }
+            }
+            ModeAction::Message(text) => {
+                let d = self.display_time();
+                for c in self.mode_clients(client, pane) {
+                    self.rt.show_message(c, &text, d);
+                }
+            }
+            ModeAction::Searching => {}
+        }
+        if let Some(p) = self.rt.panes.get_mut(&pane) {
+            let (searching, scroll) = p.mode.as_deref().map_or((false, false), |m| (m.searching(), m.autoscroll_active()));
+            if searching && !p.searching {
+                p.search_client = client;
+            }
+            p.searching = searching;
+            if !scroll {
+                p.autoscroll_at = None;
+            } else if p.autoscroll_at.is_none() {
+                p.autoscroll_at = Some(std::time::Instant::now() + AUTOSCROLL_INTERVAL);
             }
         }
         self.rt.mark_all(false);
+    }
+
+    /// Who sees a mode's prompts and messages: the client that caused them,
+    /// else every client attached to the pane's session.
+    fn mode_clients(&self, client: Option<ClientId>, pane: PaneId) -> Vec<ClientId> {
+        match client {
+            Some(c) if self.rt.clients.get(&c).is_some_and(|c| c.att.is_some()) => vec![c],
+            _ => self.clients_of_pane(pane),
+        }
     }
 
     fn display_time(&self) -> u64 {
         self.model.option_text("display-time", None, None).and_then(|v| v.parse().ok()).unwrap_or(750)
     }
 
-    fn show_output(&mut self, id: ClientId, out: &str) {
+    /// Output of a command a client ran from a key or the prompt: one line
+    /// is shown as a message; more open view mode in the active pane, a
+    /// read-only pager (tmux's view mode) left with q or Escape.
+    pub(crate) fn show_output(&mut self, id: ClientId, out: &str) {
         let text = out.trim_end();
-        if !text.is_empty() {
-            let d = self.display_time();
-            self.rt.show_message(id, text.lines().next_back().unwrap_or(""), d);
+        if text.is_empty() {
+            return;
         }
+        if !text.contains('\n') {
+            let d = self.display_time();
+            self.rt.show_message(id, text, d);
+            return;
+        }
+        let Some(pane) = self.active_pane(id) else { return };
+        self.sync_mode_config(pane);
+        let cfg = self.rt.copy_cfg.cfg.clone();
+        let key = self.rt.copy_cfg.key.clone();
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+        p.leave_mode();
+        p.mode = Some(new_view_mode(text.to_string(), &cfg, &mut ModeCtx { engine: &mut p.engine }));
+        p.mode_cfg = Some(key);
+        self.model.pane_changed(pane, &mut self.rt);
+        self.rt.mark_all(false);
     }
 
     pub(crate) fn run_string(&mut self, id: ClientId, s: &str) {
@@ -203,10 +382,27 @@ impl Server {
 
     // ----- mouse ---------------------------------------------------------
 
-    fn mouse(&mut self, id: ClientId, m: &MouseEvent) {
+    fn mouse(&mut self, id: ClientId, m: &MouseEvent, now: std::time::Instant) {
+        let now_ms = self.now_ms(now);
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
-        let Some(view) = a.view.as_ref() else { return };
         let (x, y) = (m.cell.x, m.cell.y);
+        if let Some((pane, rect)) = a.mode_drag {
+            // The pane in a mode that took the press gets the whole drag,
+            // clamped to its edges (where it scrolls).
+            if m.action == MouseAction::Release {
+                a.mode_drag = None;
+            }
+            let cell = Pos {
+                x: x.clamp(rect.x, rect.right().saturating_sub(1)) - rect.x,
+                y: y.clamp(rect.y, rect.bottom().saturating_sub(1)) - rect.y,
+            };
+            let local = MouseEvent { cell, ..*m };
+            self.sync_mode_config(pane);
+            let act = self.with_mode(pane, |md, ctx| md.mouse(&local, now_ms, ctx));
+            self.mode_action(Some(id), pane, act);
+            return;
+        }
+        let Some(view) = a.view.as_ref() else { return };
         if let Some(drag) = a.drag {
             match m.action {
                 MouseAction::Motion => {
@@ -262,13 +458,57 @@ impl Server {
         if !mouse_opt {
             return;
         }
+        let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
+        let wheel = matches!(m.button, Some(MouseButton::WheelUp | MouseButton::WheelDown));
+        if p.mode.is_some() {
+            if m.action == MouseAction::Press && pane != active && !wheel {
+                self.run_string(id, &format!("select-pane -t {pane}"));
+            }
+            if m.action == MouseAction::Press
+                && m.button == Some(MouseButton::Left)
+                && let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut())
+            {
+                a.mode_drag = Some((pane, rect));
+            }
+            self.sync_mode_config(pane);
+            let act = self.with_mode(pane, |md, ctx| md.mouse(&local, now_ms, ctx));
+            self.mode_action(Some(id), pane, act);
+            return;
+        }
+        let press = match self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+            Some(a) if m.action == MouseAction::Press && m.button == Some(MouseButton::Left) => {
+                a.mouse_press = Some((pane, rect, local));
+                None
+            }
+            Some(a) => a.mouse_press.take(),
+            None => None,
+        };
         match (m.action, m.button) {
             (MouseAction::Press, Some(MouseButton::Left)) if pane != active => {
                 self.run_string(id, &format!("select-pane -t {pane}"));
             }
+            (MouseAction::Motion, Some(MouseButton::Left)) if !modes.alt_screen => {
+                // tmux's MouseDrag1Pane: a drag starts copy mode, selecting
+                // from where the button went down.
+                let Some((pp, prect, pev)) = press.filter(|(p, _, _)| *p == pane) else { return };
+                self.sync_mode_config(pp);
+                let opts = lif_core::CopyModeOptions { mouse_drag: true, ..Default::default() };
+                let Some(p) = self.rt.panes.get_mut(&pp) else { return };
+                crate::host::enter_copy(p, opts, &self.rt.copy_cfg.cfg);
+                p.mode_cfg = Some(self.rt.copy_cfg.key.clone());
+                self.model.pane_changed(pp, &mut self.rt);
+                if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                    a.mode_drag = Some((pp, prect));
+                }
+                let act = self.with_mode(pp, |md, ctx| {
+                    md.mouse(&pev, now_ms, ctx);
+                    md.mouse(&local, now_ms, ctx)
+                });
+                self.mode_action(Some(id), pp, act);
+            }
             (MouseAction::Press, Some(b @ (MouseButton::WheelUp | MouseButton::WheelDown))) => {
                 let up = b == MouseButton::WheelUp;
-                if modes.alt_screen && p.mode.is_none() {
+                if modes.alt_screen {
                     // A full-screen program without mouse support: arrow
                     // keys, as terminals do in alternate-scroll mode.
                     let k = KeyEvent::new(if up { Key::Up } else { Key::Down }, Mods::NONE);
@@ -279,20 +519,18 @@ impl Server {
                     self.rt.write_pane(pane, &bytes);
                     return;
                 }
-                if p.mode.is_none() {
-                    if !up {
-                        return;
-                    }
-                    let opts = lif_core::CopyModeOptions { exit_at_bottom: true, ..Default::default() };
-                    p.mode = Some(new_copy_mode(opts, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows }));
+                if !up {
+                    return;
                 }
-                let lines = if up { -WHEEL_LINES } else { WHEEL_LINES };
-                let action = match p.mode.as_mut() {
-                    Some(mode) => mode.scroll(lines, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows }),
-                    None => ModeAction::Stay,
-                };
-                self.mode_action(pane, action);
+                // tmux's default WheelUpPane: copy-mode -e, then scroll.
+                self.sync_mode_config(pane);
+                let opts = lif_core::CopyModeOptions { exit_at_bottom: true, ..Default::default() };
+                let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+                crate::host::enter_copy(p, opts, &self.rt.copy_cfg.cfg);
+                p.mode_cfg = Some(self.rt.copy_cfg.key.clone());
                 self.model.pane_changed(pane, &mut self.rt);
+                let act = self.with_mode(pane, |md, ctx| md.mouse(&local, now_ms, ctx));
+                self.mode_action(Some(id), pane, act);
             }
             _ => {}
         }
@@ -430,7 +668,7 @@ impl Server {
         match ev {
             VtEvent::Bell => self.model.pane_bell(pane, &mut self.rt),
             VtEvent::TitleChanged | VtEvent::PwdChanged => self.model.pane_changed(pane, &mut self.rt),
-            VtEvent::ClipboardWrite { selection, data } => self.clipboard_write(pane, selection, &data, false),
+            VtEvent::ClipboardWrite { selection, data } => self.clipboard_write(selection, &data, false),
             VtEvent::ClipboardRead { selection } => self.clipboard_read(pane, selection),
             VtEvent::Notification { title, body } => {
                 let text = if title.is_empty() { body } else if body.is_empty() { title } else { format!("{title}: {body}") };
@@ -452,14 +690,16 @@ impl Server {
         self.rt.clients.values().filter(|c| c.att.as_ref().is_some_and(|a| a.session == sid)).map(|c| c.id).collect()
     }
 
-    /// OSC 52 from a pane (or a copy from a mode, `own`): forward to the
-    /// outer terminals per `set-clipboard` and keep it as a paste buffer.
-    fn clipboard_write(&mut self, pane: PaneId, selection: u8, data: &[u8], own: bool) {
+    /// OSC 52 from a pane, or a copy from a mode (`own`, already stored
+    /// as a paste buffer): forward it to the outer terminals unless
+    /// `set-clipboard` is off, and keep a pane's as a paste buffer when it
+    /// is on.
+    fn clipboard_write(&mut self, selection: u8, data: &[u8], own: bool) {
         let mode = self.model.option_text("set-clipboard", None, None).unwrap_or_default();
         if mode == "off" && !own {
             return;
         }
-        if mode == "on" || own {
+        if mode == "on" && !own {
             self.model.set_buffer(None, data.to_vec());
         }
         if mode == "off" {
@@ -469,11 +709,12 @@ impl Server {
         let mut seq = format!("\x1b]52;{sel};");
         base64(data, &mut seq);
         seq.push_str("\x1b\\");
-        for c in self.clients_of_pane(pane) {
-            let ok = self.rt.clients.get(&c).and_then(|c| c.att.as_ref()).is_some_and(|a| a.renderer.caps().osc52_write);
-            if ok {
-                self.rt.send_output(c, seq.as_bytes());
-            }
+        // Every attached terminal gets it, whether or not it was recognized
+        // as supporting OSC 52: one that does not ignores the sequence, and
+        // detection misses many that do (a plain xterm-256color TERM).
+        let attached: Vec<ClientId> = self.rt.clients.values().filter(|c| c.att.is_some()).map(|c| c.id).collect();
+        for c in attached {
+            self.rt.send_output(c, seq.as_bytes());
         }
     }
 

@@ -20,7 +20,9 @@ fn lock_path(socket: &Path) -> PathBuf {
 /// Starts a server on `socket` unless one is already running there, and
 /// returns once it accepts connections. An exclusive lock on
 /// `<socket>.lock` serializes clients racing to start one.
-pub(crate) fn start_server(socket: &Path, verbose: bool) -> io::Result<()> {
+/// `config` is `lif -f`: the configuration file the new server reads
+/// (a server already running keeps its own, as in tmux).
+pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) -> io::Result<()> {
     let lock_path = lock_path(socket);
     let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&lock_path)?;
     loop {
@@ -60,7 +62,10 @@ pub(crate) fn start_server(socket: &Path, verbose: bool) -> io::Result<()> {
                 _ => libc::_exit(0),
             }
         }
-        let code = daemon_main(socket, &lock_path, verbose, ready_w.as_raw_fd());
+        // A relative -f is relative to where the user ran lif, not to the
+        // daemon's / working directory.
+        let config = config.map(|c| std::env::current_dir().map(|d| d.join(c)).unwrap_or_else(|_| c.to_path_buf()));
+        let code = daemon_main(socket, &lock_path, verbose, config, ready_w.as_raw_fd());
         std::process::exit(code);
     }
     drop(ready_w);
@@ -91,7 +96,7 @@ fn open_fds() -> Vec<RawFd> {
 
 /// The daemon: detached from the terminal and the client's process group,
 /// cwd `/`, stdio on /dev/null, no inherited fds, default signals.
-fn daemon_main(socket: &Path, lock: &Path, verbose: bool, ready: RawFd) -> i32 {
+fn daemon_main(socket: &Path, lock: &Path, verbose: bool, config: Option<PathBuf>, ready: RawFd) -> i32 {
     // SAFETY: plain syscalls on fds this process owns.
     unsafe {
         libc::chdir(c"/".as_ptr());
@@ -140,5 +145,8 @@ fn daemon_main(socket: &Path, lock: &Path, verbose: bool, ready: RawFd) -> i32 {
     tell(b"R");
     // SAFETY: closes our end of the ready pipe; the client sees EOF.
     unsafe { libc::close(ready) };
-    lif_server::run(listener, lif_server::ServerOptions { socket: socket.to_path_buf(), lock: Some(lock.to_path_buf()), verbose })
+    lif_server::run(
+        listener,
+        lif_server::ServerOptions { socket: socket.to_path_buf(), lock: Some(lock.to_path_buf()), verbose, config },
+    )
 }

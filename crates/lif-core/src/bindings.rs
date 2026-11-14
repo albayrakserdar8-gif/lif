@@ -30,6 +30,35 @@ pub struct Binding {
 #[derive(Clone, Debug, Default)]
 pub struct KeyBindings {
     tables: BTreeMap<String, HashMap<KeyCode, Binding>>,
+    /// Bumped by every change, so a copy compiled from a table (copy mode's
+    /// key table) knows when it is stale.
+    generation: u64,
+    /// tmux's copy-mode tables (`copy-mode-vi`, `copy-mode`) are part of
+    /// the defaults but parsed only when something reads them: a server
+    /// nobody uses copy mode on never needs them, and parsed they cost about
+    /// 250 KB of its memory. `copy_pending[i]`: table `i` is still the
+    /// default (not yet moved into `tables` by a change).
+    copy_pending: [bool; 2],
+    copy_defaults: std::cell::OnceCell<[HashMap<KeyCode, Binding>; 2]>,
+}
+
+/// Index of a copy-mode table in `KeyBindings::copy_pending`.
+fn copy_index(table: &str) -> Option<usize> {
+    match table {
+        COPY_MODE_VI_TABLE => Some(0),
+        COPY_MODE_TABLE => Some(1),
+        _ => None,
+    }
+}
+
+fn parse_defaults(list: &[(&str, &str)]) -> HashMap<KeyCode, Binding> {
+    let mut t = HashMap::with_capacity(list.len());
+    for (key, cmd) in list {
+        let key = KeyCode::parse(key).unwrap_or_else(|| panic!("bad default key {key}"));
+        let commands = parse_string(cmd).unwrap_or_else(|e| panic!("bad default binding {cmd}: {e}"));
+        t.insert(key, Binding { key, repeat: false, note: None, commands });
+    }
+    t
 }
 
 /// tmux 3.8's default prefix table, restricted to commands lif implements
@@ -106,13 +135,186 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     ("C-Right", true, "resize-pane -R"),
 ];
 
+/// Name of copy mode's key table with `mode-keys emacs`.
+pub const COPY_MODE_TABLE: &str = "copy-mode";
+/// Name of copy mode's key table with `mode-keys vi`.
+pub const COPY_MODE_VI_TABLE: &str = "copy-mode-vi";
+
+/// tmux 3.8's default `copy-mode-vi` table, `(key, command)`, exactly as
+/// `tmux list-keys -T copy-mode-vi` prints it, without the mouse bindings
+/// (copy mode handles the mouse itself) and `C-[` (the same key as Escape).
+///
+/// This and [`COPY_MODE_DEFAULTS`] are the only definition of copy mode's
+/// default keys: [`KeyBindings::with_defaults`] loads them into the model,
+/// where `bind-key -T`, `unbind-key -T`, `list-keys -T` and the
+/// configuration file change and show them, and copy mode compiles its key
+/// table from the model's (`lif_copy::KeyTable::from_bindings`).
+pub const COPY_MODE_VI_DEFAULTS: &[(&str, &str)] = &[
+    (r#"Enter"#, r#"send-keys -X copy-pipe-and-cancel"#),
+    (r#"Escape"#, r#"send-keys -X clear-selection"#),
+    (r#"Space"#, r#"send-keys -X begin-selection"#),
+    (r#"#"#, r##"send-keys -FX search-backward -- "#{copy_cursor_word}""##),
+    (r#"$"#, r#"send-keys -X end-of-line"#),
+    (r#"%"#, r#"send-keys -X next-matching-bracket"#),
+    (r#"*"#, r##"send-keys -FX search-forward -- "#{copy_cursor_word}""##),
+    (r#","#, r#"send-keys -X jump-reverse"#),
+    (r#"/"#, r#"command-prompt -P -T search -p "(search down)" { send-keys -X search-forward -- "%%" }"#),
+    (r#"0"#, r#"send-keys -X start-of-line"#),
+    (r#"1"#, r#"command-prompt -NP -I 1 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"2"#, r#"command-prompt -NP -I 2 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"3"#, r#"command-prompt -NP -I 3 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"4"#, r#"command-prompt -NP -I 4 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"5"#, r#"command-prompt -NP -I 5 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"6"#, r#"command-prompt -NP -I 6 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"7"#, r#"command-prompt -NP -I 7 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"8"#, r#"command-prompt -NP -I 8 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"9"#, r#"command-prompt -NP -I 9 -p (repeat) { send-keys -N "%%" }"#),
+    (r#":"#, r#"command-prompt -P -p "(goto line)" { send-keys -X goto-line -- "%%" }"#),
+    (r#";"#, r#"send-keys -X jump-again"#),
+    (r#"?"#, r#"command-prompt -P -T search -p "(search up)" { send-keys -X search-backward -- "%%" }"#),
+    (r#"A"#, r#"send-keys -X append-selection-and-cancel"#),
+    (r#"B"#, r#"send-keys -X previous-space"#),
+    (r#"D"#, r#"send-keys -X copy-pipe-end-of-line-and-cancel"#),
+    (r#"E"#, r#"send-keys -X next-space-end"#),
+    (r#"F"#, r#"command-prompt -1P -p "(jump backward)" { send-keys -X jump-backward -- "%%" }"#),
+    (r#"G"#, r#"send-keys -X history-bottom"#),
+    (r#"H"#, r#"send-keys -X top-line"#),
+    (r#"J"#, r#"send-keys -X scroll-down"#),
+    (r#"K"#, r#"send-keys -X scroll-up"#),
+    (r#"L"#, r#"send-keys -X bottom-line"#),
+    (r#"M"#, r#"send-keys -X middle-line"#),
+    (r#"N"#, r#"send-keys -X search-reverse"#),
+    (r#"P"#, r#"send-keys -X toggle-position"#),
+    (r#"T"#, r#"command-prompt -1P -p "(jump to backward)" { send-keys -X jump-to-backward -- "%%" }"#),
+    (r#"V"#, r#"send-keys -X select-line"#),
+    (r#"W"#, r#"send-keys -X next-space"#),
+    (r#"X"#, r#"send-keys -X set-mark"#),
+    (r#"^"#, r#"send-keys -X back-to-indentation"#),
+    (r#"b"#, r#"send-keys -X previous-word"#),
+    (r#"e"#, r#"send-keys -X next-word-end"#),
+    (r#"f"#, r#"command-prompt -1P -p "(jump forward)" { send-keys -X jump-forward -- "%%" }"#),
+    (r#"g"#, r#"send-keys -X history-top"#),
+    (r#"h"#, r#"send-keys -X cursor-left"#),
+    (r#"j"#, r#"send-keys -X cursor-down"#),
+    (r#"k"#, r#"send-keys -X cursor-up"#),
+    (r#"l"#, r#"send-keys -X cursor-right"#),
+    (r#"n"#, r#"send-keys -X search-again"#),
+    (r#"o"#, r#"send-keys -X other-end"#),
+    (r#"q"#, r#"send-keys -X cancel"#),
+    (r#"r"#, r#"send-keys -X refresh-now"#),
+    (r#"t"#, r#"command-prompt -1P -p "(jump to forward)" { send-keys -X jump-to-forward -- "%%" }"#),
+    (r#"v"#, r#"send-keys -X rectangle-toggle"#),
+    (r#"w"#, r#"send-keys -X next-word"#),
+    (r#"z"#, r#"send-keys -X scroll-middle"#),
+    (r#"{"#, r#"send-keys -X previous-paragraph"#),
+    (r#"}"#, r#"send-keys -X next-paragraph"#),
+    (r#"BSpace"#, r#"send-keys -X cursor-left"#),
+    (r#"Home"#, r#"send-keys -X start-of-line"#),
+    (r#"End"#, r#"send-keys -X end-of-line"#),
+    (r#"NPage"#, r#"send-keys -X page-down"#),
+    (r#"PPage"#, r#"send-keys -X page-up"#),
+    (r#"Up"#, r#"send-keys -X cursor-up"#),
+    (r#"Down"#, r#"send-keys -X cursor-down"#),
+    (r#"Left"#, r#"send-keys -X cursor-left"#),
+    (r#"Right"#, r#"send-keys -X cursor-right"#),
+    (r#"M-x"#, r#"send-keys -X jump-to-mark"#),
+    (r#"C-b"#, r#"send-keys -X page-up"#),
+    (r#"C-c"#, r#"send-keys -X cancel"#),
+    (r#"C-d"#, r#"send-keys -X halfpage-down"#),
+    (r#"C-e"#, r#"send-keys -X scroll-down"#),
+    (r#"C-f"#, r#"send-keys -X page-down"#),
+    (r#"C-h"#, r#"send-keys -X cursor-left"#),
+    (r#"C-j"#, r#"send-keys -X copy-pipe-and-cancel"#),
+    (r#"C-u"#, r#"send-keys -X halfpage-up"#),
+    (r#"C-v"#, r#"send-keys -X rectangle-toggle"#),
+    (r#"C-y"#, r#"send-keys -X scroll-up"#),
+    (r#"C-Up"#, r#"send-keys -X scroll-up"#),
+    (r#"C-Down"#, r#"send-keys -X scroll-down"#),
+];
+
+/// tmux 3.8's default `copy-mode` (emacs) table; see
+/// [`COPY_MODE_VI_DEFAULTS`]. tmux's `L` (line-numbers-toggle) is left out:
+/// lif has no line-number gutter.
+pub const COPY_MODE_DEFAULTS: &[(&str, &str)] = &[
+    (r#"Escape"#, r#"send-keys -X cancel"#),
+    (r#"Space"#, r#"send-keys -X page-down"#),
+    (r#","#, r#"send-keys -X jump-reverse"#),
+    (r#";"#, r#"send-keys -X jump-again"#),
+    (r#"F"#, r#"command-prompt -1P -p "(jump backward)" { send-keys -X jump-backward -- "%%" }"#),
+    (r#"N"#, r#"send-keys -X search-reverse"#),
+    (r#"P"#, r#"send-keys -X toggle-position"#),
+    (r#"R"#, r#"send-keys -X rectangle-toggle"#),
+    (r#"T"#, r#"command-prompt -1P -p "(jump to backward)" { send-keys -X jump-to-backward -- "%%" }"#),
+    (r#"X"#, r#"send-keys -X set-mark"#),
+    (r#"f"#, r#"command-prompt -1P -p "(jump forward)" { send-keys -X jump-forward -- "%%" }"#),
+    (r#"g"#, r#"command-prompt -P -p "(goto line)" { send-keys -X goto-line -- "%%" }"#),
+    (r#"n"#, r#"send-keys -X search-again"#),
+    (r#"q"#, r#"send-keys -X cancel"#),
+    (r#"r"#, r#"send-keys -X refresh-now"#),
+    (r#"t"#, r#"command-prompt -1P -p "(jump to forward)" { send-keys -X jump-to-forward -- "%%" }"#),
+    (r#"Home"#, r#"send-keys -X start-of-line"#),
+    (r#"End"#, r#"send-keys -X end-of-line"#),
+    (r#"NPage"#, r#"send-keys -X page-down"#),
+    (r#"PPage"#, r#"send-keys -X page-up"#),
+    (r#"Up"#, r#"send-keys -X cursor-up"#),
+    (r#"Down"#, r#"send-keys -X cursor-down"#),
+    (r#"Left"#, r#"send-keys -X cursor-left"#),
+    (r#"Right"#, r#"send-keys -X cursor-right"#),
+    (r#"M-1"#, r#"command-prompt -NP -I 1 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-2"#, r#"command-prompt -NP -I 2 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-3"#, r#"command-prompt -NP -I 3 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-4"#, r#"command-prompt -NP -I 4 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-5"#, r#"command-prompt -NP -I 5 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-6"#, r#"command-prompt -NP -I 6 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-7"#, r#"command-prompt -NP -I 7 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-8"#, r#"command-prompt -NP -I 8 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-9"#, r#"command-prompt -NP -I 9 -p (repeat) { send-keys -N "%%" }"#),
+    (r#"M-<"#, r#"send-keys -X history-top"#),
+    (r#"M->"#, r#"send-keys -X history-bottom"#),
+    (r#"M-R"#, r#"send-keys -X top-line"#),
+    (r#"M-b"#, r#"send-keys -X previous-word"#),
+    (r#"M-f"#, r#"send-keys -X next-word-end"#),
+    (r#"M-l"#, r#"send-keys -X cursor-centre-horizontal"#),
+    (r#"M-m"#, r#"send-keys -X back-to-indentation"#),
+    (r#"M-r"#, r#"send-keys -X middle-line"#),
+    (r#"M-v"#, r#"send-keys -X page-up"#),
+    (r#"M-w"#, r#"send-keys -X copy-pipe-and-cancel"#),
+    (r#"M-x"#, r#"send-keys -X jump-to-mark"#),
+    (r#"M-{"#, r#"send-keys -X previous-paragraph"#),
+    (r#"M-}"#, r#"send-keys -X next-paragraph"#),
+    (r#"M-Up"#, r#"send-keys -X halfpage-up"#),
+    (r#"M-Down"#, r#"send-keys -X halfpage-down"#),
+    (r#"C-Space"#, r#"send-keys -X begin-selection"#),
+    (r#"C-a"#, r#"send-keys -X start-of-line"#),
+    (r#"C-b"#, r#"send-keys -X cursor-left"#),
+    (r#"C-c"#, r#"send-keys -X cancel"#),
+    (r#"C-e"#, r#"send-keys -X end-of-line"#),
+    (r#"C-f"#, r#"send-keys -X cursor-right"#),
+    (r#"C-g"#, r#"send-keys -X clear-selection"#),
+    (r#"C-k"#, r#"send-keys -X copy-pipe-end-of-line-and-cancel"#),
+    (r#"C-l"#, r#"send-keys -X recentre-top-bottom"#),
+    (r#"C-n"#, r#"send-keys -X cursor-down"#),
+    (r#"C-p"#, r#"send-keys -X cursor-up"#),
+    (r#"C-r"#, r##"command-prompt -Pi -I "#{pane_search_string}" -T search -p "(search up)" { send-keys -X search-backward-incremental -- "%%" }"##),
+    (r#"C-s"#, r##"command-prompt -Pi -I "#{pane_search_string}" -T search -p "(search down)" { send-keys -X search-forward-incremental -- "%%" }"##),
+    (r#"C-v"#, r#"send-keys -X page-down"#),
+    (r#"C-w"#, r#"send-keys -X copy-pipe-and-cancel"#),
+    (r#"C-Up"#, r#"send-keys -X scroll-up"#),
+    (r#"C-Down"#, r#"send-keys -X scroll-down"#),
+    (r#"C-M-b"#, r#"send-keys -X previous-matching-bracket"#),
+    (r#"C-M-f"#, r#"send-keys -X next-matching-bracket"#),
+    (r#"C-M-Up"#, r#"send-keys -X previous-prompt"#),
+    (r#"C-M-Down"#, r#"send-keys -X next-prompt"#),
+];
+
 impl KeyBindings {
     /// No bindings at all.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// tmux's default prefix table (see the source for the list).
+    /// tmux's default prefix table (see the source for the list) and copy
+    /// mode's tables ([`COPY_MODE_VI_DEFAULTS`], [`COPY_MODE_DEFAULTS`]).
     pub fn with_defaults() -> Self {
         let mut b = Self::new();
         for (key, repeat, cmd) in DEFAULTS {
@@ -120,7 +322,32 @@ impl KeyBindings {
             let commands = parse_string(cmd).unwrap_or_else(|e| panic!("bad default binding {cmd}: {e}"));
             b.bind(PREFIX_TABLE, Binding { key, repeat: *repeat, note: None, commands });
         }
+        b.copy_pending = [true, true];
         b
+    }
+
+    /// A table's bindings, the copy-mode defaults included.
+    fn table(&self, table: &str) -> Option<&HashMap<KeyCode, Binding>> {
+        if let Some(t) = self.tables.get(table) {
+            return Some(t);
+        }
+        let i = copy_index(table).filter(|&i| self.copy_pending[i])?;
+        let d = self
+            .copy_defaults
+            .get_or_init(|| [parse_defaults(COPY_MODE_VI_DEFAULTS), parse_defaults(COPY_MODE_DEFAULTS)]);
+        Some(&d[i])
+    }
+
+    /// Before changing `table`: a pending copy-mode default becomes an
+    /// ordinary table.
+    fn own(&mut self, table: &str) {
+        if let Some(i) = copy_index(table).filter(|&i| self.copy_pending[i]) {
+            self.copy_pending[i] = false;
+            let t = self.copy_defaults.get().map(|d| d[i].clone()).unwrap_or_else(|| {
+                parse_defaults(if i == 0 { COPY_MODE_VI_DEFAULTS } else { COPY_MODE_DEFAULTS })
+            });
+            self.tables.insert(table.to_string(), t);
+        }
     }
 
     /// The binding for an input event in `table`.
@@ -130,17 +357,26 @@ impl KeyBindings {
 
     /// The binding for a key code in `table`.
     pub fn lookup_code(&self, table: &str, key: &KeyCode) -> Option<&Binding> {
-        self.tables.get(table)?.get(key)
+        self.table(table)?.get(key)
     }
 
     /// Add or replace a binding.
     pub fn bind(&mut self, table: &str, binding: Binding) {
+        self.generation += 1;
+        self.own(table);
         self.tables.entry(table.to_string()).or_default().insert(binding.key, binding);
+    }
+
+    /// A number that changes whenever any binding does.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Remove a binding; returns whether it existed.
     pub fn unbind(&mut self, table: &str, key: &KeyCode) -> bool {
+        self.own(table);
         let Some(t) = self.tables.get_mut(table) else { return false };
+        self.generation += 1;
         let removed = t.remove(key).is_some();
         if t.is_empty() {
             self.tables.remove(table);
@@ -150,22 +386,33 @@ impl KeyBindings {
 
     /// Remove every binding in `table`.
     pub fn unbind_all(&mut self, table: &str) {
+        self.generation += 1;
+        if let Some(i) = copy_index(table) {
+            self.copy_pending[i] = false;
+        }
         self.tables.remove(table);
     }
 
     /// Whether a table exists (has at least one binding).
     pub fn has_table(&self, table: &str) -> bool {
-        self.tables.contains_key(table)
+        self.tables.contains_key(table) || copy_index(table).is_some_and(|i| self.copy_pending[i])
     }
 
     /// Table names in order.
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
-        self.tables.keys().map(|s| s.as_str())
+        let mut names: Vec<&str> = self.tables.keys().map(|s| s.as_str()).collect();
+        for (i, n) in [COPY_MODE_VI_TABLE, COPY_MODE_TABLE].into_iter().enumerate() {
+            if self.copy_pending[i] {
+                names.push(n);
+            }
+        }
+        names.sort_unstable();
+        names.into_iter()
     }
 
     /// Bindings of a table in tmux's `list-keys` order.
     pub fn bindings(&self, table: &str) -> Vec<&Binding> {
-        let mut v: Vec<&Binding> = self.tables.get(table).map(|t| t.values().collect()).unwrap_or_default();
+        let mut v: Vec<&Binding> = self.table(table).map(|t| t.values().collect()).unwrap_or_default();
         v.sort_by_key(|b| b.key.sort_key());
         v
     }
@@ -377,6 +624,31 @@ mod tests {
         let first: Vec<&str> = list.lines().take(3).collect();
         assert_eq!(first[0], "bind-key    -T prefix Space   next-layout");
         assert!(list.lines().last().unwrap().contains("C-Right"));
+    }
+
+    #[test]
+    fn copy_mode_defaults_are_parsed_on_first_use() {
+        let mut b = KeyBindings::with_defaults();
+        assert!(b.copy_defaults.get().is_none(), "not parsed at start-up");
+        let names: Vec<&str> = b.table_names().collect();
+        assert_eq!(names, ["copy-mode", "copy-mode-vi", "prefix"]);
+        assert!(b.has_table(COPY_MODE_VI_TABLE));
+        let q = KeyCode::parse("q").unwrap();
+        assert_eq!(run(&KeyDecision::Run(b.lookup_code(COPY_MODE_VI_TABLE, &q).unwrap().commands.clone())), "send-keys -X cancel");
+        // A change makes the table an ordinary one, defaults kept.
+        let g = b.generation();
+        b.bind(COPY_MODE_VI_TABLE, Binding { key: KeyCode::parse("y").unwrap(), repeat: false, note: None, commands: parse_string("send -X copy-selection").unwrap() });
+        assert!(b.generation() > g);
+        assert!(b.lookup_code(COPY_MODE_VI_TABLE, &q).is_some());
+        assert_eq!(b.bindings(COPY_MODE_VI_TABLE).len(), COPY_MODE_VI_DEFAULTS.len() + 1, "y is new");
+        assert!(b.unbind(COPY_MODE_TABLE, &q));
+        assert!(b.lookup_code(COPY_MODE_TABLE, &q).is_none());
+        assert_eq!(b.bindings(COPY_MODE_TABLE).len(), COPY_MODE_DEFAULTS.len() - 1);
+        b.unbind_all(COPY_MODE_TABLE);
+        assert!(!b.has_table(COPY_MODE_TABLE));
+        assert!(b.lookup_code(COPY_MODE_TABLE, &q).is_none());
+        // An empty set of bindings has no copy tables.
+        assert!(!KeyBindings::new().has_table(COPY_MODE_TABLE));
     }
 
     #[test]

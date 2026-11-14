@@ -12,16 +12,23 @@ pub struct Theme {
     pub selection: Style,
     /// The position indicator (`[12/340]`) on a pane's first row.
     pub indicator: Style,
+    /// Search matches shown in copy mode (tmux's `copy-mode-match-style`),
+    /// drawn under the selection.
+    pub search_match: Style,
+    /// The match the cursor is on (`copy-mode-current-match-style`).
+    pub current_match: Style,
 }
 
 impl Default for Theme {
-    /// tmux's defaults: green active border, yellow mode style.
+    /// tmux's defaults: green active border, yellow mode style, cyan
+    /// matches and a magenta current match.
     fn default() -> Self {
-        let mode = Style {
+        let on = |bg: u8| Style {
             fg: Color::Indexed(0),
-            bg: Color::Indexed(3),
+            bg: Color::Indexed(bg),
             ..Style::default()
         };
+        let mode = on(3);
         Theme {
             border: Style::default(),
             active_border: Style {
@@ -30,6 +37,8 @@ impl Default for Theme {
             },
             selection: mode,
             indicator: mode,
+            search_match: on(6),
+            current_match: on(5),
         }
     }
 }
@@ -112,6 +121,35 @@ impl Selection {
     }
 }
 
+/// One highlighted run of a search match on one row of a pane, in pane
+/// coordinates, columns `x0..=x1`. A wide character is highlighted when the
+/// column of its first cell is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatchSpan {
+    pub y: u16,
+    pub x0: u16,
+    pub x1: u16,
+    /// Drawn in [`Theme::current_match`] instead of [`Theme::search_match`].
+    pub current: bool,
+}
+
+impl MatchSpan {
+    /// The style `spans` give the cell at `(x, y)`: the current match's if
+    /// any current span covers it, else the match style if any span does.
+    pub fn style_at(spans: &[MatchSpan], theme: &Theme, x: u16, y: u16) -> Option<Style> {
+        let mut found = None;
+        for s in spans {
+            if s.y == y && s.x0 <= x && x <= s.x1 {
+                if s.current {
+                    return Some(theme.current_match);
+                }
+                found = Some(theme.search_match);
+            }
+        }
+        found
+    }
+}
+
 /// One pane of the scene.
 #[derive(Clone, Copy, Debug)]
 pub struct ScenePane<'a> {
@@ -125,6 +163,8 @@ pub struct ScenePane<'a> {
     pub frame: &'a PaneFrame,
     pub active: bool,
     pub selection: Option<Selection>,
+    /// Search matches to highlight (under the selection), any order.
+    pub matches: &'a [MatchSpan],
     /// Right-aligned on the pane's first row, e.g. `[12/340]`.
     pub indicator: Option<&'a str>,
 }

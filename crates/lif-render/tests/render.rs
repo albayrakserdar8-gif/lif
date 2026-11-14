@@ -6,7 +6,8 @@ mod common;
 
 use common::{Rng, Vt, diff, escape, reference};
 use lif_render::{
-    Message, Renderer, Scene, ScenePane, Selection, SelectionKind, StatusBar, StatusPosition, Theme,
+    MatchSpan, Message, Renderer, Scene, ScenePane, Selection, SelectionKind, StatusBar, StatusPosition,
+    Theme,
 };
 use lif_types::{
     Attrs, Cell, CellWidth, Color, Cursor, CursorShape, OuterCaps, PaneFrame, Pos, Rect, Size,
@@ -93,6 +94,7 @@ fn pane(id: u64, rect: Rect, frame: &PaneFrame, active: bool) -> ScenePane<'_> {
         frame,
         active,
         selection: None,
+        matches: &[],
         indicator: None,
     }
 }
@@ -505,6 +507,13 @@ fn status_message_overlays_and_cursor() {
         Span::plain("vim 中文 e\u{301}"),
     ];
     let msg: StyledLine = vec![Span::plain(":kill-pane")];
+    // Matches, one current, one under the selections and one over the
+    // wide character's tail only (which does not highlight it).
+    let spans = [
+        MatchSpan { y: 1, x0: 0, x1: 4, current: false },
+        MatchSpan { y: 3, x0: 2, x1: 3, current: true },
+        MatchSpan { y: 0, x0: 21, x1: 23, current: false },
+    ];
     let mut r = Renderer::new(full_caps());
     let mut vt = Vt::new(24, 6);
     let sels = [
@@ -529,6 +538,7 @@ fn status_message_overlays_and_cursor() {
     for (i, sel) in sels.into_iter().enumerate() {
         let panes = [ScenePane {
             selection: sel,
+            matches: if i % 2 == 0 { &spans } else { &[] },
             indicator: (i % 2 == 1).then_some("[12/340]"),
             ..pane(1, Rect::new(0, 1, 24, 5), &f, true)
         }];
@@ -572,6 +582,7 @@ struct P {
     rect: Rect,
     frame: PaneFrame,
     sel: Option<Selection>,
+    matches: Vec<MatchSpan>,
     ind: Option<String>,
 }
 
@@ -894,6 +905,7 @@ impl World {
                         rect,
                         frame,
                         sel: None,
+                        matches: Vec::new(),
                         ind: None,
                     }
                 }
@@ -1007,6 +1019,24 @@ impl World {
                     ..Theme::default()
                 };
                 self.theme.selection = rand_style(&mut self.rng);
+                self.theme.search_match = rand_style(&mut self.rng);
+                self.theme.current_match = rand_style(&mut self.rng);
+            }
+            98..=99 if n > 0 => {
+                // Search matches: a few spans, possibly overlapping each
+                // other, the selection, wide characters and the pane edge.
+                let p = &mut self.panes[pi];
+                let r = p.rect;
+                p.matches.clear();
+                for _ in 0..self.rng.below(5) {
+                    let x0 = self.rng.below(r.cols as u64 + 1) as u16;
+                    p.matches.push(MatchSpan {
+                        y: self.rng.below(r.rows as u64 + 1) as u16,
+                        x0,
+                        x1: x0 + self.rng.below(8) as u16,
+                        current: self.rng.chance(0.3),
+                    });
+                }
             }
             96 if !clients.is_empty() => {
                 let i = self.rng.below(clients.len() as u64) as usize;
@@ -1081,6 +1111,7 @@ fn run_seed(seed: u64, steps: usize) -> (usize, usize) {
                 frame: &p.frame,
                 active: i == w.active,
                 selection: p.sel,
+                matches: &p.matches,
                 indicator: p.ind.as_deref(),
             })
             .collect();

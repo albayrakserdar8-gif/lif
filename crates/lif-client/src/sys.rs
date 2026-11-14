@@ -2,6 +2,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::time::Instant;
 
 /// Turns a -1 return into the OS error.
 pub(crate) fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -37,6 +38,33 @@ pub(crate) fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// [`write_all`] that gives up at `deadline` (`TimedOut`), for the
+/// shutdown paths that must not hang on a terminal nobody reads.
+pub(crate) fn write_all_until(fd: RawFd, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
+    while !buf.is_empty() {
+        match write(fd, buf) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let ms = poll_ms(deadline).ok_or(io::ErrorKind::TimedOut)?;
+                let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                // SAFETY: one valid pollfd.
+                unsafe { libc::poll(&mut p, 1, ms) };
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The poll(2) timeout that ends at `deadline`, rounded up so a poll never
+/// returns just before it; `None` once it has passed.
+pub(crate) fn poll_ms(deadline: Instant) -> Option<libc::c_int> {
+    let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+    Some(left.as_micros().div_ceil(1000).min(libc::c_int::MAX as u128) as libc::c_int)
 }
 
 pub(crate) fn get_flags(fd: RawFd) -> io::Result<libc::c_int> {

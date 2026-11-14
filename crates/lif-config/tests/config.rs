@@ -298,23 +298,23 @@ fn theme_styles() {
 }
 
 #[test]
-fn theme_keys_lif_core_lacks_are_warnings() {
+fn pane_border_selection_message_and_match_styles() {
     let c = Config::parse(
-        "[theme]\nborder = { fg = \"red\" }\nactive-border = \"fg=green\"\nselection = {}\nmessage = { bg = \"yellow\" }\nstatus = { fg = \"red\" }",
+        "[theme]\nborder = { fg = \"red\" }\nactive-border = \"fg=green\"\nselection = {}\nmessage = { bg = \"yellow\" }\nmatch = { bg = \"blue\" }\ncurrent-match = \"bg=red\"",
     );
-    let d: Vec<String> = c.diagnostics.iter().map(|d| d.to_string()).collect();
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
     assert_eq!(
-        d,
+        c.command_strings(),
         [
-            "2:1: warning: `theme.border` has no effect yet: this lif build has no `pane-border-style` option",
-            "3:1: warning: `theme.active-border` has no effect yet: this lif build has no `pane-active-border-style` option",
-            "4:1: warning: `theme.selection` has no effect yet: this lif build has no `mode-style` option",
-            "5:1: warning: `theme.message` has no effect yet: this lif build has no `message-style` option",
+            "set-option -g pane-border-style fg=red",
+            "set-option -g pane-active-border-style fg=green",
+            "set-option -g mode-style default",
+            "set-option -g message-style bg=yellow",
+            "set-option -g copy-mode-match-style bg=blue",
+            "set-option -g copy-mode-current-match-style bg=red",
         ]
     );
-    assert!(!c.has_errors());
-    assert_eq!(c.command_strings(), ["set-option -g status-style fg=red"]);
-    // Their values are still checked.
+    // Their values are checked.
     assert_eq!(diag("[theme]\nborder = { fg = \"rd\" }"), "2:17: error: `theme.border`: unknown color \"rd\", did you mean \"red\"?");
 }
 
@@ -603,19 +603,21 @@ fn bad_command_strings_point_at_the_value() {
         diag("[keys]\nx = { command = \"slect-pane -L\" }"),
         "2:17: error: key `x` in [keys]: unknown command `slect-pane`, did you mean `select-pane`?"
     );
-    // Copy-mode commands (send-keys -X) are not in lif-core yet.
-    assert_eq!(
-        diag("[keys.copy-mode-vi]\nv = \"send-keys -X begin-selection\""),
-        "2:5: error: key `v` in [keys.copy-mode-vi]: command send-keys: unknown flag -X"
-    );
+    // Copy-mode commands (send-keys -X) are lif-core commands.
+    let c = Config::parse("[keys.copy-mode-vi]\nv = \"send-keys -X begin-selection\"");
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
+    assert_eq!(c.command_strings(), ["bind-key -T copy-mode-vi v \"send-keys -X begin-selection\""]);
 }
 
 #[test]
 fn all_diagnostics_are_returned_with_everything_that_parsed() {
     let c = Config::parse("mouze = true\nbase-index = 1\nmouse = \"on\"\n[keys]\n\"|\" = \"splt-window\"\nx = false\n[theme]\nborder = {}\n");
     let d: Vec<(u32, Severity)> = c.diagnostics.iter().map(|d| (d.line, d.severity)).collect();
-    assert_eq!(d, [(1, Severity::Error), (3, Severity::Error), (5, Severity::Error), (8, Severity::Warning)]);
-    assert_eq!(c.command_strings(), ["set-option -g base-index 1", "unbind-key -T prefix x"]);
+    assert_eq!(d, [(1, Severity::Error), (3, Severity::Error), (5, Severity::Error)]);
+    assert_eq!(
+        c.command_strings(),
+        ["set-option -g base-index 1", "set-option -g pane-border-style default", "unbind-key -T prefix x"]
+    );
     assert_eq!(c.commands[0], Entry { command: "set-option -g base-index 1".into(), line: 2, column: 14 });
 }
 
@@ -658,6 +660,8 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g repeat-time 500",
         "set-option -g mouse on",
         "set-option -g mode-keys emacs",
+        "set-option -g word-separators \"!\\\"#\\$%&'()*+,-./:;<=>?@[\\\\]^`{|}~\"",
+        "set-option -g wrap-search on",
         "set-option -s set-clipboard external",
         "set-option -g scrollback-bytes 10485760",
         "set-option -g history-limit 2000",
@@ -703,6 +707,12 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g window-status-last-style default",
         "set-option -g window-status-activity-style reverse",
         "set-option -g window-status-bell-style reverse",
+        "set-option -g pane-border-style default",
+        "set-option -g pane-active-border-style fg=green",
+        "set-option -g mode-style bg=yellow,fg=black",
+        "set-option -g message-style bg=yellow,fg=black",
+        "set-option -g copy-mode-match-style bg=cyan,fg=black",
+        "set-option -g copy-mode-current-match-style bg=magenta,fg=black",
         "bind-key -T prefix C-b send-prefix",
         "bind-key -T prefix \\\" split-window",
         "bind-key -T prefix \\% \"split-window -h\"",
@@ -729,7 +739,7 @@ fn example_values_are_lif_defaults() {
 #[test]
 fn example_commented_settings_are_valid_too() {
     // Uncomment every "# key = value" line of the example: the result must
-    // load without errors (only the documented theme warnings).
+    // load without errors or warnings.
     let mut out = String::new();
     for line in example().lines() {
         let uncommented = line.strip_prefix("# ").filter(|rest| {
@@ -741,7 +751,7 @@ fn example_commented_settings_are_valid_too() {
     }
     let c = Config::parse(&out);
     assert!(!c.has_errors(), "{}\n{out}", c.report());
-    assert_eq!(c.diagnostics.len(), 4, "{}", c.report());
+    assert_eq!(c.diagnostics.len(), 0, "{}", c.report());
     let cmds = c.command_strings();
     for want in [
         "set-option -g default-shell /bin/zsh",
@@ -891,6 +901,12 @@ x = "kill-pane ; display-message killed"
 [keys.root]
 M-Left = "select-pane -L"
 M-Right = "select-pane -R"
+
+[keys.copy-mode]
+q = "send -X cancel"
+
+[keys.copy-mode-vi]
+v = "send -X begin-selection"
 "##;
     assert_eq!(m.toml, expected_toml);
     let un: Vec<(usize, &str)> = m.untranslated.iter().map(|u| (u.line, u.reason.as_str())).collect();
@@ -900,9 +916,10 @@ M-Right = "select-pane -R"
             (15, "lif has no option default-terminal"),
             (16, "set-option -a has no config.toml equivalent"),
             (23, "user options (@name) have no config.toml equivalent"),
-            (37, "unsupported command: source-file"),
-            (39, "command send-keys: unknown flag -X"),
-            (40, "command send-keys: unknown flag -X"),
+            (
+                37,
+                "source-file of a tmux configuration file: lif reloads its own config.toml (source-file ~/.config/lif/config.toml)",
+            ),
             (41, "key table mytable is not supported (config.toml has prefix, root, copy-mode, copy-mode-vi)"),
             (42, "unbind-key -a has no config.toml equivalent"),
             (43, "unsupported command: if-shell"),
@@ -913,8 +930,7 @@ M-Right = "select-pane -R"
     );
     assert_eq!(m.untranslated[0].text, "set -g default-terminal \"tmux-256color\"");
 
-    // The translation loads (the active-border warning aside) and means
-    // what the .tmux.conf meant.
+    // The translation loads and means what the .tmux.conf meant.
     let c = Config::parse(&m.toml);
     assert!(!c.has_errors(), "{}", c.report());
     let mut model = Model::new("h");
@@ -929,6 +945,7 @@ M-Right = "select-pane -R"
     assert_eq!(bound(&model, PREFIX_TABLE, "%"), None);
     assert_eq!(bound(&model, PREFIX_TABLE, "x"), Some((false, None, "kill-pane ; display-message killed".into())));
     assert_eq!(bound(&model, ROOT_TABLE, "M-Right"), Some((false, None, "select-pane -R".into())));
+    assert_eq!(bound(&model, "copy-mode-vi", "v"), Some((false, None, "send-keys -X begin-selection".into())));
 }
 
 #[test]

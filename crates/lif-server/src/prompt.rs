@@ -1,7 +1,7 @@
 //! The status-line prompt: `command-prompt` (a small line editor with
 //! history) and `confirm-before`.
 
-use lif_core::{KeyCode, Prompt};
+use lif_core::{KeyCode, PaneId, Prompt};
 use lif_render::char_width;
 use lif_types::{Color, Key, KeyAction, KeyEvent, Mods, Span, Style, StyledLine};
 
@@ -13,6 +13,19 @@ pub(crate) enum PromptAction {
     Cancel,
     /// Parse and run this command string.
     Run(String),
+    /// A copy-mode prompt's text changed (incremental search).
+    CopyChanged(PaneId, String),
+    /// C-s (true) or C-r in an incremental copy-mode prompt.
+    CopyAgain(PaneId, bool),
+    CopyAccept(PaneId, String),
+    CopyCancel(PaneId),
+}
+
+/// A prompt copy mode asked for (search, goto line).
+#[derive(Clone, Copy)]
+struct CopyPrompt {
+    pane: PaneId,
+    incremental: bool,
 }
 
 pub(crate) struct PromptState {
@@ -25,6 +38,7 @@ pub(crate) struct PromptState {
     /// Position in the history while browsing it; `None` when editing.
     hist: Option<usize>,
     saved: Vec<char>,
+    copy: Option<CopyPrompt>,
 }
 
 pub(crate) fn message_style() -> Style {
@@ -33,9 +47,30 @@ pub(crate) fn message_style() -> Style {
 
 impl PromptState {
     pub(crate) fn new(prompt: Prompt) -> Self {
-        let mut s = PromptState { prompt, step: 0, answers: Vec::new(), line: Vec::new(), cursor: 0, hist: None, saved: Vec::new() };
+        let mut s =
+            PromptState { prompt, step: 0, answers: Vec::new(), line: Vec::new(), cursor: 0, hist: None, saved: Vec::new(), copy: None };
         s.load_input();
         s
+    }
+
+    /// A prompt for copy mode in `pane` (`(search up)` ...); its edits and
+    /// answer go back to the mode instead of running a command.
+    pub(crate) fn copy(pane: PaneId, label: &str, initial: String, incremental: bool) -> Self {
+        let mut s = PromptState::new(Prompt::Command {
+            prompts: vec![format!("{label} ")],
+            inputs: vec![initial],
+            template: String::new(),
+            single_key: false,
+            key_name: false,
+            numeric: false,
+        });
+        s.copy = Some(CopyPrompt { pane, incremental });
+        s
+    }
+
+    /// The pane of a copy-mode prompt.
+    pub(crate) fn copy_pane(&self) -> Option<PaneId> {
+        self.copy.map(|c| c.pane)
     }
 
     fn load_input(&mut self) {
@@ -56,10 +91,9 @@ impl PromptState {
         }
     }
 
-    /// The line to show and the column of the cursor in it.
-    pub(crate) fn render(&self, out: &mut StyledLine) -> u16 {
+    /// The line to show (in `style`) and the column of the cursor in it.
+    pub(crate) fn render(&self, out: &mut StyledLine, style: Style) -> u16 {
         out.clear();
-        let style = message_style();
         let label = self.label().to_string();
         let mut col: usize = label.chars().map(char_width).sum();
         out.push(Span::new(label, style));
@@ -74,6 +108,9 @@ impl PromptState {
     pub(crate) fn key(&mut self, key: &KeyEvent, history: &mut Vec<String>) -> PromptAction {
         if key.action == KeyAction::Release || matches!(key.key, Key::Modifier(_)) {
             return PromptAction::Continue;
+        }
+        if let Some(c) = self.copy {
+            return self.copy_key(c, key, history);
         }
         let (single_key, key_name, numeric) = match &self.prompt {
             Prompt::Confirm { command, default_yes, .. } => {
@@ -151,6 +188,31 @@ impl PromptState {
                 }
                 self.insert(&text);
             }
+        }
+        PromptAction::Continue
+    }
+
+    fn copy_key(&mut self, c: CopyPrompt, key: &KeyEvent, history: &mut Vec<String>) -> PromptAction {
+        let ctrl = key.mods.contains(Mods::CTRL);
+        let line = |s: &Self| s.line.iter().collect::<String>();
+        match key.key {
+            Key::Escape => return PromptAction::CopyCancel(c.pane),
+            Key::Char('c') | Key::Char('g') if ctrl => return PromptAction::CopyCancel(c.pane),
+            Key::Enter => return PromptAction::CopyAccept(c.pane, line(self)),
+            Key::Char('m') | Key::Char('j') if ctrl => return PromptAction::CopyAccept(c.pane, line(self)),
+            Key::Char('s') if ctrl && c.incremental => return PromptAction::CopyAgain(c.pane, true),
+            Key::Char('r') if ctrl && c.incremental => return PromptAction::CopyAgain(c.pane, false),
+            _ => {}
+        }
+        let before = self.line.clone();
+        // The usual line editing (search prompts keep no history).
+        let mut none = Vec::new();
+        let _ = history;
+        let copy = self.copy.take();
+        let _ = self.key(key, &mut none);
+        self.copy = copy;
+        if c.incremental && self.line != before {
+            return PromptAction::CopyChanged(c.pane, line(self));
         }
         PromptAction::Continue
     }
@@ -289,25 +351,25 @@ mod tests {
         typed(&mut p, "abc def", &mut h);
         p.key(&ctrl('w'), &mut h);
         let mut line = StyledLine::new();
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "abc ");
         p.key(&ctrl('u'), &mut h);
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "");
         p.key(&k(Key::Up), &mut h);
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "second");
         p.key(&k(Key::Up), &mut h);
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "first");
         p.key(&k(Key::Down), &mut h);
         p.key(&k(Key::Down), &mut h);
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "");
         typed(&mut p, "xyz", &mut h);
         p.key(&k(Key::Home), &mut h);
         p.key(&ctrl('k'), &mut h);
-        p.render(&mut line);
+        p.render(&mut line, message_style());
         assert_eq!(line[1].text, "");
         assert!(matches!(p.key(&k(Key::Escape), &mut h), PromptAction::Cancel));
     }

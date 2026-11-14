@@ -21,6 +21,7 @@
 mod frame;
 mod input;
 mod osc;
+mod rows;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -30,7 +31,7 @@ use libghostty_vt::effect::{
     PrimaryDeviceAttributes, SecondaryDeviceAttributes, SemanticPromptKind,
     TertiaryDeviceAttributes,
 };
-use libghostty_vt::fmt::{Format, Formatter};
+use libghostty_vt::fmt::{Extras, Format, Formatter};
 use libghostty_vt::mode::Mode;
 use libghostty_vt::point::{Coordinate, Point};
 use libghostty_vt::render::{CellIterator, RowIterator};
@@ -39,11 +40,11 @@ use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::Selection;
 use libghostty_vt::terminal::{CompressionActivity, CompressionMode, CompressionResult, ScrollViewport};
 use libghostty_vt::{RenderState, Terminal, key, mouse};
-use lif_types::{KeyEvent, MouseEvent, PaneFrame, PixelSize, Size};
+use lif_types::{FrameRow, KeyEvent, MouseEvent, PaneFrame, PixelSize, Size};
 
 use crate::{
-    FALLBACK_BACKGROUND, FALLBACK_FOREGROUND, PaneModes, Rgb, Scroll, TextRange, VtEngine, VtError, VtEvent, VtMemory,
-    VtOptions,
+    FALLBACK_BACKGROUND, FALLBACK_FOREGROUND, PaneModes, Rgb, Scroll, TextOptions, TextRange, VtEngine, VtError,
+    VtEvent, VtMemory, VtOptions,
 };
 
 use frame::{FrameScratch, Links};
@@ -121,6 +122,9 @@ pub struct GhosttyVt {
     reverse: bool,
     /// Compression activity token at the end of the last finished pass.
     compacted_at: Option<CompressionActivity>,
+    trim: rows::TrimCounter,
+    /// The row `row_scan` read last (which way a scan goes).
+    last_scan: Option<usize>,
 }
 
 fn engine_err(e: libghostty_vt::Error) -> VtError {
@@ -262,10 +266,14 @@ impl GhosttyVt {
         self.term.mode(m).unwrap_or(false)
     }
 
-    /// Format `sel` (or the whole screen) as plain text.
-    fn format_text(&self, sel: Option<(Point, Point)>, join_wrapped: bool) -> Option<String> {
+    /// Format `sel` (or the whole screen) as text.
+    fn format_text(&self, sel: Option<(Point, Point)>, opts: TextOptions) -> Option<String> {
         let mut f = Formatter::new(&self.term).ok()?;
-        f.set_format(Format::Plain).ok()?.set_unwrap(join_wrapped).ok()?.set_trim(true).ok()?;
+        let format = if opts.styled { Format::Vt } else { Format::Plain };
+        f.set_format(format).ok()?.set_unwrap(opts.join_wrapped).ok()?.set_trim(!opts.keep_trailing).ok()?;
+        // Only the text and its styles, not the terminal state (palette,
+        // modes...) VT output carries by default.
+        f.set_extras(Extras::NONE).ok()?;
         if let Some((a, b)) = sel {
             let start = self.term.grid_ref(a).ok()?;
             let end = self.term.grid_ref(b).ok()?;
@@ -314,6 +322,8 @@ impl VtEngine for GhosttyVt {
             osc: OscWatch::default(),
             reverse: false,
             compacted_at: None,
+            trim: rows::TrimCounter::default(),
+            last_scan: None,
         };
         vt.install_effects().map_err(engine_err)?;
         vt.apply_default_colors(opts.default_fg, opts.default_bg, opts.default_cursor).map_err(engine_err)?;
@@ -332,6 +342,10 @@ impl VtEngine for GhosttyVt {
                 OscEvent::Notification { title, body } => VtEvent::Notification { title, body },
             });
         });
+        if self.trim.tracking() {
+            let primary = matches!(self.term.active_screen(), Ok(Screen::Primary));
+            self.trim.after_write(&mut self.term, self.size.rows, primary);
+        }
         let flagged = {
             let sh = self.shared.borrow();
             sh.title_changed || sh.pwd_changed
@@ -360,6 +374,9 @@ impl VtEngine for GhosttyVt {
             self.size = size;
             self.pixels = pixels;
             self.dirty = true;
+            if self.trim.tracking() && matches!(self.term.active_screen(), Ok(Screen::Primary)) {
+                self.trim.place(&mut self.term, size.rows);
+            }
         }
     }
 
@@ -495,6 +512,10 @@ impl VtEngine for GhosttyVt {
     }
 
     fn text(&self, range: TextRange, join_wrapped: bool) -> String {
+        self.capture(range, TextOptions { join_wrapped, ..TextOptions::default() })
+    }
+
+    fn capture(&self, range: TextRange, opts: TextOptions) -> String {
         let last_col = self.size.cols.saturating_sub(1);
         let sel = match range {
             TextRange::All => None,
@@ -517,7 +538,44 @@ impl VtEngine for GhosttyVt {
                 ))
             }
         };
-        self.format_text(sel, join_wrapped).unwrap_or_default()
+        self.format_text(sel, opts).unwrap_or_default()
+    }
+
+    fn row(&self, abs_row: usize, out: &mut FrameRow) {
+        rows::read_row(&self.term, self.size.cols, abs_row, out);
+    }
+
+    fn row_scan(&mut self, abs_row: usize, out: &mut FrameRow) {
+        let rows = usize::from(self.size.rows.max(1));
+        let top = self.viewport_top();
+        if abs_row < top || abs_row >= top + rows {
+            // Put the row at the end of the viewport the scan comes from,
+            // so the next rows it reads are inside too.
+            let backward = self.last_scan.is_some_and(|l| abs_row < l);
+            let new_top = if backward { (abs_row + 1).saturating_sub(rows) } else { abs_row };
+            self.term.scroll_viewport(ScrollViewport::Row(new_top.min(self.scrollback_rows())));
+            self.dirty = true;
+        }
+        self.last_scan = Some(abs_row);
+        rows::read_row(&self.term, self.size.cols, abs_row, out);
+    }
+
+    fn find_prompt(&self, from: usize, forward: bool) -> Option<usize> {
+        rows::find_prompt(&self.term, from, forward)
+    }
+
+    fn trimmed_rows(&self) -> u64 {
+        self.trim.trimmed
+    }
+
+    fn track_trimmed(&mut self, on: bool) {
+        self.trim.set_tracking(&mut self.term, self.size.rows, on);
+    }
+
+    fn set_viewport_top(&mut self, top: usize) {
+        let to = if top >= self.scrollback_rows() { ScrollViewport::Bottom } else { ScrollViewport::Row(top) };
+        self.term.scroll_viewport(to);
+        self.dirty = true;
     }
 
     fn title(&self) -> &str {
@@ -538,6 +596,7 @@ impl VtEngine for GhosttyVt {
                 resident_bytes: (m.primary_resident_bytes + m.alternate_resident_bytes) as usize,
                 compressed_bytes: (m.primary_compressed_bytes + m.alternate_compressed_bytes)
                     as usize,
+                compressed_pages: (m.primary_compressed_pages + m.alternate_compressed_pages) as usize,
             },
             Err(_) => VtMemory::default(),
         }

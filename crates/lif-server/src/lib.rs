@@ -66,12 +66,23 @@ pub struct ServerOptions {
     pub lock: Option<PathBuf>,
     /// Log to `lif-server-<pid>.log` in the socket's directory.
     pub verbose: bool,
+    /// The configuration file given with `lif -f`; `None` means the
+    /// default location (lif-config's `default_path`).
+    pub config: Option<PathBuf>,
 }
 
-/// Commands run once at start-up, before the first client command (the
-/// configuration file). The seam the configuration loader fills in.
-pub fn load_startup_commands() -> Vec<String> {
-    Vec::new()
+/// Commands run once at start-up, before the first client command: reading
+/// the configuration file. A file named with `-f` must exist; the default
+/// one may be missing. Problems never stop the server (see `server`).
+pub fn load_startup_commands(opts: &ServerOptions) -> Vec<String> {
+    let (path, quiet) = match &opts.config {
+        Some(p) => (p.clone(), ""),
+        None => match lif_config::default_path() {
+            Some(p) => (p, "-q "),
+            None => return Vec::new(),
+        },
+    };
+    vec![format!("source-file {quiet}{}", lif_core::escape_arg(&path.to_string_lossy()))]
 }
 
 /// Runs the server on an already bound and listening socket until it exits.

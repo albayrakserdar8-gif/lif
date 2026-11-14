@@ -1,5 +1,9 @@
-//! SIGWINCH / SIGHUP / SIGTERM delivered through a self-pipe, so the
-//! single-threaded loop sees them as an fd becoming readable in poll(2).
+//! SIGWINCH and the terminating signals delivered through a self-pipe, so
+//! the single-threaded loop sees them as an fd becoming readable in poll(2).
+//!
+//! SIGINT and SIGQUIT are caught too: raw mode turns off ISIG, so the
+//! terminal never sends them, but `kill -INT` can, and dying of one with
+//! the default disposition would leave the terminal raw.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -8,7 +12,12 @@ use std::sync::Mutex;
 
 use crate::sys;
 
-pub(crate) const SIGNALS: [libc::c_int; 3] = [libc::SIGWINCH, libc::SIGHUP, libc::SIGTERM];
+pub(crate) const SIGNALS: [libc::c_int; 5] = [libc::SIGWINCH, libc::SIGHUP, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
+
+/// Everything in [`SIGNALS`] but SIGWINCH ends the attachment.
+pub(crate) fn is_terminating(sig: libc::c_int) -> bool {
+    sig != libc::SIGWINCH && SIGNALS.contains(&sig)
+}
 
 /// Write ends of every live self-pipe. A process normally has one attach
 /// loop; more slots let tests run loops side by side.
@@ -16,10 +25,10 @@ static PIPES: [AtomicI32; 16] = [const { AtomicI32::new(-1) }; 16];
 
 struct Installed {
     users: usize,
-    previous: [Option<libc::sigaction>; 3],
+    previous: [Option<libc::sigaction>; SIGNALS.len()],
 }
 
-static INSTALLED: Mutex<Installed> = Mutex::new(Installed { users: 0, previous: [None; 3] });
+static INSTALLED: Mutex<Installed> = Mutex::new(Installed { users: 0, previous: [None; SIGNALS.len()] });
 
 extern "C" fn on_signal(sig: libc::c_int) {
     let errno = sys::errno_location();
@@ -46,6 +55,8 @@ pub(crate) struct SignalPipe {
     read: OwnedFd,
     _write: OwnedFd,
     slot: usize,
+    /// Still counted in `Installed::users` (`finish` already uncounted it).
+    counted: bool,
 }
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
@@ -91,7 +102,7 @@ impl SignalPipe {
             }
         }
         st.users += 1;
-        Ok(SignalPipe { read, _write: write, slot })
+        Ok(SignalPipe { read, _write: write, slot, counted: true })
     }
 
     pub(crate) fn fd(&self) -> RawFd {
@@ -104,6 +115,54 @@ impl SignalPipe {
         while let Ok(n @ 1..) = sys::read(self.fd(), &mut buf) {
             buf[..n].iter().for_each(|&b| f(b as libc::c_int));
         }
+    }
+}
+
+impl SignalPipe {
+    /// Puts the previous dispositions back (if this is the last pipe), then
+    /// returns the first terminating signal still in the pipe. In this
+    /// order nothing is lost: a signal that arrives before the handlers go
+    /// is in the pipe, one that arrives after meets the old disposition.
+    pub(crate) fn finish(mut self) -> Option<libc::c_int> {
+        self.uncount();
+        let mut first = None;
+        self.drain(|sig| {
+            if is_terminating(sig) {
+                first.get_or_insert(sig);
+            }
+        });
+        first
+    }
+
+    fn uncount(&mut self) {
+        if !std::mem::take(&mut self.counted) {
+            return;
+        }
+        let mut st = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+        st.users -= 1;
+        if st.users == 0 {
+            restore(&mut st);
+        }
+    }
+}
+
+/// Delivers `sig` again, after [`SignalPipe::finish`] put the previous
+/// disposition back. For a process that had the default one (the lif
+/// binary) this ends it by the signal, so its parent sees "killed by
+/// SIGTERM" instead of a clean exit; a disposition the process inherited
+/// as ignored (`nohup`, background jobs and SIGINT) stays ignored and this
+/// returns.
+pub(crate) fn reraise(sig: libc::c_int) {
+    // SAFETY: sigset_t is plain data, initialized by sigemptyset; the
+    // pointers are valid for the calls.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        // A signal blocked by the caller would stay pending and be lost
+        // at exit.
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
     }
 }
 
@@ -121,10 +180,6 @@ impl Drop for SignalPipe {
         // Unregister before the fd closes, so the handler never writes to
         // a closed (or reused) fd number.
         PIPES[self.slot].store(-1, Ordering::Release);
-        let mut st = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
-        st.users -= 1;
-        if st.users == 0 {
-            restore(&mut st);
-        }
+        self.uncount();
     }
 }

@@ -4,7 +4,7 @@ use crate::cell::{DEFAULT_STYLE, RCell, W, hash_cells, same, style_eq};
 use crate::esc::{Sink, csi_n, num};
 use crate::layout::{self, ACTIVE, CHROME, PANE, glyph_of, is_border};
 use crate::moves::move_cursor;
-use crate::scene::{LinkLookup, Scene, Selection, StatusPosition, Theme};
+use crate::scene::{LinkLookup, MatchSpan, Scene, Selection, StatusPosition, Theme};
 use crate::sgr::{self, Norm};
 use crate::text;
 use lif_types::{
@@ -595,6 +595,7 @@ struct Track {
     stale: Vec<bool>,
     nstale: usize,
     sel: Option<Selection>,
+    matches: Vec<MatchSpan>,
     has_ind: bool,
     ind: String,
 }
@@ -789,6 +790,22 @@ fn pane_run(
                 };
                 x += 1;
             }
+        }
+    }
+    if p.matches.iter().any(|m| m.y as usize == py) {
+        let mut x = x0;
+        while x < x1 {
+            let d = &mut dst[x - base];
+            if d.w != W::Tail
+                && let Some(style) =
+                    MatchSpan::style_at(p.matches, &c.scene.theme, (x - r.x as usize) as u16, py as u16)
+            {
+                d.style = style;
+                if d.w == W::Wide {
+                    dst[x + 1 - base].style = style;
+                }
+            }
+            x += 1;
         }
     }
     if let Some(sel) = p.selection {
@@ -1148,6 +1165,7 @@ impl Renderer {
             t.stale.resize(p.rect.rows as usize, false);
             t.nstale = 0;
             t.sel = None;
+            t.matches.clear();
             t.has_ind = false;
             t.ind.clear();
         }
@@ -1217,6 +1235,15 @@ impl Renderer {
                     t.mark(lo as usize, hi as usize);
                 }
                 t.sel = p.selection;
+            }
+            if p.matches != t.matches.as_slice() {
+                let old = std::mem::take(&mut t.matches);
+                for m in old.iter().chain(p.matches) {
+                    t.mark(m.y as usize, m.y as usize);
+                }
+                t.matches = old;
+                t.matches.clear();
+                t.matches.extend_from_slice(p.matches);
             }
             let changed = match p.indicator {
                 Some(s) => !t.has_ind || t.ind != s,
