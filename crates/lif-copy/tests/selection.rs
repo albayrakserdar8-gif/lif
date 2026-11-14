@@ -120,9 +120,9 @@ fn copy_outcomes() {
     assert_eq!(x(&mut m, &mut v, "copy-selection-and-cancel"), Outcome::Exit);
     x(&mut m, &mut v, "begin-selection");
     x(&mut m, &mut v, "cursor-right");
-    assert_eq!(x(&mut m, &mut v, "copy-selection-no-clear"), Outcome::Copy { data: b"ab".to_vec(), append: false, exit: false });
+    assert_eq!(x(&mut m, &mut v, "copy-selection-no-clear"), Outcome::Copy { data: b"ab".to_vec(), append: false, exit: false, pipe: false });
     assert!(m.selection().is_some());
-    assert_eq!(x(&mut m, &mut v, "append-selection"), Outcome::Copy { data: b"ab".to_vec(), append: true, exit: false });
+    assert_eq!(x(&mut m, &mut v, "append-selection"), Outcome::Copy { data: b"ab".to_vec(), append: true, exit: false, pipe: false });
     assert!(m.selection().is_none(), "append clears");
     x(&mut m, &mut v, "begin-selection");
     x(&mut m, &mut v, "stop-selection");
@@ -130,7 +130,7 @@ fn copy_outcomes() {
     assert_eq!(m.selection_text(&v).unwrap(), "b", "stopped selections no longer follow the cursor");
     assert_eq!(
         x(&mut m, &mut v, "copy-selection-and-cancel"),
-        Outcome::Copy { data: b"b".to_vec(), append: false, exit: true }
+        Outcome::Copy { data: b"b".to_vec(), append: false, exit: true, pipe: false }
     );
     assert_eq!(copied(&x(&mut m, &mut v, "copy-end-of-line-and-cancel")), "cd");
 }

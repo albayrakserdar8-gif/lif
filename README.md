@@ -13,36 +13,38 @@ what is missing is below and in [docs/tmux-migration.md](docs/tmux-migration.md)
 
 <!-- BEGIN BENCHMARKS: generated from bench/results/comparison.md; replace this whole block when the numbers are re-measured -->
 
-lif 0.1.0 against tmux 3.8, zellij 0.46.0 and a bare shell on the same PTY
-("none"), one run on an Apple Silicon Mac with other work running (2026-11-14).
-Medians; the full table with spreads and sample counts is in
-[bench/results/comparison.md](bench/results/comparison.md), the methodology in
+lif (after the performance tour) against tmux 3.8, zellij 0.46.0 and a bare
+shell on the same PTY ("none"). One run on one machine (Mac18,5, Apple M6, 12
+cores, 16 GiB, macOS 27.2; 2026-11-15) with other work running (load average
+2.3-4.3), client PTY 200x50, every tool with its default settings. Medians;
+spreads, sample counts, the raw data and the methodology are in
+[bench/results/comparison.md](bench/results/comparison.md) and
 [bench/README.md](bench/README.md).
 
-| | none | tmux 3.8 | zellij 0.46.0 | lif 0.1.0 |
+| | none | tmux 3.8 | zellij 0.46.0 | lif |
 |---|---|---|---|---|
-| `cat` 100 MB ASCII (MB/s) | 231.9 | 55.6 | 79.2 | 210.9 |
-| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 279.5 | 21.2 | 80.9 | 147.3 |
-| `cat` one 20 MB line (MB/s) | 154.7 | 52.4 | 17.4 | 151.3 |
-| server memory, idle, 1 pane (MiB, phys_footprint) | - | 3.7 | 25.2 | 3.3 |
-| server memory, idle, 50 panes (MiB) | - | 4.2 | 37.8 | 25.1 |
-| server memory, 100k colored lines in scrollback (MiB) | - | 270.8 | 231.6 | 184.8 |
-| client memory, idle (MiB) | - | 3.3 | 11.9 | 1.3 |
-| server CPU over 30 s idle (ms) | - | 3.3 | 40.7 | 0.4 |
-| server idle wakeups over 30 s | - | 2 | 177 | 0 |
-| create session + kill server (ms) | - | 11.0 | 52.6 | 6.0 |
-| new session until a typed command runs (ms) | 30.5 | 49.0 | 88.6 | 29.2 |
-| key echo, idle pane, p50 / p95 (us) | 16 / 26 | 115 / 198 | 387 / 534 | 1,299 / 5,798 |
-| key echo while another pane runs `yes`, p50 (us) | - | 262 | 949 | 4,611 |
-| bare ESC delivered to the program, p50 (us) | 48 | 10,960 | 56,202 | 5,786 |
-| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 2.49, system libraries only |
+| `cat` 100 MB ASCII (MB/s) | 225.2 | 52.4 | 79.2 | 205.8 |
+| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 284.7 | 21.3 | 81.6 | 151.8 |
+| `cat` one 20 MB line (MB/s) | 155.1 | 51.8 | 17.6 | 151.1 |
+| server memory, idle, 1 pane (MiB, footprint / RSS) | - | 3.7 / 5.2 | 26.5 / 43.1 | 3.3 / 5.1 |
+| server memory, idle, 50 visible panes (MiB) | - | 4.2 / 5.7 | 38.2 / 55.2 | 9.5 / 11.4 |
+| server memory after a 100 MB `cat` (MiB), lines kept | - | 6.1 / 7.6, 1,818 | 44.8 / 61.4, 9,997 | 5.6 / 13.7, 3,784 |
+| server over 30 s idle: CPU ms, idle wakeups | - | 2.3, 1 | 40.6, 155 | 0.4, 0 |
+| create session + kill server (ms) | - | 11.0 | 53.2 | 6.1 |
+| new session until a typed command runs (ms) | 31.6 | 51.4 | 85.5 | 41.9 |
+| key echo, idle pane, p50 / p95 (us) | 22 / 37 | 146 / 214 | 536 / 763 | 126 / 185 |
+| key echo while another pane runs `yes`, p50 / p95 (us) | - | 263 / 332 | 949 / 1,063 | 38 / 45 |
+| bare ESC to the program, default settings, p50 (us) | 54 | 11,696 | 61,673 | 6,323 |
+| bare ESC with `escape-time 0` / kitty keyboard protocol, p50 (us) | - | 1,444 / - | - | 157 / 162 |
+| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 3.06, system libraries only |
 
-Where lif loses: keystroke echo is 11x slower than tmux at the median in this
-run (1.3 ms vs 0.115 ms), because a key that arrives less than 8 ms after the
-previous frame waits for the frame interval; while another pane floods output
-it is 4.6 ms. Each extra idle pane costs about 456 KiB (tmux: about 10 KiB), so
-50 idle panes use 25 MiB against tmux's 4.2 MiB. Attach, draw and detach takes
-33.0 ms against tmux's 29.5 ms.
+Where lif still loses: each extra visible pane costs about 128 KiB (tmux:
+about 10 KiB), so 50 idle panes take 9.5 MiB against tmux's 4.2 MiB (a pane no
+client shows costs about 46 KiB). After large output its RSS stays higher than
+tmux's (13.7 MiB against 7.6 after the 100 MB `cat`) although its footprint is
+lower: compressed history leaves its old pages resident until macOS reclaims
+them. The binary is 2.6 times tmux's, and a new session takes 10 ms longer
+than a bare shell to run its first command.
 
 <!-- END BENCHMARKS -->
 
@@ -107,7 +109,8 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   `E:`, `T:`, `q:`, `n:`, `w:`, `s/a/b/:`, `m:`, `e|op|:`) and
   strftime in the status line.
 - Option names, scopes (`-s`, `-g`, `-w`, per session and window) and the
-  defaults of the 60 options lif has, plus user options (`@name`).
+  defaults of the 60 tmux options lif has (except `escape-time` and
+  `history-limit`, see below), plus user options (`@name`).
 - Layouts: `even-horizontal`, `even-vertical`, `main-horizontal`,
   `main-vertical`, their `-mirrored` variants, `tiled`, and tmux layout
   strings in `#{window_layout}`.
@@ -121,36 +124,40 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   translates the common part of one and lists every line it could not
   translate; `lif check-config` reports mistakes with line, column and a
   suggestion. See [docs/configuration.md](docs/configuration.md).
-- **Scrollback is a byte budget per pane** (`scrollback = "10MB"` by default,
-  option `scrollback-bytes`), not a line count. `history-limit` is accepted
-  and shown but is not enforced.
+- **Scrollback has two limits per pane**: `history-limit` in lines (default
+  4000, tmux's is 2000) and a memory budget, `scrollback-bytes` (`scrollback =
+  "10MB"` in the configuration file); both hold. Changing either applies to
+  existing panes too (in tmux only to new ones). History a quiet pane holds is
+  compressed after 2 s.
 - **Clipboard and notifications pass through.** Copying in copy mode sets the
   outer terminal's clipboard with OSC 52 (`set-clipboard external`, the
-  default), and OSC 52 from programs in panes is forwarded too. Desktop
-  notifications from programs (OSC 9, OSC 777, OSC 99) reach the outer
-  terminal as OSC 9.
+  default), and OSC 52 from programs in panes is forwarded too (tmux 3.8's
+  `external` drops it; `set-clipboard off` stops both). Desktop notifications from
+  programs (OSC 9, OSC 777, OSC 99) reach the outer terminal as OSC 9.
 - **Kitty keyboard protocol end to end.** When the outer terminal answers the
   kitty keyboard query, lif enables the protocol there (and restores it on
   detach); keys are then encoded for each pane according to the keyboard mode
   the program in that pane asked for, kitty or legacy.
-- **No escape-time.** With the kitty protocol active, the Escape key is
-  unambiguous and is delivered at once. Without it, a lone ESC at the end of a
-  read waits a fixed 5 ms before it is treated as the Escape key.
-  `escape-time` is accepted for compatibility and ignored.
+- **`escape-time` defaults to 5 ms** (tmux: 10), and with the kitty protocol
+  active there is no wait at all: the Escape key is unambiguous and is
+  delivered at once. `escape-time 0` never waits, as in tmux.
 - **TERM inside panes is `xterm-256color`**, with `COLORTERM=truecolor` and
   `TERM_PROGRAM=lif`. There is no `default-terminal` option and no
   `tmux-256color`-style terminfo entry to install.
 - **`$LIF` instead of `$TMUX`.** Panes get `LIF=<socket>,<server pid>,<session id>`
   and `LIF_PANE=%N`; `TMUX` is not set (and is removed from the environment
-  panes inherit). `lif` refuses to attach from inside a pane unless `$LIF`
-  is unset, as tmux does with `$TMUX`.
-- **No shell commands from lif.** `#(command)` in formats expands to nothing,
-  and `copy-pipe`'s command argument is ignored: `copy-pipe-and-cancel "pbcopy"`
-  copies into a lif buffer and the clipboard via OSC 52, but does not run
-  `pbcopy`.
+  panes inherit). `lif` run inside a pane talks to that pane's server
+  through `$LIF` unless `-S` or `-L` is given, and refuses to attach unless
+  `$LIF` is unset, as tmux does with `$TMUX`.
+- **Almost no shell commands from lif.** `#(command)` in formats expands to
+  nothing and there is no `run-shell` or `if-shell`. The exception is copying:
+  `copy-pipe-and-cancel "pbcopy"` runs `pbcopy` with the selection, and the
+  `copy-command` option does the same for the default copy keys and mouse
+  copies, as in tmux.
 - **Mouse handling is built in**: mouse support is on by default (as in tmux
-  3.8), but mouse events cannot be bound. A mouse drag that copies leaves you in
-  copy mode with the selection still shown instead of exiting.
+  3.8) and does what tmux's default mouse bindings do (a drag or a double or
+  triple click copies and leaves copy mode), but mouse events cannot be bound.
+  The `mouse-drag-end` option replaces rebinding `MouseDragEnd1Pane`.
 
 ## Not implemented
 
@@ -158,7 +165,7 @@ Checked against the command table and by running each one (they fail with
 `unsupported command: NAME`):
 
 - Running shell commands: `run-shell`, `if-shell`, `pipe-pane`, `#()` in
-  formats, the command argument of `copy-pipe`.
+  formats.
 - Hooks (`set-hook`, `show-hooks`) and `wait-for`.
 - Popups and menus (`display-popup`, `display-menu`), floating panes
   (`new-pane`, `move-pane`).
@@ -171,7 +178,7 @@ Checked against the command table and by running each one (they fail with
   `suspend-client`, `server-access`, prompt history.
 - Control mode (`-C`), marked panes, synchronized panes, pane titles set by
   `select-pane -T`, pane options (`set -p`), most of tmux's 204 options (lif
-  has 60).
+  has 60 of them, plus 2 of its own).
 - Images (sixel, kitty graphics), plugins (TPM and anything that needs
   `run-shell`), Windows.
 
@@ -216,10 +223,17 @@ the documented default file. Full reference: [docs/configuration.md](docs/config
 - **Diff renderer with frame skipping, not output queues.** Nothing is queued
   per client. When a client can take a frame, lif renders the newest state of
   its panes as a diff against what that client shows, at most one frame per
-  8 ms; intermediate states are skipped. This is why throughput is high and
-  why a fast key after a recent frame can wait up to 8 ms (see Benchmarks).
-- **Thin client**: it puts the terminal in raw mode and relays bytes; parsing of
-  terminal input and all rendering happen in the server.
+  8 ms for output nobody typed for; intermediate states are skipped. The echo
+  of a key is drawn at once, in the same loop iteration, and only the echoing
+  pane is refreshed for it, so typing stays fast next to a pane flooding output.
+- **The server drives the terminal.** The client puts its terminal in raw mode
+  and hands it over: the server opens the same terminal by path and reads
+  keys from it and writes frames to it directly, so a keystroke costs the
+  client nothing. The client only forwards resizes and signals. If the server
+  cannot open the terminal, the client relays bytes instead.
+- **Memory per pane follows what is shown.** A pane no client shows keeps only
+  its terminal (no frame or render state); a pane that was resized is
+  repacked once it is quiet; history is compressed after 2 s without output.
 
 | Crate | Role |
 |---|---|

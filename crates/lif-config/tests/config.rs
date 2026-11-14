@@ -43,7 +43,8 @@ impl Host for TestHost {
     fn enter_copy_mode(&mut self, _client: Option<ClientId>, _pane: PaneId, _opts: CopyModeOptions) {}
     fn show_message(&mut self, _client: ClientId, _text: &str, _duration_ms: u64) {}
     fn prompt(&mut self, _client: ClientId, _prompt: Prompt) {}
-    fn display_panes(&mut self, _client: ClientId, _duration_ms: u64, _template: &str) {}
+    fn display_panes(&mut self, _client: ClientId, _duration_ms: u64, _template: &str, _keys: bool) {}
+    fn hangup_client_parent(&mut self, _client: ClientId) {}
     fn bell(&mut self, _client: ClientId) {}
     fn redraw(&mut self, _what: Redraw) {}
     fn shutdown(&mut self) {}
@@ -659,10 +660,12 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g prefix2 None",
         "set-option -g repeat-time 500",
         "set-option -g mouse on",
+        "set-option -g mouse-drag-end copy-pipe-and-cancel",
         "set-option -g mode-keys emacs",
         "set-option -g word-separators \"!\\\"#\\$%&'()*+,-./:;<=>?@[\\\\]^`{|}~\"",
         "set-option -g wrap-search on",
         "set-option -s set-clipboard external",
+        "set-option -s copy-command ''",
         "set-option -g scrollback-bytes 10485760",
         "set-option -g history-limit 4000",
         "set-option -g display-time 750",
@@ -980,6 +983,32 @@ fn tmux_conf_details() {
     // Lexer errors are reported for the line.
     let m = migrate_tmux_conf("bind x { kill-pane\n");
     assert_eq!(m.untranslated[0].reason, "syntax error: missing }");
+}
+
+#[test]
+fn tmux_conf_copy_pipe_and_mouse() {
+    // copy-pipe with a command is a binding like any other: lif runs it.
+    let m = migrate_tmux_conf("bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\nset -s copy-command 'wl-copy'\n");
+    assert!(m.untranslated.is_empty(), "{:?}", m.untranslated);
+    assert!(m.toml.contains("copy-command = \"wl-copy\""), "{}", m.toml);
+    assert!(m.toml.contains("[keys.copy-mode-vi]\ny = \"send -X copy-pipe-and-cancel pbcopy\""), "{}", m.toml);
+    assert!(Config::parse(&m.toml).diagnostics.is_empty());
+    // MouseDragEnd1Pane is the mouse-drag-end option.
+    let m = migrate_tmux_conf("bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-no-clear\n");
+    assert!(m.untranslated.is_empty(), "{:?}", m.untranslated);
+    assert!(m.toml.contains("mouse-drag-end = \"copy-pipe-no-clear\""), "{}", m.toml);
+    let m = migrate_tmux_conf("unbind -T copy-mode MouseDragEnd1Pane\n");
+    assert!(m.toml.contains("mouse-drag-end = \"none\""), "{}", m.toml);
+    // With a pipe command: the mode is translated, the command reported.
+    let m = migrate_tmux_conf("bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n");
+    assert!(m.toml.contains("mouse-drag-end = \"copy-pipe-and-cancel\""), "{}", m.toml);
+    assert_eq!(m.untranslated.len(), 1);
+    assert!(m.untranslated[0].reason.contains("copy-command = \"pbcopy\""), "{}", m.untranslated[0].reason);
+    assert!(Config::parse(&m.toml).diagnostics.is_empty());
+    // Other mouse bindings say why they are left out.
+    let m = migrate_tmux_conf("bind -n MouseDown3Pane display-menu\nbind -T copy-mode-vi MouseDragEnd1Pane send -X select-word\n");
+    assert!(m.untranslated[0].reason.contains("mouse actions are built in"), "{}", m.untranslated[0].reason);
+    assert!(m.untranslated[1].reason.contains("mouse-drag-end is"), "{}", m.untranslated[1].reason);
 }
 
 // ------------------------------------------------------------- robustness --

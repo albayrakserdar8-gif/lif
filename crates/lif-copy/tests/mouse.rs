@@ -33,7 +33,17 @@ fn drag_selects_and_release_copies() {
     assert_eq!(m.handle_mouse(&drag(6, 2), t + 10, &mut v), Outcome::Redraw);
     let out = m.handle_mouse(&release(6, 2), t + 20, &mut v);
     assert_eq!(copied(&out), "25 some words\nrow 26 ");
-    assert!(matches!(out, Outcome::Copy { exit: false, .. }), "lif stays in copy mode");
+    // tmux's default MouseDragEnd1Pane: copy-pipe-and-cancel.
+    assert!(matches!(out, Outcome::Copy { exit: true, pipe: true, .. }), "copies and leaves, as tmux");
+
+    // mouse-drag-end copy-pipe-no-clear: copy and stay, selection shown.
+    let mut cfg = Config::new(Vi);
+    cfg.mouse.drag_end = DragEnd::CopyAndStay;
+    m.set_config(cfg);
+    m.handle_mouse(&press(4, 1), 500, &mut v);
+    m.handle_mouse(&drag(6, 2), 510, &mut v);
+    let out = m.handle_mouse(&release(6, 2), 520, &mut v);
+    assert!(matches!(out, Outcome::Copy { exit: false, .. }), "stays in copy mode");
     assert!(m.selection().is_some(), "and keeps the selection shown");
 
     // Dragging past the end of a line takes the newline (cursor past the text).
@@ -41,12 +51,14 @@ fn drag_selects_and_release_copies() {
     m.handle_mouse(&drag(19, 1), 1010, &mut v);
     assert_eq!(copied(&m.handle_mouse(&release(19, 1), 1020, &mut v)), "row 25 some words\n");
 
+    // mouse-drag-end none: the selection stays, nothing is copied.
     let mut cfg = Config::new(Vi);
-    cfg.mouse.drag_end = DragEnd::CopyAndCancel;
+    cfg.mouse.drag_end = DragEnd::Keep;
     m.set_config(cfg);
     m.handle_mouse(&press(0, 0), 2000, &mut v);
     m.handle_mouse(&drag(2, 0), 2010, &mut v);
-    assert!(matches!(m.handle_mouse(&release(2, 0), 2020, &mut v), Outcome::Copy { exit: true, .. }));
+    assert_eq!(m.handle_mouse(&release(2, 0), 2020, &mut v), Outcome::Redraw);
+    assert!(m.selection().is_some());
 }
 
 #[test]

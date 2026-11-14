@@ -56,6 +56,8 @@ pub(crate) struct DisplayPanes {
     pub(crate) template: String,
     /// (pane, label) in pane index order; the label is the digit to press.
     pub(crate) labels: Vec<(PaneId, String)>,
+    /// Keys choose a pane or close the numbers (not with `-N`).
+    pub(crate) keys: bool,
 }
 
 /// A border being dragged with the mouse.
@@ -113,6 +115,9 @@ pub(crate) struct Attached {
     /// A left button press on a pane not in a mode: a drag from it starts
     /// copy mode with a selection (tmux's MouseDrag1Pane: copy-mode -M).
     pub(crate) mouse_press: Option<(PaneId, lif_types::Rect, lif_types::MouseEvent)>,
+    /// The last left click on a pane not in a mode: (pane, cell, time in
+    /// ms, clicks so far), for double and triple clicks.
+    pub(crate) clicks: Option<(PaneId, lif_types::Pos, u64, u8)>,
 }
 
 /// Where the bytes for a client's terminal go.

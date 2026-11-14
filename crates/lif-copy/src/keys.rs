@@ -51,6 +51,15 @@ pub enum Action {
     /// Start a repeat count with this digit (vi 1-9, emacs M-1..M-9). While
     /// a count is being typed, plain digits extend it.
     Count(u8),
+    /// A copy command of tmux's `copy-pipe` family given without a
+    /// command: copy, and pipe the text to the `copy-command` option
+    /// (see [`Outcome::Copy`](crate::Outcome)).
+    Pipe(Command),
+    /// Bound to commands copy mode does not run itself (a `copy-pipe` with
+    /// its own command, `kill-pane`, ...): the server looks the key up in
+    /// the model's table and runs them (see
+    /// [`Outcome::Binding`](crate::Outcome)).
+    Commands,
 }
 
 impl Action {
@@ -80,6 +89,7 @@ impl Action {
                 let c = Command::from_name(name)?;
                 match rest {
                     [] if c.takes_argument() => Some(Action::Ask(c)),
+                    [] if name.starts_with("copy-pipe") => Some(Action::Pipe(c)),
                     [] => Some(Action::Command(c)),
                     [w] if a.has('F') && w == "#{copy_cursor_word}" => match c {
                         Command::SearchForward | Command::SearchForwardText => Some(Action::SearchWord { forward: true }),
@@ -134,6 +144,7 @@ impl Action {
         match s {
             "search-word-forward" => Some(Action::SearchWord { forward: true }),
             "search-word-backward" => Some(Action::SearchWord { forward: false }),
+            _ if s.starts_with("copy-pipe") => Command::from_name(s).map(Action::Pipe),
             _ => Command::from_name(s).map(Action::Command),
         }
     }
@@ -164,15 +175,13 @@ impl KeyTable {
     }
 
     /// The table copy mode uses for the model's key table `table`: every
-    /// binding [`Action::from_commands`] understands. Bindings it does not
-    /// are left out (the server runs those as commands).
+    /// binding [`Action::from_commands`] understands, and
+    /// [`Action::Commands`] for the others (the server runs those).
     pub fn from_bindings(bindings: &KeyBindings, table: &str) -> KeyTable {
         let list = bindings.bindings(table);
         let mut t = KeyTable { map: HashMap::with_capacity(list.len()) };
         for b in list {
-            if let Some(a) = Action::from_commands(&b.commands) {
-                t.map.insert(b.key, a);
-            }
+            t.map.insert(b.key, Action::from_commands(&b.commands).unwrap_or(Action::Commands));
         }
         t
     }
@@ -257,5 +266,18 @@ mod tests {
         assert_eq!(act("send-keys -X copy-pipe-and-cancel pbcopy"), None);
         assert_eq!(act("copy-mode -q"), None);
         assert_eq!(act("send-keys -X cancel ; kill-pane"), None);
+        // The copy-pipe family without a command pipes to copy-command.
+        assert_eq!(act("send-keys -X copy-pipe-and-cancel"), Some(Action::Pipe(Command::CopySelectionAndCancel)));
+        assert_eq!(act("send-keys -X copy-selection-and-cancel"), Some(Action::Command(Command::CopySelectionAndCancel)));
+    }
+
+    #[test]
+    fn other_bindings_are_left_to_the_server() {
+        let mut b = KeyBindings::with_defaults();
+        let list = lif_core::parse_string("send-keys -X copy-pipe-and-cancel pbcopy").unwrap();
+        b.bind(COPY_MODE_VI_TABLE, lif_core::Binding { key: KeyCode::parse("y").unwrap(), repeat: false, note: None, commands: list });
+        let t = KeyTable::from_bindings(&b, COPY_MODE_VI_TABLE);
+        assert_eq!(t.get(&KeyCode::parse("y").unwrap()), Some(Action::Commands));
+        assert_eq!(t.get(&KeyCode::parse("C-x").unwrap()), None, "unbound keys stay unbound");
     }
 }

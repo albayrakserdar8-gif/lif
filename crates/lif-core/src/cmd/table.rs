@@ -36,7 +36,7 @@ const O: Option<usize> = Some(1);
 
 /// The table, sorted by name.
 pub(crate) static TABLE: &[CmdEntry] = &[
-    c("attach-session", Some("attach"), "c:dt:", 0, Z),
+    c("attach-session", Some("attach"), "c:dt:x", 0, Z),
     c("bind-key", Some("bind"), "nrN:T:", 1, N),
     c("break-pane", Some("breakp"), "abdPF:n:s:t:", 0, Z),
     c("capture-pane", Some("capturep"), "b:eE:JNpqS:t:", 0, Z),
@@ -55,7 +55,7 @@ pub(crate) static TABLE: &[CmdEntry] = &[
     u("display-menu", Some("menu")),
     c("display-message", Some("display"), "c:d:lpt:F:", 0, O),
     u("display-popup", Some("popup")),
-    c("display-panes", Some("displayp"), "bd:Nt:", 0, O),
+    c("display-panes", Some("displayp"), "d:Nt:", 0, O),
     u("find-window", Some("findw")),
     c("has-session", Some("has"), "t:", 0, Z),
     u("if-shell", Some("if")),

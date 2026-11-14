@@ -12,8 +12,9 @@ tmux work the same way.
 | `prefix [` | `copy-mode`: enter at the bottom of the history |
 | `prefix PPage` | `copy-mode -u`: enter and scroll one page up |
 | Mouse wheel up over a pane | enter and scroll up; leaves copy mode when you scroll back to the bottom (`copy-mode -e`) |
-| Mouse drag in a pane | enter and start a selection where the button went down |
-| `lif copy-mode -t TARGET` | from a script or the command prompt; `-u` page up, `-e` exit at the bottom, `-H` hide the position indicator, `-q` leave any mode |
+| Mouse drag in a pane | enter and start a selection where the button went down; on release copy it and leave (see [Mouse](#mouse)) |
+| Double / triple click in a pane | copy the word / line under the pointer (entering and leaving copy mode) |
+| `lif copy-mode -t TARGET` | from a script or the command prompt; `-u` page up, `-d` page down, `-e` exit at the bottom, `-H` hide the position indicator, `-q` leave any mode |
 | `q`, `C-c` (vi and emacs), `Escape` (emacs) | leave copy mode |
 
 While a pane is in copy mode its window name shows `[lif]` (the
@@ -90,6 +91,23 @@ terminal whether or not it detected OSC 52 support; a terminal that does not
 support it (or has it disabled) ignores it, and the text is still in the lif
 buffer.
 
+To hand copies to a program as well (the system clipboard through `pbcopy`,
+`wl-copy` or `xclip`), use `copy-pipe` with a command, as in tmux:
+
+```toml
+[keys.copy-mode-vi]
+y = "send-keys -X copy-pipe-and-cancel pbcopy"
+```
+
+or set `copy-command = "pbcopy"` (`set -s copy-command pbcopy`): it receives
+every copy made by `copy-pipe` without a command of its own, which includes
+the default copy keys (`Enter`, `C-j`, `D` in vi; `M-w`, `C-w`, `C-k` in
+emacs) and mouse copies. `copy-selection` and the other `copy-*` commands do
+not pipe. The command runs as `/bin/sh -c COMMAND` in the pane's directory
+with the text on its standard input and its output discarded; the server
+does not wait for it (at most 8 such commands may still be reading at once;
+more are refused with a message).
+
 Buffers: `lif list-buffers`, `lif show-buffer [-b NAME]`, `lif set-buffer
 [-a] [-b NAME] [-n NEWNAME] DATA`, `lif delete-buffer [-b NAME]` (`prefix -`),
 `lif paste-buffer [-b NAME] [-d] [-p] [-r] [-s SEP] [-t PANE]`. The default
@@ -109,10 +127,16 @@ the whole history).
   Up/Down arrow keys instead (3 per notch).
 - Dragging with the left button selects text, entering copy mode if needed.
   Holding the pointer at the top or bottom edge scrolls. On release the
-  selection is copied (buffer and OSC 52), and the pane stays in copy mode
-  with the selection shown; press `q` to leave.
-- In copy mode, a double click selects and copies a word, a triple click a
-  line.
+  selection is copied (buffer, OSC 52 and `copy-command`) and copy mode
+  ends, as in tmux.
+- A double click selects and copies a word, a triple click a line, in copy
+  mode or not (outside it, the pane enters copy mode for the selection and
+  leaves it again).
+- The option `mouse-drag-end` changes what the end of a selection does:
+  `copy-pipe-and-cancel` (the default) copies and leaves copy mode,
+  `copy-pipe-no-clear` copies and stays with the selection shown, `none`
+  only selects (copy with the keyboard). It is what tmux users set by
+  rebinding `MouseDragEnd1Pane`.
 - Programs that turn on mouse reporting (vim, htop, ...) get the mouse events
   instead.
 
@@ -129,7 +153,12 @@ implements these (tmux's names):
 (`copy-pipe`, `copy-pipe-no-clear`, `copy-pipe-and-cancel`,
 `copy-pipe-line`, `copy-pipe-line-and-cancel`, `copy-pipe-end-of-line`,
 `copy-pipe-end-of-line-and-cancel`), which copy like the matching
-`copy-*` command and ignore the command argument.
+`copy-*` command and then pipe the text to their command argument, or
+without one to the `copy-command` option (see above).
+
+Key names sent with `send-keys` (without `-X`) to a pane in copy mode are
+looked up in the copy-mode key table, as if typed: with vi keys,
+`lif send-keys -t work V Enter` selects the line and copies it.
 
 `send-keys -X` on a pane that is not in a mode fails with `not in a mode`.
 
@@ -306,18 +335,14 @@ sections of the configuration file or with `bind-key -T`.
   `MouseDragEnd1Pane`, `WheelUpPane`, `WheelDownPane`, `DoubleClick1Pane`,
   `TripleClick1Pane`), which are built in. tmux's extra `C-[` entries are the
   same key as `Escape`.
-- **Drag-copy keeps copy mode.** tmux copies and leaves copy mode when a drag
-  ends (`MouseDragEnd1Pane` runs `copy-pipe-and-cancel`); lif copies and stays,
-  with the selection visible.
-- **Double and triple click** select a word or line only in a pane that is
-  already in copy mode. In tmux they also work from normal mode.
-- **`copy-pipe` does not run its command.** `send-keys -X copy-pipe-and-cancel
-  "pbcopy"` copies to a lif buffer and the terminal clipboard (OSC 52) but does
-  not start `pbcopy`. lif never runs shell commands.
+- **Mouse bindings are an option.** What a drag end does is the
+  `mouse-drag-end` option instead of the `MouseDragEnd1Pane` binding; the
+  default (copy and leave) is tmux's. After a double or triple click lif copies
+  at once, where tmux shows the selection for 0.3 s first.
 - **Copy-mode format variables** (`copy_cursor_x`, `scroll_position`,
   `selection_present`, `pane_search_string`, ...) are not available to
   `display-message` or other formats.
-- **Key names sent with `send-keys`** (without `-X`) to a pane in copy mode
-  do not behave like key presses: `q` leaves copy mode, but in a test `V`
-  and `Enter` neither selected nor copied. Keys typed on an attached client
-  work. In scripts, use `send-keys -X`.
+- **Bindings to other commands, run with `send-keys`.** A copy-mode key bound
+  to commands copy mode does not run itself (`copy-pipe` with a command,
+  `kill-pane`, ...) runs them after the rest of the `send-keys` command
+  list, not in its place in the list.

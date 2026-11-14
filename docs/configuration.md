@@ -67,8 +67,9 @@ status = { bg = "black", fg = "white" }
 ```
 
 Keys not mentioned keep their defaults. Names are lower case with dashes, the
-same as the tmux option they set, except `scrollback` (tmux has no
-equivalent) and the shorter names inside `[status]` and `[theme]`.
+same as the tmux option they set, except `scrollback` and `mouse-drag-end`
+(tmux has no equivalent options) and the shorter names inside `[status]` and
+`[theme]`.
 
 Value types used below:
 
@@ -91,17 +92,19 @@ Value types used below:
 | `prefix2` | key | `false` | A second prefix key. | `prefix2` |
 | `repeat-time` | integer (0-32767) | `500` | Milliseconds in which a repeatable binding can be pressed again without the prefix; 0 disables repeat. | `repeat-time` |
 | `mouse` | bool | `true` | Mouse support: select panes and windows, resize, scroll, select text. | `mouse` |
+| `mouse-drag-end` | choice: `"copy-pipe-and-cancel"`, `"copy-pipe-no-clear"`, `"none"` | `"copy-pipe-and-cancel"` | What the end of a mouse selection (a drag, a double or a triple click) does: copy and leave copy mode (tmux's default), copy and stay with the selection shown, or only select. tmux sets this by binding `MouseDragEnd1Pane`. | `mouse-drag-end` (lif only) |
 | `mode-keys` | choice: `"emacs"`, `"vi"` | `"emacs"`, or `"vi"` if `$VISUAL` (else `$EDITOR`) contains `vi` when the server starts | Which copy-mode key table is used. | `mode-keys` |
 | `word-separators` | string | `` !"#$%&'()*+,-./:;<=>?@[\]^`{\|}~ `` | Characters that end a word in copy mode, besides spaces. | `word-separators` |
 | `wrap-search` | bool | `true` | Searches in copy mode wrap around the ends of the history. | `wrap-search` |
-| `set-clipboard` | choice: `"off"`, `"external"`, `"on"` | `"external"` | `external`: copying sets the outer terminal's clipboard (OSC 52), and OSC 52 from programs is forwarded to it. `on`: also keeps what programs copy as a lif buffer. `off`: neither. | `set-clipboard` |
-| `scrollback` | bytes | `"10MB"` | Scrollback kept per pane, in bytes. Applies to panes created after it is set. | `scrollback-bytes` (lif only) |
-| `history-limit` | integer | `2000` | Kept for scripts that read it; shown in `list-panes` and `#{history_limit}`, but not enforced. | `history-limit` |
+| `set-clipboard` | choice: `"off"`, `"external"`, `"on"` | `"external"` | Copies from copy mode always become a paste buffer. `external`: they also set the outer terminal's clipboard (OSC 52), and OSC 52 from programs in panes is forwarded to it but not kept. `on`: as `external`, and what programs copy is also kept as a paste buffer. `off`: nothing reaches the terminal's clipboard and OSC 52 from programs is ignored. (tmux's `external` ignores programs' OSC 52 entirely.) | `set-clipboard` |
+| `copy-command` | string | `""` | A command copies are piped to (standard input, run with `/bin/sh -c` in the pane's directory) when they come from `copy-pipe` without a command of its own: the default copy keys (`Enter` in vi, `M-w` in emacs) and mouse copies. For example `"pbcopy"`, `"wl-copy"`, `"xclip -selection clipboard"`. | `copy-command` |
+| `scrollback` | bytes | `"10MB"` | Memory budget for each pane's scrollback; `history-limit` holds as well. A line of history counts about 1.7 KB at 200 columns. Memory is allocated in whole pages, so a small budget rounds up (`100KB` shows as 819200 bytes in `#{history_bytes}`). Applies to existing panes too. | `scrollback-bytes` (lif only) |
+| `history-limit` | integer | `4000` | Lines of scrollback kept per pane (tmux's default is 2000); `scrollback` holds as well. Applies to existing panes too (tmux: only to new ones). 0 keeps none. | `history-limit` |
 | `default-shell` | string (absolute path) | `$SHELL` of the server, else `/bin/sh` | Shell for new panes, started as a login shell. | `default-shell` |
 | `default-command` | string | `""` | Command run instead of a login shell (through `default-shell -c`). | `default-command` |
 | `display-time` | integer (ms) | `750` | How long messages stay on the status line. | `display-time` |
 | `display-panes-time` | integer (ms, from 1) | `1000` | How long `display-panes` (`prefix q`) shows pane numbers. | `display-panes-time` |
-| `escape-time` | integer | `10` | Accepted for compatibility and ignored. | `escape-time` |
+| `escape-time` | integer (ms) | `5` | How long a lone Escape from a terminal using the legacy key encoding waits for the rest of a sequence (Alt+key, arrows); 0 never waits. With the kitty keyboard protocol (enabled when the terminal supports it) Escape never waits. tmux's default is 10. | `escape-time` |
 | `exit-empty` | bool | `true` | Stop the server when the last session closes. | `exit-empty` |
 | `buffer-limit` | integer (from 1) | `50` | How many automatically named paste buffers are kept. | `buffer-limit` |
 | `detach-on-destroy` | choice: `"off"`, `"on"`, `"no-detached"`, `"previous"`, `"next"` | `"on"` | What attached clients do when their session is destroyed: detach, or switch to another session. | `detach-on-destroy` |

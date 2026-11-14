@@ -32,6 +32,12 @@ repeat-time = 500
 # Mouse: click to select panes, drag borders, scroll.  => set -g mouse on
 mouse = true
 
+# What ending a mouse selection (a drag, a double or a triple click) does:
+# "copy-pipe-and-cancel" copies and leaves copy mode (as tmux does),
+# "copy-pipe-no-clear" copies and stays with the selection shown, "none"
+# only selects. In tmux this is the MouseDragEnd1Pane binding.
+mouse-drag-end = "copy-pipe-and-cancel"
+
 # Copy mode keys: "emacs" or "vi" (the copy-mode or copy-mode-vi table).
 # When this line is left out, vi if $VISUAL (or else $EDITOR) contains "vi"
 # when the server starts, as in tmux.
@@ -42,15 +48,31 @@ mode-keys = "emacs"
 word-separators = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~"
 wrap-search = true
 
-# Whether copying sets the outer terminal's clipboard (OSC 52):
-# "off", "external" (lif sets it, programs in panes may not) or "on".
+# The outer terminal's clipboard (OSC 52). Copies from copy mode always
+# become a paste buffer; besides:
+#   "on"        copies set the terminal's clipboard; OSC 52 from programs
+#               in panes is forwarded to it and also kept as a paste buffer
+#   "external"  copies set the terminal's clipboard; OSC 52 from programs
+#               is forwarded to it but not kept as a buffer (tmux's
+#               external ignores it entirely)
+#   "off"       nothing reaches the terminal's clipboard, and OSC 52 from
+#               programs is ignored
 set-clipboard = "external"
+
+# A command that copies are piped to (on its standard input, run with
+# /bin/sh -c in the pane's directory): copy-pipe commands given without one
+# of their own, which include the default copy keys (Enter in vi, M-w in
+# emacs) and mouse copies. For example "pbcopy", "wl-copy" or
+# "xclip -selection clipboard". Empty runs nothing.  => set -s copy-command ''
+copy-command = ""
 
 # Scrollback kept per pane: at most this many bytes and at most
 # history-limit lines (below); both hold, and changing either also applies to
 # existing panes. Accepts sizes: "512KB", "32MB", "1GB" (1 KB = 1024 bytes).
 # A line of history costs about 1.7 KB at 200 columns (less in narrower
 # panes) until the pane has been quiet for 2 s, when it is compressed.
+# Memory is allocated in whole pages, so a small budget rounds up: 100KB
+# shows as 819200 bytes in #{history_bytes} and list-panes.
 #   => set -g scrollback-bytes 10485760
 scrollback = "10MB"
 

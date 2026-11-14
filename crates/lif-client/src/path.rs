@@ -35,6 +35,14 @@ pub fn resolve_socket_path(lif_socket: Option<OsString>, xdg_runtime_dir: Option
     SocketPath { socket: dir.join("default"), private_dir: Some(dir) }
 }
 
+/// The server named by `$LIF` (set in every pane): the socket path is its
+/// first comma-separated field, as tmux reads `$TMUX`. `None` when the
+/// variable or that field is empty.
+pub fn socket_from_lif_env(lif: Option<&str>) -> Option<PathBuf> {
+    let sock = lif?.split(',').next()?;
+    (!sock.is_empty()).then(|| PathBuf::from(sock))
+}
+
 /// The socket path for this process, with its private directory created and
 /// checked.
 pub fn default_socket_path() -> io::Result<PathBuf> {
@@ -70,4 +78,18 @@ pub fn secure_dir(dir: &Path) -> io::Result<()> {
         return bad("directory is accessible by group or others (needs mode 0700)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lif_env_names_the_socket_by_its_first_field() {
+        assert_eq!(socket_from_lif_env(Some("/tmp/lif-501/default,4242,0")), Some(PathBuf::from("/tmp/lif-501/default")));
+        assert_eq!(socket_from_lif_env(Some("/x/s")), Some(PathBuf::from("/x/s")));
+        assert_eq!(socket_from_lif_env(Some("")), None);
+        assert_eq!(socket_from_lif_env(Some(",1,2")), None);
+        assert_eq!(socket_from_lif_env(None), None);
+    }
 }

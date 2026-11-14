@@ -22,16 +22,19 @@ pub const DEFAULT_SEARCH_STEP_ROWS: usize = 2_000;
 /// Furthest a bracket match looks, in rows.
 const BRACKET_ROWS: usize = 10_000;
 
-/// What happens when a mouse drag ends.
+/// What happens when a mouse drag ends (and after a double or triple
+/// click): tmux's `MouseDragEnd1Pane` binding, which lif sets with the
+/// `mouse-drag-end` option.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DragEnd {
-    /// Copy the selection and stay in copy mode with it still shown
-    /// (lif's default).
+    /// Copy and leave copy mode (tmux's default, `copy-pipe-and-cancel`).
     #[default]
-    CopyAndStay,
-    /// Copy and leave copy mode (tmux's default, copy-pipe-and-cancel).
     CopyAndCancel,
-    /// Keep the selection without copying.
+    /// Copy the selection and stay in copy mode with it still shown
+    /// (`copy-pipe-no-clear`).
+    CopyAndStay,
+    /// Keep the selection without copying (tmux with `MouseDragEnd1Pane`
+    /// unbound).
     Keep,
 }
 
@@ -47,7 +50,7 @@ pub struct MouseConfig {
 
 impl Default for MouseConfig {
     fn default() -> Self {
-        MouseConfig { drag_end: DragEnd::CopyAndStay, wheel_lines: 5, click_ms: 300 }
+        MouseConfig { drag_end: DragEnd::CopyAndCancel, wheel_lines: 5, click_ms: 300 }
     }
 }
 
@@ -99,8 +102,15 @@ pub enum Outcome {
     None,
     Redraw,
     /// Put `data` in a new paste buffer (or append it to the top one) and
-    /// on the clipboard; then leave copy mode if `exit`.
-    Copy { data: Vec<u8>, append: bool, exit: bool },
+    /// on the clipboard; then leave copy mode if `exit`. `pipe`: the copy
+    /// came from tmux's `copy-pipe` family (keys bound to it, and mouse
+    /// selections, which tmux binds to `copy-pipe-and-cancel`), so the text
+    /// also goes to the `copy-command` option's command when one is set.
+    Copy { data: Vec<u8>, append: bool, exit: bool, pipe: bool },
+    /// The key is bound to commands copy mode does not run itself
+    /// ([`Action::Commands`](crate::Action)): look it up in the model's
+    /// key table and run them.
+    Binding,
     /// Leave copy mode (call [`CopyMode::leave`] first).
     Exit,
     /// Show a prompt on the status line and feed its input back through
@@ -585,6 +595,17 @@ impl CopyMode {
             Action::Command(cmd) => {
                 let n = self.count.take().unwrap_or(1);
                 self.run(view, cmd, None, n)
+            }
+            Action::Pipe(cmd) => {
+                let n = self.count.take().unwrap_or(1);
+                match self.run(view, cmd, None, n) {
+                    Outcome::Copy { data, append, exit, .. } => Outcome::Copy { data, append, exit, pipe: true },
+                    other => other,
+                }
+            }
+            Action::Commands => {
+                self.count = None;
+                Outcome::Binding
             }
             Action::Ask(cmd) if cmd.is_jump() => {
                 self.awaiting_jump = Some(cmd);
@@ -1142,7 +1163,7 @@ impl CopyMode {
                     self.sel = None;
                 }
                 return match text {
-                    Some(t) => Outcome::Copy { data: t.into_bytes(), append, exit },
+                    Some(t) => Outcome::Copy { data: t.into_bytes(), append, exit, pipe: false },
                     None if exit => Outcome::Exit,
                     None => Outcome::Redraw,
                 };
@@ -1166,7 +1187,7 @@ impl CopyMode {
                 let text = self.sel_text(g);
                 (self.cur, self.sel, self.rect) = (saved_cur, saved_sel, saved_rect);
                 return match text {
-                    Some(t) => Outcome::Copy { data: t.into_bytes(), append: false, exit },
+                    Some(t) => Outcome::Copy { data: t.into_bytes(), append: false, exit, pipe: false },
                     None if exit => Outcome::Exit,
                     None => Outcome::Redraw,
                 };
@@ -1821,7 +1842,9 @@ impl CopyMode {
         match self.cfg.mouse.drag_end {
             DragEnd::Keep => Outcome::Redraw,
             end => match self.sel_text(g) {
-                Some(t) => Outcome::Copy { data: t.into_bytes(), append: false, exit: end == DragEnd::CopyAndCancel },
+                Some(t) => {
+                    Outcome::Copy { data: t.into_bytes(), append: false, exit: end == DragEnd::CopyAndCancel, pipe: true }
+                }
                 None => Outcome::Redraw,
             },
         }

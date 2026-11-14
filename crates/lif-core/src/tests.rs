@@ -31,6 +31,8 @@ struct TestHost {
     mode_commands: Vec<(PaneId, String, Vec<String>, u32)>,
     /// What `read_config` returns, by path.
     configs: HashMap<String, ConfigFile>,
+    /// Clients whose parent process got SIGHUP.
+    hangups: Vec<ClientId>,
 }
 
 impl Host for TestHost {
@@ -87,8 +89,12 @@ impl Host for TestHost {
     fn prompt(&mut self, client: ClientId, prompt: Prompt) {
         self.prompts.push((client, prompt));
     }
-    fn display_panes(&mut self, client: ClientId, _duration_ms: u64, template: &str) {
-        self.messages.push((client, format!("display-panes {template}")));
+    fn display_panes(&mut self, client: ClientId, _duration_ms: u64, template: &str, keys: bool) {
+        let n = if keys { "" } else { " (no keys)" };
+        self.messages.push((client, format!("display-panes {template}{n}")));
+    }
+    fn hangup_client_parent(&mut self, client: ClientId) {
+        self.hangups.push(client);
     }
     fn bell(&mut self, client: ClientId) {
         self.bells.push(client);
@@ -1064,4 +1070,89 @@ fn server_formats() {
     t.m.set_server_info(4242, "/tmp/lif-501/default");
     assert_eq!(t.ok("display -p '#{pid} #{socket_path}'"), "4242 /tmp/lif-501/default\n");
     assert_eq!(t.ok("display -p '#{version}'"), format!("{}\n", env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn set_option_o_refuses_options_already_set() {
+    // tmux 3.8: global tables hold every option, so -go always refuses;
+    // a session or window table refuses only what it set itself.
+    let mut t = T::with_session();
+    assert_eq!(t.err("set -go status-right x"), "already set: status-right");
+    assert_eq!(t.err("set -wgo mode-keys vi"), "already set: mode-keys");
+    t.ok("set -o status-right x");
+    assert_eq!(t.err("set -o status-right y"), "already set: status-right");
+    assert_eq!(t.ok("show -v status-right"), "x\n");
+    t.ok("set -go @u 1");
+    assert_eq!(t.err("set -go @u 2"), "already set: @u");
+}
+
+#[test]
+fn flags_that_change_behavior_work_or_fail() {
+    let mut t = T::with_session();
+    t.ok("new -d -s b");
+    let c1 = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c1, NOW);
+    t.ok("attach -t a");
+    // detach -P: SIGHUP to the client's parent after detaching it.
+    t.ok("detach -P");
+    assert_eq!(t.h.detached.last().unwrap(), &(c1, DetachReason::Detached { session: "a".into() }));
+    assert_eq!(t.h.hangups, vec![c1]);
+    // attach -x: like -d, and the kicked client's parent gets SIGHUP.
+    t.ok("attach -t a");
+    let c2 = t.attach_client(2, 80, 25);
+    t.ctx = CmdContext::client(c2, NOW);
+    t.ok("attach -x -t a");
+    assert_eq!(t.h.detached.last().unwrap(), &(c1, DetachReason::Kicked { session: "a".into() }));
+    assert_eq!(t.h.hangups, vec![c1, c1]);
+    // new-session -A -X is attach -x; -D is attach -d (no SIGHUP).
+    t.ctx = CmdContext::client(c1, NOW);
+    t.ok("new -A -X -s a");
+    assert_eq!(t.h.detached.last().unwrap(), &(c2, DetachReason::Kicked { session: "a".into() }));
+    assert_eq!(t.h.hangups, vec![c1, c1, c2]);
+    t.ctx = CmdContext::client(c2, NOW);
+    t.ok("new -A -D -s a");
+    assert_eq!(t.h.hangups.len(), 3);
+    // -E would skip update-environment, which lif does not have.
+    assert_eq!(t.err("new -d -E -s e"), "new-session -E is not supported: lif has no update-environment option");
+    // display-panes -N: numbers that ignore keys; -b is not a tmux 3.8 flag.
+    t.ok("display-panes -N");
+    assert_eq!(t.h.messages.last().unwrap(), &(c2, "display-panes select-pane -t '%%' (no keys)".to_string()));
+    assert_eq!(t.err("display-panes -b"), "command display-panes: unknown flag -b");
+    // command-prompt -i (incremental) only exists for copy-mode searches.
+    assert!(t.err("command-prompt -i").contains("not supported"));
+}
+
+#[test]
+fn switch_client_z_keeps_zoom() {
+    // tmux 3.8: switching to another pane of a zoomed window unzooms it;
+    // with -Z the window stays zoomed, on that pane.
+    let mut t = T::with_session();
+    t.ok("split-window -t a");
+    t.ok("new -d -s b");
+    let c = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach -t b");
+    t.ok("resize-pane -Z -t a:0.1");
+    assert_eq!(t.ok("display -p -t a:0 '#{window_zoomed_flag} #{pane_index}'"), "1 1\n");
+    t.ok("switch-client -t a:0.0");
+    assert_eq!(t.ok("display -p -t a:0 '#{window_zoomed_flag} #{pane_index}'"), "0 0\n");
+    t.ok("resize-pane -Z -t a:0.1");
+    t.ok("switch-client -Z -t a:0.0");
+    assert_eq!(t.ok("display -p -t a:0 '#{window_zoomed_flag} #{pane_index}'"), "1 0\n");
+}
+
+#[test]
+fn list_commands_format() {
+    let mut t = T::new();
+    assert_eq!(
+        t.ok("list-commands -F '#{command_list_name}|#{command_list_alias}' new-session"),
+        "new-session|new\n"
+    );
+    assert_eq!(
+        t.ok("lscm -F '#{command_list_usage}' new-session"),
+        "[-AdDEPX] [-c value] [-F value] [-n value] [-s value] [-x value] [-y value] [argument ...]\n"
+    );
+    assert_eq!(t.ok("lscm -F '#{command_list_usage}' kill-server"), "\n");
+    let all = t.ok("lscm -F '#{command_list_name}'");
+    assert_eq!(all.lines().count(), t.ok("lscm").lines().count());
 }

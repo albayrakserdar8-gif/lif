@@ -105,6 +105,11 @@ fn socket_path(cli: &Cli) -> io::Result<PathBuf> {
         secure_dir(&dir)?;
         return Ok(dir.join(label));
     }
+    // Inside a pane, the pane's own server, as tmux uses `$TMUX`: it comes
+    // before `$LIF_SOCKET` the way `$TMUX` comes before `$TMUX_TMPDIR`.
+    if let Some(s) = lif_client::socket_from_lif_env(std::env::var("LIF").ok().as_deref()) {
+        return Ok(s);
+    }
     lif_client::default_socket_path()
 }
 

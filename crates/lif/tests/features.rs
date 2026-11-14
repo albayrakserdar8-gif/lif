@@ -88,3 +88,34 @@ fn bracketed_paste_streams_once() {
         t.screen().split_whitespace().collect::<Vec<_>>().join(" ").contains("033 [ 2 0 0 ~ a b c d 033 [ 2 0 1 ~")
     });
 }
+
+/// set-clipboard, end to end. Copies from copy mode always become a paste
+/// buffer and reach the outer terminal unless the option is off. OSC 52
+/// from a program in a pane: `on` forwards it and keeps it as a buffer,
+/// `external` forwards it only, `off` drops it.
+#[test]
+fn set_clipboard_on_external_off() {
+    for (mode, pane_forwarded, pane_buffer, copy_forwarded) in
+        [("on", true, true, true), ("external", true, false, true), ("off", false, false, false)]
+    {
+        let env = Env::new();
+        let mut t = attach(&env, &[]);
+        env.ok(&["set", "-s", "set-clipboard", mode]);
+        let clip = |t: &Term, want: &[u8]| t.events.iter().any(|e| matches!(e, VtEvent::ClipboardWrite { data, .. } if data == want));
+        // A program in the pane sets the clipboard ("hello").
+        t.type_str("printf '\\033]52;c;aGVsbG8=\\a'; echo osc''sent\r");
+        t.wait_text("oscsent");
+        t.settle(std::time::Duration::from_millis(200));
+        assert_eq!(clip(&t, b"hello"), pane_forwarded, "{mode}: pane OSC 52 forwarded");
+        let buffers = env.ok(&["list-buffers"]);
+        assert_eq!(buffers.contains("hello"), pane_buffer, "{mode}: pane OSC 52 kept as a buffer: {buffers:?}");
+        // A copy from copy mode ("oscsent").
+        env.ok(&["copy-mode"]);
+        env.ok(&["send-keys", "-X", "cursor-up"]);
+        env.ok(&["send-keys", "-X", "select-line"]);
+        env.ok(&["send-keys", "-X", "copy-selection-and-cancel"]);
+        assert_eq!(env.ok(&["show-buffer"]), "oscsent\n", "{mode}: copies are always buffers");
+        t.settle(std::time::Duration::from_millis(200));
+        assert_eq!(clip(&t, b"oscsent\n") || clip(&t, b"oscsent"), copy_forwarded, "{mode}: copy forwarded");
+    }
+}

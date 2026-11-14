@@ -93,7 +93,7 @@ pub(crate) struct PaneRt {
     /// A copy-mode drag rests on an edge: scroll again at this time.
     pub(crate) autoscroll_at: Option<Instant>,
     /// The copy-mode settings the mode has (see `Server::sync_mode_config`).
-    pub(crate) mode_cfg: Option<(u64, bool, String, bool)>,
+    pub(crate) mode_cfg: Option<crate::host::CopyKey>,
     /// A streamed paste is open: whether it was bracketed.
     pub(crate) paste_bracketed: Option<bool>,
     /// Refreshed during the current frame tick.

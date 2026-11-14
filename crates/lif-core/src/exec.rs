@@ -27,6 +27,56 @@ const DISPLAY_MESSAGE: &str = "[#{session_name}] #{window_index}:#{window_name},
 const NEW_WINDOW: &str = "#{session_name}:#{window_index}.#{pane_index}";
 const NEW_SESSION: &str = "#{session_name}:";
 
+/// `list-commands -F`: tmux's `command_list_*` variables over the usual ones.
+struct CommandVars<'a> {
+    entry: &'a crate::cmd::CmdEntry,
+    inner: &'a dyn format::Vars,
+}
+
+impl format::Vars for CommandVars<'_> {
+    fn var(&self, name: &str) -> Option<String> {
+        match name {
+            "command_list_name" => Some(self.entry.name.to_string()),
+            "command_list_alias" => Some(self.entry.alias.unwrap_or("").to_string()),
+            "command_list_usage" => Some(usage(self.entry)),
+            _ => self.inner.var(name),
+        }
+    }
+    fn now(&self) -> crate::WallClock {
+        self.inner.now()
+    }
+}
+
+/// A usage line built from a command's flag template: `[-AdD] [-c value]
+/// [argument ...]` (tmux's hand-written lines name each value; lif's
+/// table does not have the names).
+fn usage(e: &crate::cmd::CmdEntry) -> String {
+    let t: Vec<char> = e.template.chars().collect();
+    let (mut flags, mut values) = (String::new(), Vec::new());
+    let mut i = 0;
+    while i < t.len() {
+        if t.get(i + 1) == Some(&':') {
+            values.push(format!("[-{} value]", t[i]));
+            i += 2;
+        } else {
+            flags.push(t[i]);
+            i += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    if !flags.is_empty() {
+        parts.push(format!("[-{flags}]"));
+    }
+    parts.extend(values);
+    match (e.lower, e.upper) {
+        (_, Some(0)) => {}
+        (0, Some(1)) => parts.push("[argument]".into()),
+        (0, _) => parts.push("[argument ...]".into()),
+        _ => parts.push("argument ...".into()),
+    }
+    parts.join(" ")
+}
+
 fn ok() -> R {
     Ok(CmdOutput::default())
 }
@@ -121,6 +171,7 @@ impl Model {
                 let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
                 let opts = CopyModeOptions {
                     page_up: a.has('u'),
+                    page_down: a.has('d'),
                     exit_at_bottom: a.has('e'),
                     hide_position: a.has('H'),
                     mouse_drag: a.has('M'),
@@ -145,7 +196,7 @@ impl Model {
                     None => self.wopt(cw, "display-panes-time").as_num() as u64,
                 };
                 let template = a.strings(0).into_iter().next().unwrap_or_else(|| "select-pane -t '%%'".to_string());
-                host.display_panes(cid, ms, &template);
+                host.display_panes(cid, ms, &template, !a.has('N'));
                 ok()
             }
             "has-session" => self.find_target(ctx, a.get('t'), Kind::Session, Flags::default()).map(|_| CmdOutput::default()),
@@ -260,6 +311,12 @@ impl Model {
                         && name != e.name
                         && e.alias != Some(name)
                     {
+                        continue;
+                    }
+                    if let Some(fmt) = a.get('F') {
+                        let inner = self.fctx(&*host, None, None, None, ctx.client, ctx.now);
+                        out.push_str(&format::expand(fmt, &CommandVars { entry: e, inner: &inner }));
+                        out.push('\n');
                         continue;
                     }
                     match e.alias {
@@ -762,19 +819,20 @@ impl Model {
     // ----- sessions and clients ----------------------------------------
 
     fn cmd_new_session(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        if a.has('E') {
+            // A new session's panes, and an attach, always take the client's
+            // environment: there is no update-environment to skip.
+            return err("new-session -E is not supported: lif has no update-environment option");
+        }
         let client = ctx.client.and_then(|c| self.clients.get(&c)).map(|c| (c.id, c.info.clone(), c.session));
         if a.has('A')
             && let Some(name) = a.get('s')
             && let Some(sid) = self.session_by_name(name)
         {
             let cid = client.as_ref().map(|c| c.0).ok_or_else(|| CmdError::new("no current client"))?;
-            if a.has('D') {
-                for other in self.clients_of(sid) {
-                    if other != cid {
-                        let name = self.sessions[&sid].name.clone();
-                        self.detach(other, DetachReason::Kicked { session: name }, host);
-                    }
-                }
+            // -D and -X are attach-session's -d and -x.
+            if a.has('D') || a.has('X') {
+                self.kick_others(sid, cid, a.has('X'), host);
             }
             self.switch_client(cid, sid, host);
             return ok();
@@ -884,28 +942,40 @@ impl Model {
                 self.set_active_pane(w, p, host);
             }
         }
-        if a.has('d') {
-            let name = self.sessions[&f.s].name.clone();
-            for other in self.clients_of(f.s) {
-                if other != cid {
-                    self.detach(other, DetachReason::Kicked { session: name.clone() }, host);
-                }
-            }
+        if a.has('d') || a.has('x') {
+            self.kick_others(f.s, cid, a.has('x'), host);
         }
         self.switch_client(cid, f.s, host);
         ok()
     }
 
+    /// `attach -d` / `-x`: detach every other client of `sid`; with `hup`
+    /// also send SIGHUP to their parent processes.
+    fn kick_others(&mut self, sid: SessionId, keep: ClientId, hup: bool, host: &mut dyn Host) {
+        let name = self.sessions[&sid].name.clone();
+        for other in self.clients_of(sid) {
+            if other != keep {
+                self.detach(other, DetachReason::Kicked { session: name.clone() }, host);
+                if hup {
+                    host.hangup_client_parent(other);
+                }
+            }
+        }
+    }
+
     fn cmd_detach(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        let reason = |m: &Model, c: ClientId| {
+        let hup = a.has('P');
+        let detach = |m: &mut Model, c: ClientId, host: &mut dyn Host| {
             let session = m.clients[&c].session.and_then(|s| m.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
-            DetachReason::Detached { session }
+            m.detach(c, DetachReason::Detached { session }, host);
+            if hup {
+                host.hangup_client_parent(c);
+            }
         };
         if let Some(t) = a.get('s') {
             let f = self.find_target(ctx, Some(t), Kind::Session, Flags::default())?;
             for c in self.clients_of(f.s) {
-                let r = reason(self, c);
-                self.detach(c, r, host);
+                detach(self, c, host);
             }
             return ok();
         }
@@ -913,16 +983,14 @@ impl Model {
         if a.has('a') {
             let others: Vec<ClientId> = self.clients.values().filter(|c| c.id != target && c.session.is_some()).map(|c| c.id).collect();
             for c in others {
-                let r = reason(self, c);
-                self.detach(c, r, host);
+                detach(self, c, host);
             }
             return ok();
         }
         if self.clients[&target].session.is_none() {
             return err("no current client");
         }
-        let r = reason(self, target);
-        self.detach(target, r, host);
+        detach(self, target, host);
         ok()
     }
 
@@ -954,8 +1022,12 @@ impl Model {
             let f = self.find_target(ctx, a.get('t'), Kind::Session, Flags { prefer_unattached: true, ..Flags::default() })?;
             if let Some(w) = f.w {
                 self.select_window(f.s, w, host);
-                if let Some(p) = f.p {
-                    self.set_active_pane(w, p, host);
+                // Another pane of a zoomed window: unzoom, or with -Z zoom
+                // that pane instead (tmux 3.8).
+                if let Some(p) = f.p
+                    && self.windows[&w].active != p
+                {
+                    self.select_pane_zoom(w, p, a.has('Z'), host);
                 }
             }
             f.s
@@ -990,6 +1062,11 @@ impl Model {
     }
 
     fn cmd_command_prompt(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        if a.has('i') {
+            // Copy mode's incremental searches (tmux's own -i bindings) are
+            // run by copy mode itself, without this command.
+            return err("command-prompt -i is not supported (incremental prompts work only for copy-mode searches)");
+        }
         let cid = self.attached_client(ctx, a.get('t'))?;
         let mut template = match a.values().first() {
             Some(Arg::Str(s)) => s.clone(),
@@ -1968,7 +2045,9 @@ impl Model {
                         set.unset(def.name);
                     }
                 } else {
-                    if a.has('o') && set.get(def.name).is_some() && !is_global {
+                    // Global tables hold every option (defaults included), so
+                    // tmux refuses -o there always (tmux 3.8).
+                    if a.has('o') && (is_global || set.get(def.name).is_some()) {
                         return err(format!("already set: {}", def.name));
                     }
                     let cur = set.get(def.name).cloned();

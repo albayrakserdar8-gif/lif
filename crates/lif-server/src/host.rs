@@ -24,10 +24,13 @@ use crate::mode::{Engine, ModeAction, ModeCtx, new_copy_mode};
 use crate::pane::PaneRt;
 use crate::prompt::PromptState;
 
+/// (key bindings generation, vi keys, word-separators, wrap-search,
+/// mouse-drag-end): the options copy mode's settings come from.
+pub(crate) type CopyKey = (u64, bool, String, bool, lif_copy::DragEnd);
+
 /// Copy mode's settings for one combination of the options it reads.
 pub(crate) struct CopyConfig {
-    /// (key bindings generation, vi keys, word-separators, wrap-search).
-    pub(crate) key: (u64, bool, String, bool),
+    pub(crate) key: CopyKey,
     pub(crate) cfg: lif_copy::Config,
 }
 
@@ -35,6 +38,8 @@ pub(crate) const PANE_TOKEN: usize = 1 << 32;
 pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
 /// A client's terminal, opened by the server (`TermOut::Direct`).
 pub(crate) const TTY_TOKEN: usize = 4 << 32;
+/// The stdin of a `copy-pipe` command (`crate::pipe`).
+pub(crate) const PIPE_TOKEN: usize = 8 << 32;
 
 /// `TERM` inside panes. xterm-256color has a terminfo entry on every
 /// system (unlike a `lif` entry would), and libghostty-vt implements the
@@ -77,6 +82,12 @@ pub(crate) struct Rt {
     pub(crate) startup_message: Option<String>,
     /// The `escape-time` option (kept current by `Server::apply_options`).
     pub(crate) escape_time: std::time::Duration,
+    /// Keys `send-keys` sent to a pane in a mode whose binding is commands
+    /// (`ModeAction::Binding`): run after the model call, which they need.
+    pub(crate) mode_bindings: Vec<(PaneId, lif_types::KeyEvent)>,
+    /// `copy-pipe` commands still being fed, by id (`PIPE_TOKEN | id`).
+    pub(crate) pipes: HashMap<u32, crate::pipe::PipeJob>,
+    pub(crate) next_pipe: u32,
 }
 
 pub(crate) fn pane_token(p: PaneId) -> Token {
@@ -104,7 +115,7 @@ impl Rt {
             server_env_zellij,
             // Built from the model on first use (the key never matches).
             copy_cfg: CopyConfig {
-                key: (u64::MAX, false, String::new(), true),
+                key: (u64::MAX, false, String::new(), true, lif_copy::DragEnd::default()),
                 cfg: lif_copy::Config {
                     mode_keys: lif_copy::ModeKeys::Emacs,
                     table: std::rc::Rc::new(lif_copy::KeyTable::new()),
@@ -118,6 +129,43 @@ impl Rt {
             mode_changed: Vec::new(),
             startup_message: None,
             escape_time: lif_input::DEFAULT_ESC_TIMEOUT,
+            mode_bindings: Vec::new(),
+            pipes: HashMap::new(),
+            next_pipe: 0,
+        }
+    }
+
+    /// `copy-pipe`: run `command` with `data` on its stdin, in `cwd`.
+    pub(crate) fn copy_pipe(&mut self, command: &str, cwd: &str, data: Vec<u8>) -> Result<(), String> {
+        if self.pipes.len() >= crate::pipe::MAX_PIPES {
+            return Err(format!("copy-pipe: {} commands are still reading; not running {command}", self.pipes.len()));
+        }
+        let cwd = (!cwd.is_empty()).then(|| std::path::Path::new(cwd));
+        let (pid, mut job) = crate::pipe::spawn(command, cwd, data).map_err(|e| format!("copy-pipe: {command}: {e}"))?;
+        self.reaper.watch(pid);
+        log!("copy-pipe: pid {pid}: {command}");
+        // Otherwise all written (dropping the job closes the pipe), or the
+        // command exited without reading all of it.
+        if let Ok(false) = job.write() {
+            self.next_pipe = self.next_pipe.wrapping_add(1);
+            let id = self.next_pipe;
+            if let Err(e) = self.registry.register(&mut job.tx, Token(PIPE_TOKEN | id as usize), Interest::WRITABLE) {
+                log!("copy-pipe: pid {pid}: {e}");
+                return Ok(());
+            }
+            self.pipes.insert(id, job);
+        }
+        Ok(())
+    }
+
+    /// A `copy-pipe` command can take more of its input.
+    pub(crate) fn pipe_writable(&mut self, id: u32) {
+        let Some(job) = self.pipes.get_mut(&id) else { return };
+        if let Ok(false) = job.write() {
+            return;
+        }
+        if let Some(mut job) = self.pipes.remove(&id) {
+            let _ = self.registry.deregister(&mut job.tx);
         }
     }
 
@@ -295,6 +343,7 @@ impl Rt {
             msg_style: crate::prompt::message_style(),
             mode_drag: None,
             mouse_press: None,
+            clicks: None,
         });
         if let Some(text) = self.startup_message.take() {
             att.message = Some(Message { line: vec![Span::new(text, att.msg_style)], expires: None });
@@ -442,9 +491,10 @@ impl Host for Rt {
         if let Some(p) = self.panes.get_mut(&pane) {
             match input {
                 PaneInput::Key(k) => {
-                    // send-keys into a pane in a mode drives the mode, as in
-                    // tmux.
+                    // send-keys into a pane in a mode drives the mode through
+                    // its key table, as in tmux.
                     match p.with_mode(|m, ctx| m.key(k, ctx)) {
+                        Some(ModeAction::Binding) => self.mode_bindings.push((pane, k.clone())),
                         Some(a) => self.mode_actions.push((None, pane, a)),
                         None => p.engine.encode_key(k, &mut buf),
                     }
@@ -558,6 +608,19 @@ impl Host for Rt {
         self.views_stale = true;
     }
 
+    fn hangup_client_parent(&mut self, client: ClientId) {
+        let Some(pid) = self.clients.get(&client).and_then(|c| c.hello.as_ref()).map(|h| h.pid) else { return };
+        match crate::sys::parent_pid(pid) {
+            // Never init, nor the server itself (a client the server started).
+            Some(ppid) if ppid > 1 && ppid != self.server_pid => {
+                log!("client {client}: SIGHUP to its parent {ppid}");
+                // SAFETY: kill(2) with a pid we looked up; no memory is involved.
+                unsafe { libc::kill(ppid as libc::pid_t, libc::SIGHUP) };
+            }
+            other => log!("client {client}: no parent to hang up ({other:?})"),
+        }
+    }
+
     fn enter_copy_mode(&mut self, client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         if opts.cancel {
@@ -569,6 +632,11 @@ impl Host for Rt {
             self.mode_actions.push((client, pane, a));
         } else {
             enter_copy(p, opts, &self.copy_cfg.cfg);
+            if opts.page_down
+                && let Some(a) = p.with_mode(|m, ctx| m.command("page-down", None, 1, ctx).unwrap_or(ModeAction::None))
+            {
+                self.mode_actions.push((client, pane, a));
+            }
             self.mode_changed.push(pane);
         }
         self.views_stale = true;
@@ -584,8 +652,13 @@ impl Host for Rt {
         count: u32,
     ) -> Result<(), String> {
         let p = self.panes.get_mut(&pane).ok_or("not in a mode")?;
-        let arg = args.first().map(|s| s.as_str());
-        let a = p.with_mode(|m, ctx| m.command(command, arg, count, ctx)).ok_or("not in a mode")??;
+        // copy-pipe* [command [prefix]]: the copy itself takes no command.
+        let pipe = command.starts_with("copy-pipe");
+        let arg = if pipe { args.get(1) } else { args.first() }.map(|s| s.as_str());
+        let mut a = p.with_mode(|m, ctx| m.command(command, arg, count, ctx)).ok_or("not in a mode")??;
+        if pipe && let ModeAction::Copy { pipe, .. } = &mut a {
+            *pipe = Some(args.first().cloned().unwrap_or_default());
+        }
         self.mode_actions.push((client, pane, a));
         Ok(())
     }
@@ -608,7 +681,7 @@ impl Host for Rt {
         a.needs_frame = true;
     }
 
-    fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str) {
+    fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str, keys: bool) {
         let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
         let labels = a
             .view
@@ -619,6 +692,7 @@ impl Host for Rt {
             expires: Instant::now() + std::time::Duration::from_millis(duration_ms.max(1)),
             template: template.to_string(),
             labels,
+            keys,
         });
         a.needs_frame = true;
     }

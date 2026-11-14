@@ -68,6 +68,7 @@ pub(crate) static TOP: &[Opt] = &[
     o("base-index", "base-index", Int),
     o("bell-action", "bell-action", Choice(&["none", "any", "current", "other"])),
     srv("buffer-limit", Int),
+    srv("copy-command", Str),
     o("default-command", "default-command", Str),
     o("default-shell", "default-shell", Str),
     o("default-size", "default-size", Dim),
@@ -83,6 +84,7 @@ pub(crate) static TOP: &[Opt] = &[
     o("monitor-activity", "monitor-activity", Bool),
     o("monitor-bell", "monitor-bell", Bool),
     o("mouse", "mouse", Bool),
+    o("mouse-drag-end", "mouse-drag-end", Choice(&["copy-pipe-and-cancel", "copy-pipe-no-clear", "none"])),
     o("other-pane-height", "other-pane-height", Size),
     o("other-pane-width", "other-pane-width", Size),
     o("pane-base-index", "pane-base-index", Int),
@@ -680,7 +682,7 @@ mod tests {
         for opt in TOP.iter().chain(STATUS).chain(THEME) {
             assert!(known.iter().any(|k| k == opt.option), "{} is not a lif-core option", opt.option);
         }
-        let server = ["buffer-limit", "escape-time", "exit-empty", "set-clipboard"];
+        let server = ["buffer-limit", "copy-command", "escape-time", "exit-empty", "set-clipboard"];
         for opt in TOP {
             assert_eq!(opt.server, server.contains(&opt.option), "{}", opt.option);
         }

@@ -124,6 +124,9 @@ pub fn migrate_tmux_conf(text: &str) -> Migration {
     Migration { toml: out.render(), untranslated }
 }
 
+/// tmux's mouse key names (`MouseDown1Pane`, `WheelUpStatus`, ...).
+const MOUSE_KEYS: &[&str] = &["Mouse", "Wheel", "DoubleClick", "TripleClick", "SecondClick"];
+
 /// Whether `path` names a tmux configuration file rather than a lif one:
 /// `.tmux.conf`, `tmux.conf`, or anything ending in `.conf`.
 pub fn looks_like_tmux_conf(path: &str) -> bool {
@@ -182,6 +185,15 @@ impl Out {
                     return Err(format!("key table {table} is not supported (config.toml has {})", TABLES.join(", ")));
                 };
                 let name = a.value(0).ok_or("no key given")?;
+                if name == "MouseDragEnd1Pane" && table.starts_with("copy-mode") {
+                    return self.drag_end(bind, &a.values()[1..], comments);
+                }
+                if MOUSE_KEYS.iter().any(|p| name.starts_with(p)) {
+                    return Err(format!(
+                        "{name}: lif's mouse actions are built in, not bound \
+                         (mouse-drag-end and copy-command configure the copy at the end of a selection)"
+                    ));
+                }
                 let key = KeyCode::parse(name).ok_or_else(|| format!("unknown key: {name}"))?;
                 let value = if !bind {
                     "false".to_string()
@@ -220,6 +232,43 @@ impl Out {
             }
             other => Err(format!("{other} has no config.toml equivalent")),
         }
+    }
+
+    /// `MouseDragEnd1Pane` in a copy-mode table: lif's `mouse-drag-end`.
+    fn drag_end(&mut self, bind: bool, rest: &[Arg], comments: &mut Option<Vec<String>>) -> Result<(), String> {
+        let value = if !bind {
+            "none"
+        } else {
+            let text = command_text(rest)?;
+            let list = parse_string(&text).map_err(|e| e.0)?;
+            let words = match list.commands() {
+                [c] if c.name() == "send-keys" && c.args().has('X') => c.args().strings(0),
+                _ => Vec::new(),
+            };
+            let value = match words.first().map(String::as_str) {
+                Some("copy-pipe-and-cancel" | "copy-selection-and-cancel") => "copy-pipe-and-cancel",
+                Some("copy-pipe-no-clear" | "copy-selection-no-clear") => "copy-pipe-no-clear",
+                _ => {
+                    return Err(format!(
+                        "MouseDragEnd1Pane runs {text}: lif's mouse-drag-end is copy-pipe-and-cancel, \
+                         copy-pipe-no-clear or none"
+                    ));
+                }
+            };
+            if let Some(pipe) = words.get(1).filter(|_| words[0].starts_with("copy-pipe")) {
+                // Translated as far as it goes; the command needs a choice.
+                self.top.set("mouse-drag-end".into(), toml_str(value), comments.take().unwrap_or_default());
+                return Err(format!(
+                    "lif pipes mouse copies to the copy-command option, which also serves copy-pipe keys \
+                     without a command of their own (Enter in vi, M-w in emacs): add copy-command = {} \
+                     if that is what you want",
+                    toml_str(pipe)
+                ));
+            }
+            value
+        };
+        self.top.set("mouse-drag-end".into(), toml_str(value), comments.take().unwrap_or_default());
+        Ok(())
     }
 
     fn render(&self) -> String {

@@ -143,12 +143,13 @@ Any unambiguous prefix of a command name works.
 .Bl -tag -width Ds
 .It Xo
 .Ic attach-session Pq Ic attach
-.Op Fl d
+.Op Fl dx
 .Op Fl c Ar working-directory
 .Op Fl t Ar target-session
 .Xc
 Attach this terminal to a session (the most recently used one without -t).
--d detaches other clients; -c sets the session working directory.
+-d detaches other clients; -x also sends SIGHUP to their parent processes;
+-c sets the session working directory.
 .It Xo
 .Ic bind-key Pq Ic bind
 .Op Fl nr
@@ -180,7 +181,7 @@ lines (negative numbers are history, - is the start or end), -J joins
 wrapped lines, -e keeps colors and attributes, -N keeps trailing spaces.
 .It Xo
 .Ic command-prompt
-.Op Fl 1FikNP
+.Op Fl 1FkNP
 .Op Fl I Ar inputs
 .Op Fl p Ar prompts
 .Op Fl T Ar prompt-type
@@ -189,6 +190,9 @@ wrapped lines, -e keeps colors and attributes, -N keeps trailing spaces.
 .Xc
 Open the command prompt on the status line, optionally with a template in
 which %% or %1 is replaced by the answer.
+-P and -T are accepted: the prompt is always on the status line and there
+is no completion.
+-i (incremental) is not supported outside copy mode's searches.
 .It Xo
 .Ic confirm-before Pq Ic confirm
 .Op Fl by
@@ -198,13 +202,14 @@ which %% or %1 is replaced by the answer.
 .Ar command
 .Xc
 Ask y/n on the status line and run command on y.
+The command that asks never waits for the answer, so -b changes nothing.
 .It Xo
 .Ic copy-mode
 .Op Fl deHMqu
 .Op Fl t Ar target-pane
 .Xc
-Enter copy mode. -u scrolls one page up, -e leaves at the bottom, -H hides
-the position, -q leaves any mode.
+Enter copy mode. -u scrolls one page up, -d one page down, -e leaves at the
+bottom, -H hides the position, -q leaves any mode.
 .It Xo
 .Ic delete-buffer Pq Ic deleteb
 .Op Fl b Ar buffer-name
@@ -218,6 +223,8 @@ Delete the newest paste buffer, or the one named with -b.
 .Xc
 Detach the current client, or the one named with -t; -s detaches all clients
 of a session, -a all other clients.
+-P also sends SIGHUP to the parent process of each detached client (usually
+the shell that started it).
 .It Xo
 .Ic display-message Pq Ic display
 .Op Fl lp
@@ -231,13 +238,15 @@ Show a message on the status line, or print it with -p. The message is a
 format.
 .It Xo
 .Ic display-panes Pq Ic displayp
-.Op Fl bN
+.Op Fl N
 .Op Fl d Ar duration
 .Op Fl t Ar target-pane
 .Oo Ar template Oc
 .Xc
 Show pane numbers; typing one selects that pane (or runs template with %%
 replaced by its id).
+With -N keys are not looked at and the numbers stay up for the whole
+duration.
 .It Xo
 .Ic has-session Pq Ic has
 .Op Fl t Ar target-session
@@ -295,6 +304,13 @@ List attached clients.
 .Oo Ar command Oc
 .Xc
 List the commands lif implements, with aliases.
+-F formats each with
+.Li command_list_name ,
+.Li command_list_alias
+and
+.Li command_list_usage
+(built from the flag table, so values are named
+.Ar value ) .
 .It Xo
 .Ic list-keys Pq Ic lsk
 .Op Fl 1N
@@ -334,7 +350,7 @@ List windows of a session (-a: all).
 Move a window to another index; -r renumbers the windows of a session.
 .It Xo
 .Ic new-session Pq Ic new
-.Op Fl ADdEPX
+.Op Fl ADdPX
 .Op Fl c Ar start-directory
 .Op Fl F Ar format
 .Op Fl n Ar window-name
@@ -344,7 +360,9 @@ Move a window to another index; -r renumbers the windows of a session.
 .Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
 .Xc
 Create a session and attach to it unless -d is given. -A attaches if the
-session named with -s exists. -x and -y set the size of a detached session.
+session named with -s exists; then -D and -X act as attach-session's -d and
+-x. -x and -y set the size of a detached session.
+-E is not supported (there is no update-environment option).
 .It Xo
 .Ic new-window Pq Ic neww
 .Op Fl abdkPS
@@ -462,6 +480,8 @@ window if already current.
 Send keys to a pane. -l sends text literally, -H hexadecimal bytes, -N
 repeats, -R resets the terminal, -X runs a copy-mode command, -F expands
 formats.
+Keys sent to a pane in copy mode go through the copy-mode key table, as if
+typed.
 .It Xo
 .Ic send-prefix
 .Op Fl 2
@@ -483,7 +503,8 @@ Set a buffer's contents; -a appends, -n renames.
 .Ar option Oo Ar value Oc
 .Xc
 Set an option. -g global, -s server, -w window, -u unset, -a append, -o only
-if unset, -q quiet, -F expand formats in the value.
+if not set yet (global options always are), -q quiet, -F expand formats in
+the value.
 .It Xo
 .Ic set-window-option Pq Ic setw
 .Op Fl aFgoqu
@@ -564,6 +585,8 @@ Swap two windows.
 .Xc
 Switch the client to another session (-n next, -p previous, -l last), or set
 its key table with -T.
+Switching to another pane of a zoomed window unzooms it; with -Z the window
+stays zoomed on that pane.
 .It Xo
 .Ic unbind-key Pq Ic unbind
 .Op Fl anq
@@ -764,8 +787,12 @@ tables, chosen by the
 option; list them with
 .Ic list-keys Fl T Ar table .
 The mouse (on by default) selects panes and windows, resizes panes by their
-borders, scrolls into copy mode and selects text; mouse actions cannot be
-bound.
+borders, scrolls into copy mode and selects text (drag, or double and triple
+click for a word and a line); mouse actions cannot be bound.
+What the end of a selection does is the
+.Ic mouse-drag-end
+option: copy and leave copy mode (the default, as tmux), copy and stay, or
+only select.
 .Sh ENVIRONMENT
 .Bl -tag -width XDG_CONFIG_HOME
 .It Ev LIF_SOCKET
@@ -773,7 +800,9 @@ Socket path used when neither
 .Fl S
 nor
 .Fl L
-is given.
+is given and
+.Ev LIF
+is unset or empty.
 .It Ev XDG_RUNTIME_DIR
 If set, the default socket directory is
 .Pa $XDG_RUNTIME_DIR/lif .
@@ -810,6 +839,15 @@ defaults to
 .It Ev LIF
 Set in every pane to
 .Ar socket , Ns Ar server-pid , Ns Ar session-id .
+Without
+.Fl S
+or
+.Fl L ,
+.Nm
+uses the socket it names (before
+.Ev LIF_SOCKET
+and the default socket), so commands run in a pane reach that pane's
+server.
 .Nm
 refuses to attach while it is set and not empty.
 .It Ev LIF_PANE
@@ -880,19 +918,21 @@ The documentation in the source tree:
 .Pa docs/tmux-migration.md .
 .Sh CAVEATS
 The configuration file is TOML, not a list of tmux commands.
-Scrollback is limited by
-.Ic scrollback-bytes ,
-not
-.Ic history-limit ,
-which is not enforced.
-.Ic escape-time
-is ignored.
+Scrollback is limited both by
+.Ic history-limit
+(lines, default 4000) and by
+.Ic scrollback-bytes
+(memory, default 10 MiB, allocated in whole pages so small budgets round
+up); changing either applies to existing panes too.
 .Nm
-does not run shell commands: there is no
+runs no shell commands except the command of
+.Ic copy-pipe
+and the
+.Ic copy-command
+option, which get the copied text on standard input: there is no
 .Ic run-shell
 or
 .Ic if-shell ,
+and
 .Li #()
-expands to nothing, and
-.Ic copy-pipe
-ignores its command.
+expands to nothing.

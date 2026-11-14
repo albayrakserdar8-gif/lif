@@ -218,3 +218,24 @@ pub(crate) fn rss_bytes() -> u64 {
         .map(|pages| pages * 4096)
         .unwrap_or(0)
 }
+
+/// The parent of process `pid` (`detach-client -P`).
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    // SAFETY: proc_pidinfo fills a proc_bsdinfo of the given size; an
+    // all-zero one is a valid out-parameter.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size);
+        (n == size).then_some(info.pbi_ppid)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    // Field 4 of /proc/<pid>/stat, after the parenthesised command name
+    // (which may itself contain spaces and parentheses).
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}

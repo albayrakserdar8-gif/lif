@@ -16,7 +16,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::ServerOptions;
 use crate::client::{CLIENT_READ_BUDGET, ClientRt, TermOut, Tty};
-use crate::host::{CLIENT_TOKEN, PANE_TOKEN, Rt, TTY_TOKEN};
+use crate::host::{CLIENT_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
 use crate::sys::{self, SignalPipe};
 
 const LISTENER: Token = Token(0);
@@ -39,6 +39,10 @@ const SERVER_CAPS: Caps = Caps::TTY;
 /// About how long one step of a copy-mode search may take before the loop
 /// looks at its descriptors again.
 const SEARCH_STEP_TIME: Duration = Duration::from_millis(2);
+
+/// How deep copy-mode bindings run from `send-keys` may nest (a binding
+/// that sends keys to copy mode runs those keys' bindings, and so on).
+const MAX_BINDING_DEPTH: u32 = 8;
 
 pub(crate) struct Server {
     poll: Poll,
@@ -67,6 +71,9 @@ pub(crate) struct Server {
     pub(crate) scratch_panes: Vec<PaneId>,
     pub(crate) scratch_clients: Vec<ClientId>,
     pub(crate) scratch_views: Vec<ClientId>,
+    /// Copy-mode bindings run from `send-keys` that are running now, so a
+    /// binding that sends its own key cannot recurse without end.
+    binding_depth: u32,
 }
 
 impl Server {
@@ -120,6 +127,7 @@ impl Server {
             scratch_panes: Vec::new(),
             scratch_clients: Vec::new(),
             scratch_views: Vec::new(),
+            binding_depth: 0,
         };
         log!("server {} started on {}", std::process::id(), s.opts.socket.display());
         for line in crate::load_startup_commands(&s.opts) {
@@ -215,6 +223,7 @@ impl Server {
             LISTENER => self.accept(),
             REAPER => self.reap(now),
             SIGNALS => self.handle_signals(),
+            Token(t) if t & PIPE_TOKEN != 0 => self.rt.pipe_writable((t & 0xffff_ffff) as u32),
             Token(t) if t & TTY_TOKEN != 0 => {
                 let id = ClientId((t & 0xffff_ffff) as u32);
                 if writable {
@@ -723,23 +732,46 @@ impl Server {
     /// Runs commands for `client` (or with no client), keeping the pane
     /// facts formats read fresh and the views in step afterwards.
     pub(crate) fn run_commands(&mut self, client: Option<ClientId>, list: &CommandList) -> Result<lif_core::CmdOutput, lif_core::CmdError> {
-        self.refresh_pane_facts();
         let pane = client
             .and_then(|c| self.rt.clients.get(&c))
             .filter(|c| c.att.is_none())
             .and_then(|c| c.hello.as_ref())
             .and_then(|h| h.env.iter().find(|(k, _)| k == "LIF_PANE"))
             .and_then(|(_, v)| PaneId::parse(v));
+        self.run_commands_in(client, pane, list)
+    }
+
+    /// [`Server::run_commands`] with `pane` as the current pane.
+    pub(crate) fn run_commands_in(
+        &mut self,
+        client: Option<ClientId>,
+        pane: Option<PaneId>,
+        list: &CommandList,
+    ) -> Result<lif_core::CmdOutput, lif_core::CmdError> {
+        self.refresh_pane_facts();
         let ctx = CmdContext { client, pane, now: sys::wall_clock() };
         // A copy mode the commands open gets the settings of the pane they
         // most likely target. (Only then: compiling the copy-mode key table
         // parses its defaults, which a server that never enters copy mode
         // does without.)
-        let target = pane.or_else(|| client.and_then(|c| self.rt.clients.get(&c)?.att.as_ref()?.active_pane));
-        if let Some(p) = target
-            && list.commands().iter().any(|c| c.name() == "copy-mode")
-        {
-            self.sync_mode_config(p);
+        // (Without a client or a pane to go by, any pane: the settings are
+        // nearly always global, and after_model corrects the rest.)
+        let has = |name: &str| list.commands().iter().any(|c| c.name() == name);
+        if has("copy-mode") {
+            let target = pane
+                .or_else(|| client.and_then(|c| self.rt.clients.get(&c)?.att.as_ref()?.active_pane))
+                .or_else(|| self.model.panes().next().map(|p| p.id()));
+            if let Some(p) = target {
+                self.sync_mode_config(p);
+            }
+        }
+        // Keys sent into a mode go through its key table, which options
+        // changed since the mode was entered (mode-keys, bindings) affect.
+        if has("send-keys") {
+            let in_mode: Vec<PaneId> = self.rt.panes.values().filter(|p| p.mode.is_some()).map(|p| p.id).collect();
+            for p in in_mode {
+                self.sync_mode_config(p);
+            }
         }
         let r = self.model.execute_list(list, &ctx, &mut self.rt);
         // Options may have changed the styles views are drawn with, and
@@ -782,12 +814,11 @@ impl Server {
             }
         }
         if !self.rt.mode_changed.is_empty() {
-            let key = self.rt.copy_cfg.key.clone();
             for p in std::mem::take(&mut self.rt.mode_changed) {
-                if let Some(pr) = self.rt.panes.get_mut(&p)
-                    && pr.mode.is_some()
-                {
-                    pr.mode_cfg = Some(key.clone());
+                // A mode entered during the call got the settings at hand,
+                // which may be another window's: give it its own.
+                if self.rt.panes.get(&p).is_some_and(|pr| pr.mode.is_some()) {
+                    self.sync_mode_config(p);
                 }
                 self.model.pane_changed(p, &mut self.rt);
             }
@@ -797,6 +828,18 @@ impl Server {
             self.rt.session_env.retain(|s, _| model.session(*s).is_some());
         }
         self.sync_views();
+        if !self.rt.mode_bindings.is_empty() {
+            let keys = std::mem::take(&mut self.rt.mode_bindings);
+            if self.binding_depth >= MAX_BINDING_DEPTH {
+                log!("copy-mode bindings nested too deep: {} keys dropped", keys.len());
+                return;
+            }
+            self.binding_depth += 1;
+            for (pane, key) in keys {
+                self.run_mode_binding(None, pane, &key);
+            }
+            self.binding_depth -= 1;
+        }
     }
 
     /// The foreground process name and directory of every pane, which

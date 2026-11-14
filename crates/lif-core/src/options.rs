@@ -66,12 +66,18 @@ use Scope::*;
 ///   compressed (to about 50-400 bytes); the default 4000 lines keep twice
 ///   tmux's history in about tmux's memory. Changing either applies to
 ///   existing panes too.
+/// - `mouse-drag-end` (lif's own) is what tmux's `MouseDragEnd1Pane`
+///   binding sets, since lif's mouse actions are built in rather than
+///   bound: copy and leave copy mode (tmux's default), copy and stay with
+///   the selection shown, or only select. It applies to double- and
+///   triple-click selections too.
 pub(crate) static DEFS: &[Def] = &[
     d("automatic-rename", Window, Flag, "on"),
     d("automatic-rename-format", Window, Str, "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"),
     d("base-index", Session, Number(0, MAXI), "0"),
     d("bell-action", Session, Choice(&["none", "any", "current", "other"]), "any"),
     d("buffer-limit", Server, Number(1, MAXI), "50"),
+    d("copy-command", Server, Str, ""),
     d("copy-mode-current-match-style", Window, Str, "bg=magenta,fg=black"),
     d("copy-mode-match-style", Window, Str, "bg=cyan,fg=black"),
     d("default-command", Session, Str, ""),
@@ -91,6 +97,7 @@ pub(crate) static DEFS: &[Def] = &[
     d("monitor-activity", Window, Flag, "off"),
     d("monitor-bell", Window, Flag, "on"),
     d("mouse", Session, Flag, "on"),
+    d("mouse-drag-end", Session, Choice(&["copy-pipe-and-cancel", "copy-pipe-no-clear", "none"]), "copy-pipe-and-cancel"),
     d("other-pane-height", Window, SizeStr, "0"),
     d("other-pane-width", Window, SizeStr, "0"),
     d("pane-active-border-style", Window, Str, "fg=green"),

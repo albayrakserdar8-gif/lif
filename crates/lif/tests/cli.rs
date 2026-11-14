@@ -128,3 +128,41 @@ fn not_a_terminal() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&o.stderr), "open terminal failed: not a terminal\n");
 }
+
+/// Inside a pane `lif` finds its server through `$LIF` (first field), as
+/// tmux does through `$TMUX`; -S and -L still win, and `$LIF` beats
+/// `$LIF_SOCKET` the way `$TMUX` beats `$TMUX_TMPDIR`.
+#[test]
+fn lif_inside_a_pane_finds_its_server_through_lif_env() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "in"]);
+    env.wait_capture("in", "$");
+    let out = env.home.join("ls.out");
+    let cmd = format!("LIF_SOCKET=/nonexistent {BIN} ls -F '#{{session_name}} #{{socket_path}}' > {} 2>&1", out.display());
+    env.ok(&["send-keys", "-t", "in", &cmd, "Enter"]);
+    let want = format!("in {}\n", env.sock.display());
+    let mut got = String::new();
+    let ok = env.wait(Duration::from_secs(10), || {
+        got = std::fs::read_to_string(&out).unwrap_or_default();
+        got == want
+    });
+    assert!(ok, "lif in a pane printed {got:?}, want {want:?}");
+    // The same from outside, with $LIF set by hand.
+    let lif = format!("{},1,0", env.sock.display());
+    let bare = |args: &[&str], extra: &[(&str, &str)]| {
+        let mut c = std::process::Command::new(BIN);
+        for k in Env::REMOVE {
+            c.env_remove(k);
+        }
+        c.envs(env.vars()).env("LIF", &lif).envs(extra.iter().copied()).args(args).output().unwrap()
+    };
+    let o = bare(&["ls", "-F", "#{session_name}"], &[("LIF_SOCKET", "/nonexistent")]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "in\n", "{}", String::from_utf8_lossy(&o.stderr));
+    // -S beats $LIF.
+    let other = env.dir.join("other");
+    let o = bare(&["-S", other.to_str().unwrap(), "ls"], &[]);
+    assert_eq!(String::from_utf8_lossy(&o.stderr), format!("no server running on {}\n", other.display()));
+    // An empty $LIF counts as unset: $LIF_SOCKET is used.
+    let o = bare(&["ls", "-F", "#{session_name}"], &[("LIF", ""), ("LIF_SOCKET", env.sock.to_str().unwrap())]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "in\n", "{}", String::from_utf8_lossy(&o.stderr));
+}

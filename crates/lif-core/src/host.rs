@@ -207,6 +207,8 @@ pub enum DetachReason {
 pub struct CopyModeOptions {
     /// `-u`: start one page up.
     pub page_up: bool,
+    /// `-d`: one page down (with `-e`, leaving copy mode at the bottom).
+    pub page_down: bool,
     /// `-e`: leave copy mode when scrolling reaches the bottom.
     pub exit_at_bottom: bool,
     /// `-H`: hide the position indicator.
@@ -311,6 +313,11 @@ pub trait Host {
     /// attachment.
     fn detach_client(&mut self, client: ClientId, reason: DetachReason);
 
+    /// `detach-client -P`, `attach-session -x`: send SIGHUP to the parent
+    /// process of `client` (usually its shell, which then exits), after
+    /// [`Host::detach_client`].
+    fn hangup_client_parent(&mut self, client: ClientId);
+
     /// Put `pane` into copy mode (or, with `opts.cancel`, take it out of any
     /// mode). `client` is the client that asked, if any. Copy mode itself is
     /// the server's.
@@ -347,8 +354,9 @@ pub trait Host {
 
     /// Show pane numbers over `client`'s panes for `duration_ms`; when the
     /// user presses a digit, run `template` with `%%` replaced by the pane id
-    /// (default `select-pane -t %%`).
-    fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str);
+    /// (default `select-pane -t %%`). Without `keys` (`-N`) keys are not
+    /// looked at: the numbers stay up until the time is over.
+    fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str, keys: bool);
 
     /// Ring the bell on `client`'s terminal (write BEL).
     fn bell(&mut self, client: ClientId);

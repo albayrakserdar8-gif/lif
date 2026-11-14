@@ -105,9 +105,13 @@ pub enum ModeAction {
     /// Redraw the pane.
     Redraw,
     /// Put `data` in a new paste buffer (or append it to the top one), send
-    /// it to the outer clipboards per `set-clipboard`, and leave the mode if
-    /// `exit`.
-    Copy { data: Vec<u8>, append: bool, exit: bool },
+    /// it to the outer clipboards per `set-clipboard`, pipe it to `pipe`
+    /// (`copy-pipe`; empty: the `copy-command` option), and leave the mode
+    /// if `exit`.
+    Copy { data: Vec<u8>, append: bool, exit: bool, pipe: Option<String> },
+    /// The key is bound to commands the mode does not run itself: run the
+    /// binding (see `lif_copy::Outcome::Binding`).
+    Binding,
     /// Leave the mode.
     Exit,
     /// Show a prompt and report its edits back (`prompt_*`).
@@ -124,7 +128,10 @@ impl From<Outcome> for ModeAction {
         match o {
             Outcome::None => ModeAction::None,
             Outcome::Redraw => ModeAction::Redraw,
-            Outcome::Copy { data, append, exit } => ModeAction::Copy { data, append, exit },
+            Outcome::Copy { data, append, exit, pipe } => {
+                ModeAction::Copy { data, append, exit, pipe: pipe.then(String::new) }
+            }
+            Outcome::Binding => ModeAction::Binding,
             Outcome::Exit => ModeAction::Exit,
             Outcome::Prompt { label, initial, incremental } => ModeAction::Prompt { label, initial, incremental },
             Outcome::Message(m) => ModeAction::Message(m),
@@ -345,6 +352,9 @@ impl PaneMode for CopyPane {
         }
         if opts.page_up {
             out = self.run(ctx, |c, v| c.run_command(v, Command::PageUp, None, 1)).into();
+        }
+        if opts.page_down {
+            out = self.run(ctx, |c, v| c.run_command(v, Command::PageDown, None, 1)).into();
         }
         out
     }

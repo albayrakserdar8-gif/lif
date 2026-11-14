@@ -29,7 +29,8 @@ impl Host for NullHost {
     fn enter_copy_mode(&mut self, _client: Option<ClientId>, _pane: PaneId, _opts: CopyModeOptions) {}
     fn show_message(&mut self, _client: ClientId, _text: &str, _duration_ms: u64) {}
     fn prompt(&mut self, _client: ClientId, _prompt: Prompt) {}
-    fn display_panes(&mut self, _client: ClientId, _duration_ms: u64, _template: &str) {}
+    fn display_panes(&mut self, _client: ClientId, _duration_ms: u64, _template: &str, _keys: bool) {}
+    fn hangup_client_parent(&mut self, _client: ClientId) {}
     fn bell(&mut self, _client: ClientId) {}
     fn redraw(&mut self, _what: Redraw) {}
     fn shutdown(&mut self) {}

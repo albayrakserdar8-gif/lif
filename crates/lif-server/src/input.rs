@@ -135,6 +135,7 @@ impl Server {
         let pressed = key.action != KeyAction::Release && !matches!(key.key, Key::Modifier(_));
         if let Some(dp) = a.display_panes.as_ref()
             && pressed
+            && dp.keys
         {
             let pick = match key.key {
                 Key::Char(c) if c.is_ascii_digit() => {
@@ -232,7 +233,30 @@ impl Server {
             }
         }
         let act = self.with_mode(pane, |m, ctx| m.key(key, ctx));
+        if act == ModeAction::Binding {
+            self.run_mode_binding(Some(client), pane, key);
+            return;
+        }
         self.mode_action(Some(client), pane, act);
+    }
+
+    /// Run the commands `key` is bound to in `pane`'s copy-mode table, with
+    /// `pane` as the current pane. Output and errors go to `client`'s
+    /// status line (or the log, for `send-keys` from no client).
+    pub(crate) fn run_mode_binding(&mut self, client: Option<ClientId>, pane: PaneId, key: &KeyEvent) {
+        let vi = self.sync_mode_config(pane);
+        let table = if vi { lif_core::bindings::COPY_MODE_VI_TABLE } else { lif_core::bindings::COPY_MODE_TABLE };
+        let Some(list) = self.model.bindings().lookup(table, key).map(|b| b.commands.clone()) else { return };
+        let r = self.run_commands_in(client, Some(pane), &list);
+        match (client, r) {
+            (Some(c), Ok(o)) => self.show_output(c, &o.stdout),
+            (Some(c), Err(e)) => {
+                let d = self.display_time();
+                self.rt.show_message(c, &e.to_string(), d);
+            }
+            (None, Ok(_)) => {}
+            (None, Err(e)) => log!("copy-mode binding in pane {pane}: {e}"),
+        }
     }
 
     /// Run `f` on `pane`'s mode; `ModeAction::None` without one.
@@ -252,13 +276,19 @@ impl Server {
         let s = w.and_then(|w| self.model.window(w)).map(|w| w.session());
         let opt = |n: &str| self.model.option_text(n, s, w).unwrap_or_default();
         let vi = opt("mode-keys") == "vi";
-        let key = (self.model.bindings().generation(), vi, opt("word-separators"), opt("wrap-search") != "off");
+        let drag_end = match opt("mouse-drag-end").as_str() {
+            "copy-pipe-no-clear" => lif_copy::DragEnd::CopyAndStay,
+            "none" => lif_copy::DragEnd::Keep,
+            _ => lif_copy::DragEnd::CopyAndCancel,
+        };
+        let key = (self.model.bindings().generation(), vi, opt("word-separators"), opt("wrap-search") != "off", drag_end);
         if self.rt.copy_cfg.key != key {
             let keys = if vi { lif_copy::ModeKeys::Vi } else { lif_copy::ModeKeys::Emacs };
             let mut cfg = lif_copy::Config::new(keys);
             cfg.table = std::rc::Rc::new(lif_copy::KeyTable::from_bindings(self.model.bindings(), keys.table_name()));
             cfg.word_separators.clone_from(&key.2);
             cfg.wrap_search = key.3;
+            cfg.mouse.drag_end = drag_end;
             self.rt.copy_cfg = crate::host::CopyConfig { key, cfg };
         }
         let gen_key = &self.rt.copy_cfg.key;
@@ -295,7 +325,7 @@ impl Server {
                 }
                 self.model.pane_changed(pane, &mut self.rt);
             }
-            ModeAction::Copy { data, append, exit } => {
+            ModeAction::Copy { data, append, exit, pipe } => {
                 let data = if append && let Some(top) = self.model.buffers().first() {
                     let (name, mut all) = (top.name.clone(), top.data.clone());
                     all.extend_from_slice(&data);
@@ -306,10 +336,27 @@ impl Server {
                     data
                 };
                 self.clipboard_write(b'c', &data, true);
+                let command = match pipe {
+                    Some(c) if c.is_empty() => self.model.option_text("copy-command", None, None).unwrap_or_default(),
+                    Some(c) => c,
+                    None => String::new(),
+                };
+                if !command.trim().is_empty() {
+                    let cwd = self.rt.panes.get(&pane).map(|p| p.current_path.clone()).unwrap_or_default();
+                    if let Err(e) = self.rt.copy_pipe(&command, &cwd, data) {
+                        log!("{e}");
+                        let d = self.display_time();
+                        for c in self.mode_clients(client, pane) {
+                            self.rt.show_message(c, &e, d);
+                        }
+                    }
+                }
                 if exit {
                     self.mode_action(client, pane, ModeAction::Exit);
                 }
             }
+            // Only a key knows its binding: key_to_mode and send-keys run it.
+            ModeAction::Binding => {}
             ModeAction::Prompt { label, initial, incremental } => {
                 for c in self.mode_clients(client, pane) {
                     if let Some(a) = self.rt.clients.get_mut(&c).and_then(|c| c.att.as_mut()) {
@@ -485,8 +532,22 @@ impl Server {
             self.mode_action(Some(id), pane, act);
             return;
         }
+        let click_ms = self.rt.copy_cfg.cfg.mouse.click_ms;
         let press = match self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
             Some(a) if m.action == MouseAction::Press && m.button == Some(MouseButton::Left) => {
+                let n = match a.clicks {
+                    Some((p, at, t, n)) if p == pane && at == local.cell && now_ms.saturating_sub(t) <= click_ms => n % 3 + 1,
+                    _ => 1,
+                };
+                a.clicks = Some((pane, local.cell, now_ms, n));
+                if n > 1 {
+                    a.mouse_press = None;
+                    if pane != active {
+                        self.run_string(id, &format!("select-pane -t {pane}"));
+                    }
+                    self.click_select(id, pane, &local, n, now_ms);
+                    return;
+                }
                 a.mouse_press = Some((pane, rect, local));
                 None
             }
@@ -544,6 +605,34 @@ impl Server {
             }
             _ => {}
         }
+    }
+
+    /// tmux's DoubleClick1Pane and TripleClick1Pane on a pane not in a mode
+    /// whose program does not take the mouse: copy mode (`-H`), select the
+    /// word or line under the pointer and copy it per `mouse-drag-end`
+    /// (tmux's `copy-pipe-and-cancel`). tmux shows the selection for 0.3 s
+    /// before it copies and leaves; lif copies at once.
+    fn click_select(&mut self, id: ClientId, pane: PaneId, press: &MouseEvent, clicks: u8, now_ms: u64) {
+        self.sync_mode_config(pane);
+        let opts = lif_core::CopyModeOptions { hide_position: true, ..Default::default() };
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+        crate::host::enter_copy(p, opts, &self.rt.copy_cfg.cfg);
+        p.mode_cfg = Some(self.rt.copy_cfg.key.clone());
+        self.model.pane_changed(pane, &mut self.rt);
+        // The mode counts the clicks itself: give it all of them.
+        let mut act = self.with_mode(pane, |md, ctx| {
+            let mut last = ModeAction::None;
+            for _ in 0..clicks {
+                last = md.mouse(press, now_ms, ctx);
+            }
+            last
+        });
+        // Nothing to copy (a blank line): tmux's copy-pipe-and-cancel still
+        // leaves.
+        if !matches!(act, ModeAction::Copy { .. }) && self.rt.copy_cfg.cfg.mouse.drag_end == lif_copy::DragEnd::CopyAndCancel {
+            act = ModeAction::Exit;
+        }
+        self.mode_action(Some(id), pane, act);
     }
 
     /// The window whose entry in the status line covers column `x`.

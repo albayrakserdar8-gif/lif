@@ -119,10 +119,135 @@ fn mouse_drag_selects_and_copies() {
     // 1-based columns).
     t.write(format!("\x1b[<0;1;{y}M\x1b[<32;3;{y}M\x1b[<32;7;{y}M\x1b[<0;7;{y}m").as_bytes());
     t.wait_for("selection copied", secs(10), |_| env.ok(&["show-buffer"]) == "dragme\n");
+    // tmux's default MouseDragEnd1Pane (copy-pipe-and-cancel): copy mode
+    // is left once the drag ends.
+    t.wait_for("copy mode left", secs(10), |t| !in_mode(t));
+    assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+    // mouse-drag-end copy-pipe-no-clear: copy and stay.
+    env.ok(&["set", "-g", "mouse-drag-end", "copy-pipe-no-clear"]);
+    t.write(format!("\x1b[<0;8;{y}M\x1b[<32;10;{y}M\x1b[<32;14;{y}M\x1b[<0;14;{y}m").as_bytes());
+    t.wait_for("second selection copied", secs(10), |_| env.ok(&["show-buffer"]) == "please\n");
     t.wait_for("copy mode shown", secs(10), in_mode);
-    assert!(in_mode(&mut t), "a drag enters copy mode and stays (lif's drag-end default): {}", t.screen());
     t.write(b"q");
     t.wait_for("left", secs(10), |t| !in_mode(t));
+    // none: select only.
+    env.ok(&["set", "-g", "mouse-drag-end", "none"]);
+    t.write(format!("\x1b[<0;1;{y}M\x1b[<32;3;{y}M\x1b[<32;7;{y}M\x1b[<0;7;{y}m").as_bytes());
+    t.wait_for("copy mode shown", secs(10), in_mode);
+    t.settle(Duration::from_millis(100));
+    assert_eq!(env.ok(&["show-buffer"]), "please\n", "nothing new copied");
+    t.write(b"q");
+    t.wait_for("left", secs(10), |t| !in_mode(t));
+}
+
+/// tmux's DoubleClick1Pane / TripleClick1Pane outside copy mode: select the
+/// word / line, copy it, leave copy mode.
+#[test]
+fn double_and_triple_click_copy_word_and_line() {
+    let env = Env::new();
+    let mut t = session(&env, "d");
+    t.type_str("echo one two''x three\r");
+    t.wait_text("one twox three");
+    t.wait_for("mouse on", secs(10), |t| t.modes().mouse_tracking);
+    let y = row_of(&t, "one twox three").unwrap() + 1;
+    // Double click on "twox" (column 6, 1-based).
+    t.write(format!("\x1b[<0;6;{y}M\x1b[<0;6;{y}m\x1b[<0;6;{y}M\x1b[<0;6;{y}m").as_bytes());
+    t.wait_for("word copied", secs(10), |_| env.run(&["show-buffer"]).stdout == b"twox\n");
+    t.wait_for("copy mode left", secs(10), |t| !in_mode(t));
+    assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+    // A third click soon after: the whole line.
+    t.write(format!("\x1b[<0;6;{y}M\x1b[<0;6;{y}m").as_bytes());
+    t.wait_for("line copied", secs(10), |_| env.run(&["show-buffer"]).stdout == b"one twox three\n");
+    assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+    // Clicks far apart in time are single clicks: nothing copied.
+    let buffers = || env.ok(&["list-buffers"]).lines().count();
+    let before = buffers();
+    t.write(format!("\x1b[<0;2;{y}M\x1b[<0;2;{y}m").as_bytes());
+    std::thread::sleep(Duration::from_millis(400));
+    t.write(format!("\x1b[<0;2;{y}M\x1b[<0;2;{y}m").as_bytes());
+    t.settle(Duration::from_millis(150));
+    assert_eq!(buffers(), before, "no new buffer");
+    // A program that takes the mouse gets the clicks instead.
+    t.type_str("printf '\\033[?1000h'; sleep 2; printf '\\033[?1000l'\r");
+    t.wait_for("program has the mouse", secs(10), |t| t.modes().mouse_tracking);
+    std::thread::sleep(Duration::from_millis(300));
+    t.write(format!("\x1b[<0;6;{y}M\x1b[<0;6;{y}m\x1b[<0;6;{y}M\x1b[<0;6;{y}m").as_bytes());
+    t.settle(Duration::from_millis(150));
+    assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+    assert_eq!(buffers(), before, "no new buffer");
+}
+
+/// copy-pipe runs its command with the copied text on stdin, without
+/// blocking the server, and the copy-command option serves copy-pipe
+/// without a command (the default Enter binding, mouse copies).
+#[test]
+fn copy_pipe_runs_the_command() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "P", "-x", "80", "-y", "24"]);
+    env.ok(&["set", "-g", "mode-keys", "vi"]);
+    env.wait_capture("P", "$");
+    env.ok(&["send-keys", "-t", "P", "echo pipe''d text", "Enter"]);
+    env.wait_capture("P", "piped text");
+    let read = |name: &str| std::fs::read_to_string(env.home.join(name)).unwrap_or_default();
+    let wait_file = |name: &str, want: &str| {
+        let mut got = String::new();
+        let ok = env.wait(secs(10), || {
+            got = read(name);
+            got == want
+        });
+        assert!(ok, "{name}: {got:?}, want {want:?}");
+    };
+    let to = |name: &str| format!("cat > '{}'", env.home.join(name).display());
+    // send-keys -X copy-pipe-and-cancel with a command.
+    env.ok(&["copy-mode", "-t", "P"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "cursor-up"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "select-line"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "copy-pipe-and-cancel", &to("a.out")]);
+    wait_file("a.out", "piped text\n");
+    assert_eq!(env.ok(&["show-buffer"]), "piped text\n", "the buffer gets it too");
+    assert_eq!(env.ok(&["display", "-p", "-t", "P", "#{pane_in_mode}"]), "0\n");
+    // A key bound to copy-pipe with a command, pressed through send-keys.
+    env.ok(&["bind", "-T", "copy-mode-vi", "y", "send-keys", "-X", "copy-pipe-and-cancel", &to("b.out")]);
+    env.ok(&["copy-mode", "-t", "P"]);
+    env.ok(&["send-keys", "-t", "P", "k", "0", "Space", "e"]);
+    env.ok(&["send-keys", "-t", "P", "y"]);
+    wait_file("b.out", "piped");
+    assert_eq!(env.ok(&["display", "-p", "-t", "P", "#{pane_in_mode}"]), "0\n");
+    // copy-command for the default Enter (copy-pipe-and-cancel).
+    env.ok(&["set", "-s", "copy-command", &to("c.out")]);
+    env.ok(&["copy-mode", "-t", "P"]);
+    env.ok(&["send-keys", "-t", "P", "k", "0", "w", "Space", "$", "Enter"]);
+    wait_file("c.out", "text");
+    // copy-selection does not pipe.
+    env.ok(&["set", "-s", "copy-command", &to("d.out")]);
+    env.ok(&["copy-mode", "-t", "P"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "cursor-up"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "select-line"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "copy-selection-and-cancel"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!env.home.join("d.out").exists());
+    // A big copy into a command that does not read for a while: the server
+    // keeps answering, and the command gets every byte in the end.
+    env.ok(&["set", "-s", "copy-command", ""]);
+    env.ok(&["send-keys", "-t", "P", "clear; yes 'a line of text that pads the copy out' | head -3000; echo big''done", "Enter"]);
+    env.wait_capture("P", "bigdone");
+    env.ok(&["copy-mode", "-t", "P"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "history-top"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "begin-selection"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "history-bottom"]);
+    env.ok(&["send-keys", "-t", "P", "-X", "end-of-line"]);
+    let t0 = Instant::now();
+    env.ok(&["send-keys", "-t", "P", "-X", "copy-pipe-and-cancel", &format!("sleep 1; wc -c > '{}'", env.home.join("e.out").display())]);
+    env.ok(&["display", "-p", "x"]);
+    assert!(t0.elapsed() < Duration::from_millis(700), "the server waited for the pipe: {:?}", t0.elapsed());
+    let len = env.ok(&["show-buffer"]).len();
+    assert!(len > 64 * 1024, "a copy bigger than a pipe buffer: {len}");
+    let mut got = String::new();
+    let ok = env.wait(secs(10), || {
+        got = read("e.out");
+        got.trim().parse::<usize>().ok().is_some_and(|n| n + 1 >= len)
+    });
+    assert!(ok, "e.out: {got:?}, buffer {len} bytes");
 }
 
 #[test]
@@ -287,4 +412,43 @@ fn copy_mode_flags_and_prefix_page_up() {
     env.ok(&["send-keys", "-X", "-N", "3", "scroll-down"]);
     t.wait_for("bottom leaves", secs(10), |t| !in_mode(t));
     assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+    // -d: a page down (tmux's PageDown recipe is copy-mode -ed).
+    env.ok(&["copy-mode", "-u"]);
+    env.ok(&["copy-mode", "-u"]);
+    t.wait_for("two pages up", secs(10), |t| t.lines()[0].contains("[42/"));
+    env.ok(&["copy-mode", "-d"]);
+    t.wait_for("a page down", secs(10), |t| t.lines()[0].contains("[21/"));
+    env.ok(&["copy-mode", "-ed"]);
+    t.wait_for("bottom leaves", secs(10), |t| !in_mode(t));
+    assert_eq!(env.ok(&["display", "-p", "#{pane_in_mode}"]), "0\n");
+}
+
+/// send-keys with key names drives a pane in copy mode through the mode's
+/// key table (tmux 3.8), from the command line with no client attached.
+#[test]
+fn send_keys_drives_copy_mode_from_the_command_line() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "S", "-x", "80", "-y", "24"]);
+    env.ok(&["set", "-g", "mode-keys", "vi"]);
+    env.wait_capture("S:0", "$");
+    env.ok(&["send-keys", "-t", "S:0", "echo copy''me", "Enter"]);
+    env.wait_capture("S:0", "copyme");
+    let in_mode = || env.ok(&["display", "-p", "-t", "S:0", "#{pane_in_mode}"]);
+    env.ok(&["copy-mode", "-t", "S:0"]);
+    assert_eq!(in_mode(), "1\n");
+    env.ok(&["send-keys", "-t", "S:0", "-X", "cursor-up"]);
+    env.ok(&["send-keys", "-t", "S:0", "V"]);
+    env.ok(&["send-keys", "-t", "S:0", "Enter"]);
+    assert_eq!(in_mode(), "0\n", "Enter (copy-pipe-and-cancel) leaves copy mode");
+    assert_eq!(env.ok(&["show-buffer"]), "copyme\n");
+    // Entering and driving the mode in one command list.
+    env.ok(&["copy-mode", "-t", "S:0", ";", "send-keys", "-t", "S:0", "k", "0", "Space", "$", "Enter"]);
+    assert_eq!(in_mode(), "0\n");
+    assert_eq!(env.ok(&["show-buffer"]), "copyme\n");
+    // A later change of mode-keys reaches a mode entered before it.
+    env.ok(&["copy-mode", "-t", "S:0"]);
+    env.ok(&["set", "-g", "mode-keys", "emacs"]);
+    // Escape cancels in emacs copy mode (in vi it only clears the selection).
+    env.ok(&["send-keys", "-t", "S:0", "Escape"]);
+    assert_eq!(in_mode(), "0\n");
 }

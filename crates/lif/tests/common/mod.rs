@@ -167,6 +167,11 @@ impl Term {
     pub fn spawn_with(env: &Env, args: &[&str], size: Size, extra: &[(&str, &str)]) -> Term {
         let mut argv: Vec<OsString> = vec![BIN.into(), "-S".into(), env.sock.clone().into()];
         argv.extend(args.iter().map(OsString::from));
+        Self::spawn_argv(env, argv, size, extra)
+    }
+
+    /// A terminal running `argv` (for a client under a shell of its own).
+    pub fn spawn_argv(env: &Env, argv: Vec<OsString>, size: Size, extra: &[(&str, &str)]) -> Term {
         let mut vars = env.vars();
         for (k, v) in extra {
             vars.push(((*k).into(), (*v).into()));

@@ -23,6 +23,7 @@ mod input;
 pub mod mode;
 mod pane;
 mod panic;
+mod pipe;
 mod prompt;
 mod server;
 mod sys;

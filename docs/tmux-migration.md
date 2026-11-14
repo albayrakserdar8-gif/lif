@@ -23,13 +23,15 @@ unsupported command: run-shell
 ```
 
 A flag lif does not know fails the same way (`command split-window: unknown flag -e`).
-"Accepted and has no effect" below means the flag parses but the code does not
-use it.
+A few tmux flags that lif cannot honor fail with an explicit `not supported`
+error instead (`new-session -E`, `command-prompt -i`). The flags that are
+accepted without changing anything are listed in
+[Flags accepted without effect](#flags-accepted-without-effect).
 
 | tmux command | lif | Differences |
 |---|---|---|
-| `attach-session` (`attach`) | supported with differences | no `-E`, `-f`, `-r`, `-x` |
-| `bind-key` (`bind`) | supported with differences | mouse key names (`MouseDown1Pane`, ...) are rejected: mouse handling is built in |
+| `attach-session` (`attach`) | supported with differences | no `-E`, `-f`, `-r` |
+| `bind-key` (`bind`) | supported with differences | mouse key names (`MouseDown1Pane`, ...) are rejected: mouse handling is built in (see [Mouse](#mouse)) |
 | `break-pane` (`breakp`) | supported with differences | no `-W`, `-x`, `-y`, `-X`, `-Y` (floating panes) |
 | `capture-pane` (`capturep`) | supported with differences | has `-b -e -E -J -N -p -q -S -t`; no `-a`, `-C`, `-F`, `-H`, `-I`, `-L`, `-M`, `-P`, `-R`, `-T` |
 | `choose-buffer` | not supported | |
@@ -38,15 +40,15 @@ use it.
 | `clear-history` (`clearhist`) | not supported | |
 | `clear-prompt-history` (`clearphist`) | not supported | |
 | `clock-mode` | not supported | |
-| `command-prompt` | supported with differences | no `-b`, `-C`, `-e`, `-l` |
-| `confirm-before` (`confirm`) | supported with differences | `-b` is accepted and has no effect |
-| `copy-mode` | supported with differences | no `-k`, `-s`, `-S`; `-d` is accepted and has no effect |
+| `command-prompt` | supported with differences | no `-b`, `-C`, `-e`, `-l`; `-i` fails with `not supported` (incremental prompts exist only for copy-mode searches); `-P`, `-T` change nothing (see below) |
+| `confirm-before` (`confirm`) | supported with differences | `-b` changes nothing (see below) |
+| `copy-mode` | supported with differences | no `-k`, `-s`, `-S` |
 | `customize-mode` | not supported | |
 | `delete-buffer` (`deleteb`) | supported | |
-| `detach-client` (`detach`) | supported with differences | no `-E`; `-P` is accepted and has no effect |
+| `detach-client` (`detach`) | supported with differences | no `-E` |
 | `display-menu` (`menu`) | not supported | |
 | `display-message` (`display`) | supported with differences | has `-c -d -F -l -p -t`; no `-a`, `-C`, `-I`, `-j`, `-N`, `-v` |
-| `display-panes` (`displayp`) | supported with differences | no `-k`, `-s`, `-Z`; `-b` and `-N` are accepted and have no effect |
+| `display-panes` (`displayp`) | supported with differences | no `-k`, `-s`, `-Z` |
 | `display-popup` (`popup`) | not supported | |
 | `find-window` (`findw`) | not supported | |
 | `has-session` (`has`) | supported | |
@@ -61,7 +63,7 @@ use it.
 | `link-window` (`linkw`) | not supported | |
 | `list-buffers` (`lsb`) | supported with differences | no `-O` (sort order) |
 | `list-clients` (`lsc`) | supported with differences | no `-O` |
-| `list-commands` (`lscm`) | supported with differences | prints names and aliases only, no usage strings; `-F` is accepted and ignored |
+| `list-commands` (`lscm`) | supported with differences | prints names and aliases only, no usage strings; with `-F`, `#{command_list_usage}` is built from the flag table (`[-deHMqu] [-t value]`), without tmux's argument names |
 | `list-keys` (`lsk`) | supported with differences | no `-a`, `-F`, `-O`, `-r` |
 | `list-panes` (`lsp`) | supported with differences | no `-O`, `-r` |
 | `list-sessions` (`ls`) | supported with differences | no `-O`, `-r` |
@@ -73,7 +75,7 @@ use it.
 | `move-pane` (`movep`) | not supported | |
 | `move-window` (`movew`) | supported | |
 | `new-pane` (`newp`) | not supported | |
-| `new-session` (`new`) | supported with differences | no `-e`, `-f`, `-t` (no session groups); `-E` and `-X` are accepted and have no effect |
+| `new-session` (`new`) | supported with differences | no `-e`, `-f`, `-t` (no session groups); `-E` fails with `not supported` (lif has no `update-environment`) |
 | `new-window` (`neww`) | supported with differences | no `-e`, `-E` |
 | `next-layout` (`nextl`) | supported | |
 | `next-window` (`next`) | supported | |
@@ -94,13 +96,13 @@ use it.
 | `select-layout` (`selectl`) | supported | |
 | `select-pane` (`selectp`) | supported with differences | no `-d`, `-e` (input on/off), `-m`, `-M` (marked pane), `-T` (title) |
 | `select-window` (`selectw`) | supported | |
-| `send-keys` (`send`) | supported with differences | no `-c`, `-K`, `-M`; key names sent into a pane in copy mode do not drive copy mode reliably (use `-X`), see below |
+| `send-keys` (`send`) | supported with differences | no `-c`, `-K`, `-M` |
 | `send-prefix` | supported | |
 | `server-access` | not supported | |
 | `set-buffer` (`setb`) | supported with differences | no `-t`, `-w` |
 | `set-environment` (`setenv`) | not supported | |
 | `set-hook` | not supported | |
-| `set-option` (`set`) | supported with differences | only the options listed below; no `-p` (pane options), `-U`; `-o` refuses only user options (`set -o -g status-right x` overwrites, tmux says `already set`) |
+| `set-option` (`set`) | supported with differences | only the options listed below; no `-p` (pane options), `-U` |
 | `set-window-option` (`setw`) | supported | |
 | `show-buffer` (`showb`) | supported | |
 | `show-environment` (`showenv`) | not supported | |
@@ -115,7 +117,7 @@ use it.
 | `suspend-client` (`suspendc`) | not supported | |
 | `swap-pane` (`swapp`) | supported | |
 | `swap-window` (`swapw`) | supported | |
-| `switch-client` (`switchc`) | supported with differences | no `-E`, `-O`, `-r`; `-Z` is accepted and has no effect |
+| `switch-client` (`switchc`) | supported with differences | no `-E`, `-O`, `-r` |
 | `switch-mode` | not supported | |
 | `unbind-key` (`unbind`) | supported | |
 | `unlink-window` (`unlinkw`) | not supported | |
@@ -123,6 +125,21 @@ use it.
 
 The three commands `check-config`, `print-config` and `migrate-tmux-conf`
 are lif's own; they run without a server (see [configuration.md](configuration.md)).
+
+### Flags accepted without effect
+
+These parse and change nothing, because what they switch is how lif always
+behaves (or something lif does not have):
+
+- `confirm-before -b`: lif never makes the command that opened a prompt wait
+  for the answer (tmux waits unless `-b` is given).
+- `command-prompt -P`: tmux opens the prompt inside the pane; lif always uses
+  the status line.
+- `command-prompt -T`: the prompt type chooses Tab completions in tmux; lif's
+  prompt has no completion.
+- `lif -2`, `lif -u`: 256 colors and UTF-8 are always on.
+
+`display-panes -b` is not a tmux 3.8 flag and fails as unknown, as in tmux.
 
 ## Default prefix key table
 
@@ -238,9 +255,10 @@ The copy-mode tables are compared in [copy-mode.md](copy-mode.md#differences-fro
 
 ## Options
 
-lif has 60 options, all with tmux's names, scopes and (except for colors that
-tmux 3.8 expresses with theme colors) tmux 3.8's defaults, plus one of its
-own, `scrollback-bytes`. `set-option`, `set-window-option`, `show-options`
+lif has 62 options: 60 with tmux's names, scopes and (except for colors that
+tmux 3.8 expresses with theme colors, and `escape-time` and `history-limit`)
+tmux 3.8's defaults, plus two of its own, `scrollback-bytes` and
+`mouse-drag-end`. `set-option`, `set-window-option`, `show-options`
 and `show-window-options` work on them as in tmux, including `-g`, `-s`,
 `-w`, `-t`, `-u`, `-a`, `-q`, `-F` and toggling a flag by leaving
 out the value. User options (`@name`) can be set and read in formats.
@@ -254,6 +272,7 @@ silences it).
 | `base-index` | session | number | `0` | `base-index` |
 | `bell-action` | session | one of: none, any, current, other | `any` | `bell-action` |
 | `buffer-limit` | server | number | `50` | `buffer-limit` |
+| `copy-command` | server | string | (empty) | `copy-command` |
 | `copy-mode-current-match-style` | window | string | `bg=magenta,fg=black` | `[theme] current-match` |
 | `copy-mode-match-style` | window | string | `bg=cyan,fg=black` | `[theme] match` |
 | `default-command` | session | string | (empty) | `default-command` |
@@ -262,9 +281,9 @@ silences it).
 | `detach-on-destroy` | session | one of: off, on, no-detached, previous, next | `on` | `detach-on-destroy` |
 | `display-panes-time` | window | number | `1000` | `display-panes-time` |
 | `display-time` | session | number | `750` | `display-time` |
-| `escape-time` (accepted, ignored) | server | number | `10` | `escape-time` |
+| `escape-time` | server | number (ms) | `5` (tmux: `10`) | `escape-time` |
 | `exit-empty` | server | on/off | `on` | `exit-empty` |
-| `history-limit` (shown, not enforced) | session | number | `2000` | `history-limit` |
+| `history-limit` | session | number (lines) | `4000` (tmux: `2000`) | `history-limit` |
 | `main-pane-height` | window | cells or N% | `24` | `main-pane-height` |
 | `main-pane-width` | window | cells or N% | `80` | `main-pane-width` |
 | `message-style` | session | string | `bg=yellow,fg=black` | `[theme] message` |
@@ -273,6 +292,7 @@ silences it).
 | `monitor-activity` | window | on/off | `off` | `monitor-activity` |
 | `monitor-bell` | window | on/off | `on` | `monitor-bell` |
 | `mouse` | session | on/off | `on` | `mouse` |
+| `mouse-drag-end` (lif only) | session | one of: copy-pipe-and-cancel, copy-pipe-no-clear, none | `copy-pipe-and-cancel` | `mouse-drag-end` |
 | `other-pane-height` | window | cells or N% | `0` | `other-pane-height` |
 | `other-pane-width` | window | cells or N% | `0` | `other-pane-width` |
 | `pane-active-border-style` | window | string | `fg=green` | `[theme] active-border` |
@@ -283,7 +303,7 @@ silences it).
 | `remain-on-exit` | window | one of: off, on, failed | `off` | `remain-on-exit` |
 | `renumber-windows` | session | on/off | `off` | `renumber-windows` |
 | `repeat-time` | session | number | `500` | `repeat-time` |
-| `scrollback-bytes` | session | number | `10485760` | `scrollback` |
+| `scrollback-bytes` (lif only) | session | number (bytes) | `10485760` | `scrollback` |
 | `set-clipboard` | server | one of: off, external, on | `external` | `set-clipboard` |
 | `status` | session | one of: off, on | `on` | `[status] enabled` |
 | `status-interval` | session | number | `15` | `[status] interval` |
@@ -355,8 +375,9 @@ lif never reads `~/.tmux.conf`. `lif migrate-tmux-conf [file]` (default
 `~/.tmux.conf`) prints a `config.toml` on standard output and, on standard
 error, one line per command it did not translate, with the reason. It
 translates `set`/`set-option`/`setw` with `-g` or `-s` for options lif has,
-`bind`/`bind-key` with `-n`, `-r`, `-T`, `-N`, `unbind`, and comments
-directly above a translated line. It never guesses. It exits 0 even when
+`bind`/`bind-key` with `-n`, `-r`, `-T`, `-N`, `unbind`, a copy-mode table's
+`MouseDragEnd1Pane` (as `mouse-drag-end`), and comments directly above a
+translated line. It never guesses. It exits 0 even when
 lines were left out.
 
 Input, `tmux.conf`:
@@ -392,6 +413,7 @@ bind -n M-Left select-pane -L
 bind r source-file ~/.tmux.conf \; display "reloaded"
 bind -T copy-mode-vi v send -X begin-selection
 bind -T copy-mode-vi y send -X copy-pipe-and-cancel "pbcopy"
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
 
 set -g @plugin 'tmux-plugins/tpm'
 run '~/.tmux/plugins/tpm/tpm'
@@ -404,10 +426,11 @@ $ lif migrate-tmux-conf tmux.conf > ~/.config/lif/config.toml
 tmux.conf:12: not translated (lif has no option default-terminal): set -g default-terminal "tmux-256color"
 tmux.conf:13: not translated (set-option -a has no config.toml equivalent): set -ga terminal-overrides ",xterm-256color:Tc"
 tmux.conf:28: not translated (source-file of a tmux configuration file: lif reloads its own config.toml (source-file ~/.config/lif/config.toml)): bind r source-file ~/.tmux.conf \; display "reloaded"
-tmux.conf:32: not translated (user options (@name) have no config.toml equivalent): set -g @plugin 'tmux-plugins/tpm'
-tmux.conf:33: not translated (unsupported command: run-shell): run '~/.tmux/plugins/tpm/tpm'
-tmux.conf:34: not translated (unsupported command: if-shell): if-shell "test -f ~/.tmux.local" "source ~/.tmux.local"
-tmux.conf:35: not translated (unsupported command: set-hook): set-hook -g after-new-window 'display hi'
+tmux.conf:31: not translated (lif pipes mouse copies to the copy-command option, which also serves copy-pipe keys without a command of their own (Enter in vi, M-w in emacs): add copy-command = "pbcopy" if that is what you want): bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
+tmux.conf:33: not translated (user options (@name) have no config.toml equivalent): set -g @plugin 'tmux-plugins/tpm'
+tmux.conf:34: not translated (unsupported command: run-shell): run '~/.tmux/plugins/tpm/tpm'
+tmux.conf:35: not translated (unsupported command: if-shell): if-shell "test -f ~/.tmux.local" "source ~/.tmux.local"
+tmux.conf:36: not translated (unsupported command: set-hook): set-hook -g after-new-window 'display hi'
 ```
 
 The resulting `config.toml`:
@@ -423,6 +446,7 @@ pane-base-index = 1
 history-limit = 50000
 escape-time = 0
 mode-keys = "vi"
+mouse-drag-end = "copy-pipe-and-cancel"
 
 [status]
 # status line
@@ -454,13 +478,17 @@ after a migration:
 
 - The usual prefix recipe (`unbind C-b`, `bind C-a send-prefix`) is folded
   into `prefix = "C-a"`, which does both.
-- `history-limit = 50000` is carried over but lif does not enforce it.
-  Scrollback is limited by `scrollback` (bytes); set that instead, for example
-  `scrollback = "64MB"`.
-- `copy-pipe-and-cancel pbcopy` is translated, but lif ignores the command
-  argument: the selection goes to a lif buffer and to the terminal clipboard
-  through OSC 52. With a terminal that accepts OSC 52 the result is the same.
-- `escape-time` is accepted and ignored.
+- `history-limit = 50000` is carried over and enforced, but the byte budget
+  `scrollback` (10 MiB by default) holds as well, and at 200 columns 50000
+  lines count about 85 MB against it (compressed history still counts at its
+  uncompressed size). Raise it too, for example `scrollback = "128MB"`.
+- `copy-pipe-and-cancel pbcopy` runs `pbcopy` with the selection, as in
+  tmux; the selection also goes to a lif buffer and, through OSC 52, to the
+  terminal clipboard.
+- The mouse's `MouseDragEnd1Pane` binding becomes `mouse-drag-end`; its
+  `pbcopy` is reported because lif pipes mouse copies through
+  `copy-command`, which also serves the default copy keys. Add
+  `copy-command = "pbcopy"` to pipe every copy.
 - Reload bindings: `bind r source-file ~/.config/lif/config.toml`.
 - Plugins, `run-shell`, `if-shell` and hooks have no replacement.
 
@@ -472,29 +500,45 @@ after a migration:
   refuses `.conf` files and files of tmux commands with a pointer to
   `lif migrate-tmux-conf`. Errors in the file go to `show-messages`, and the
   rest of the file still applies.
-- **Scrollback.** Budgeted in bytes per pane (`scrollback-bytes`, default
-  10 MiB) instead of lines. How many lines that holds depends on the pane
-  width: in the benchmark, 5,688 lines at 200 columns after a 100 MB `cat`.
-  The engine allocates in pages, so very small budgets round up (a budget of
-  100000 bytes used 819200). As with tmux's `history-limit`, a new value
-  applies to panes created afterwards. `history-limit` is not enforced:
-  with `set -g history-limit 100`, a new pane kept 2,973 lines of `seq 1 3000`.
+- **Scrollback.** Two limits per pane, and both hold: `history-limit` in lines
+  (default 4000, twice tmux's 2000) and `scrollback-bytes` in memory (default
+  10 MiB, config key `scrollback`). The byte budget only matters for wide
+  panes or long histories: a line of history counts about 1.7 KB at 200
+  columns. After a 100 MB `cat` at 200 columns lif kept 3,784 lines (tmux
+  1,818). The engine allocates whole pages, so a small budget rounds up: with
+  `scrollback-bytes 100000`, `#{history_bytes}` showed 819200. Unlike tmux,
+  where a new `history-limit` only applies to panes created afterwards,
+  changing either limit also trims existing panes (`set -g history-limit 100`
+  left an existing pane with 96 lines of `seq 1 3000`).
 - **Environment inside panes.** `TERM=xterm-256color`, `COLORTERM=truecolor`,
   `TERM_PROGRAM=lif`, `TERM_PROGRAM_VERSION`, `LIF` and `LIF_PANE`; no
   `TMUX` or `TMUX_PANE`. Scripts that test `$TMUX` to detect a multiplexer
   need to test `$LIF` too.
-- **lif inside a pane.** `lif` run in a pane knows which pane it is in
-  (`lif split-window` splits that pane), but it finds the server through the
-  default socket (or `-S`, `-L`, `$LIF_SOCKET`), not through `$LIF` as tmux
-  does with `$TMUX`. For a server on a non-default socket, pass `-S` again.
-- **Escape key.** No `escape-time`. With a terminal that speaks the kitty
-  keyboard protocol, Escape is delivered immediately; otherwise a lone ESC
-  waits 5 ms (fixed). Measured: 5.8 ms median, against 11 ms for tmux's default
-  `escape-time 10`.
-- **Clipboard.** `set-clipboard` defaults to `external`, as in tmux: copies
-  from copy mode set the terminal clipboard (OSC 52), and OSC 52 from programs
-  in panes is forwarded to the terminal but not stored as a lif buffer (`on`
-  stores it too, `off` forwards nothing). `copy-pipe` commands are not run.
+- **lif inside a pane.** As tmux uses `$TMUX`, `lif` finds its server through
+  `$LIF` (the socket path is its first comma-separated field) and knows which
+  pane it runs in (`lif split-window` splits that pane). The socket is chosen
+  in this order: `-S`, then `-L`, then `$LIF`, then `$LIF_SOCKET`, then the
+  default socket (as tmux: `-S`, `-L`, `$TMUX`, then `$TMUX_TMPDIR` or the
+  default). An empty variable counts as unset.
+- **Escape key.** `escape-time` works as in tmux but defaults to 5 ms (tmux:
+  10): a lone ESC from a terminal using the legacy encoding waits that long for
+  the rest of a sequence, and 0 means no wait (a split Alt+key then arrives as
+  Escape and the key, as in tmux). With a terminal that speaks the kitty
+  keyboard protocol, which lif turns on when the terminal answers, Escape is
+  unambiguous and never waits, whatever `escape-time` says. Measured (one
+  run): 6.3 ms median with the defaults against tmux's 11.7 ms; 157 us with
+  `escape-time 0` (tmux 1.4 ms); 162 us with the kitty protocol.
+- **Clipboard.** `set-clipboard` defaults to `external`. Copies from copy
+  mode always become a paste buffer and, unless the option is `off`, reach
+  the terminal clipboard (OSC 52). OSC 52 from programs in panes: `on`
+  forwards it to the terminal and keeps it as a buffer, `external` forwards
+  it without keeping it, `off` ignores it. This `external` differs from
+  tmux 3.8's, which ignores the program's OSC 52 entirely (checked: with
+  `external`, tmux sent nothing to the terminal); use `off` if programs in
+  panes must not set the clipboard. `copy-pipe` runs its command with the
+  copied text on standard input (`/bin/sh -c`, in the pane's directory),
+  and so does the `copy-command` option for `copy-pipe` without a command,
+  as in tmux.
 - **Notifications.** OSC 9, OSC 777 and OSC 99 desktop notifications from
   panes are forwarded to the attached terminals as OSC 9.
 - **Mouse.** <a id="mouse"></a>On by default (as in tmux 3.8) and handled
@@ -502,20 +546,19 @@ after a migration:
   selects it, dragging a border resizes, the wheel scrolls (entering copy mode,
   which it leaves at the bottom; in full-screen programs without mouse support
   it sends arrow keys), dragging in a pane selects text and copies it on
-  release, and programs that request the mouse get it. Differences: mouse
-  events cannot be bound (`bind -n MouseDown1Pane ...` fails with
-  `unknown key: MouseDown1Pane`); after a drag-copy lif stays in copy mode
-  with the selection shown (tmux exits); double- and triple-click select a word
-  or line only when the pane is already in copy mode; there are no
-  right-click menus.
+  release (then leaves copy mode, as tmux), double and triple click copy a
+  word or a line, and programs that request the mouse get it. Differences:
+  mouse events cannot be bound (`bind -n MouseDown1Pane ...` fails with
+  `unknown key: MouseDown1Pane`); what tmux users change by rebinding
+  `MouseDragEnd1Pane` is the `mouse-drag-end` option (`copy-pipe-no-clear`
+  stays in copy mode with the selection shown, `none` only selects); after a
+  double or triple click lif copies at once, where tmux shows the selection
+  for 0.3 s first; there are no right-click menus.
 - **No shell from lif.** `#()` in the status line is empty, so status bars
   built on shell commands (battery, load, git) need another approach.
 - **Status line styles.** `fg=`, `bg=`, `us=` and attributes work;
   `align=`, `fill=`, `list=`, `range=` and theme colors (`themegreen`)
   are not supported.
-- **`send-keys` into copy mode.** `send-keys -X command` works. Sending key
-  names to a pane in copy mode (`send-keys k V Enter`) does not act like
-  pressing those keys: in a test, `q` left copy mode but `V` and `Enter` did
-  not select or copy. Use `-X` in scripts.
-- **`list-commands`** prints names and aliases, not usage lines.
+- **`list-commands`** prints names and aliases, not usage lines; with `-F`,
+  `#{command_list_usage}` is built from lif's flag table.
 - **Prefix `?`** shows the complete `list-keys` output of all tables.

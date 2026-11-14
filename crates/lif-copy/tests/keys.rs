@@ -34,7 +34,8 @@ fn every_tmux_default_binding_is_present() {
         let code = KeyCode::parse(&key).unwrap_or_else(|| panic!("{key}"));
         let got = table.get(&code);
         let want = if let Some(cmd) = rest.strip_prefix("send-keys -X ") {
-            Command::from_name(cmd.trim()).map(Action::Command)
+            let pipe = cmd.trim().starts_with("copy-pipe");
+            Command::from_name(cmd.trim()).map(if pipe { Action::Pipe } else { Action::Command })
         } else if rest.starts_with("send-keys -FX search-forward") {
             Some(Action::SearchWord { forward: true })
         } else if rest.starts_with("send-keys -FX search-backward") {
@@ -124,7 +125,8 @@ fn counts_jumps_prompts_and_exit_vi() {
     // Space, motion, Enter copies and exits.
     keys(&mut m, &mut v, &["g", "Space", "e"]);
     let o = m.handle_key(&key("Enter"), &mut v);
-    assert_eq!(o, Outcome::Copy { data: b"alpha".to_vec(), append: false, exit: true });
+    // Enter is copy-pipe-and-cancel: piped to copy-command when one is set.
+    assert_eq!(o, Outcome::Copy { data: b"alpha".to_vec(), append: false, exit: true, pipe: true });
     assert_eq!(m.handle_key(&key("q"), &mut v), Outcome::Exit);
     assert_eq!(m.handle_key(&key("C-c"), &mut v), Outcome::Exit);
     // Unbound keys do nothing and drop a pending count.

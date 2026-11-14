@@ -159,3 +159,38 @@ fn socket_label() {
     assert_eq!(std::fs::metadata(sock.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
     assert!(run(&["kill-server"]).status.success());
 }
+
+/// detach-client -P: the client detaches and its parent process (the
+/// shell that ran it) gets SIGHUP.
+#[test]
+fn detach_client_p_hangs_up_the_parent() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "hup"]);
+    let flag = env.home.join("hup.flag");
+    let script = format!(
+        "trap 'echo hup > {}; exit 0' HUP; {BIN} -S {} attach -t hup; sleep 10 & wait",
+        flag.display(),
+        env.sock.display()
+    );
+    let mut t = Term::spawn_argv(&env, vec!["/bin/sh".into(), "-c".into(), script.into()], Size::new(80, 24), &[]);
+    t.wait_text("[hup]");
+    env.ok(&["detach-client", "-P", "-s", "hup"]);
+    assert!(env.wait(secs(10), || flag.exists()), "the client's parent got no SIGHUP");
+    t.wait_exit();
+    // Without -P the parent lives on.
+    let flag2 = env.home.join("hup2.flag");
+    let script = format!(
+        "trap 'echo hup > {}; exit 0' HUP; {BIN} -S {} attach -t hup; echo detached > {}; sleep 0.5 & wait",
+        flag.display(),
+        env.sock.display(),
+        flag2.display()
+    );
+    std::fs::remove_file(&flag).unwrap();
+    let mut t = Term::spawn_argv(&env, vec!["/bin/sh".into(), "-c".into(), script.into()], Size::new(80, 24), &[]);
+    t.wait_text("[hup]");
+    env.ok(&["detach-client", "-s", "hup"]);
+    // The shell outlives the client and ends on its own.
+    assert_eq!(t.wait_exit(), 0);
+    assert!(flag2.exists(), "client did not detach");
+    assert!(!flag.exists(), "SIGHUP without -P");
+}
