@@ -1,0 +1,548 @@
+//! The runtime state the model does not own, and lif-core's `Host` trait
+//! on it.
+
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use lif_core::{
+    CaptureRange, ClientId, CopyModeOptions, DetachReason, Host, LinePos, PaneId, PaneInfo, PaneInput, Prompt, Redraw,
+    SessionId, SpawnCommand, SpawnSpec,
+};
+use lif_input::{CapsProbe, InputParser};
+use lif_proto::{ExitReason, ServerMsg};
+use lif_pty::{ChildReaper, Pty, SpawnOptions};
+use lif_render::Renderer;
+use lif_types::{PaneFrame, PixelSize, Size, Span, StyledLine};
+use lif_vt::{Rgb, TextRange, VtEngine, VtOptions};
+use mio::unix::SourceFd;
+use mio::{Interest, Registry, Token};
+
+use crate::client::{Attached, ClientRt, DisplayPanes, Message, emergency_bytes, leave_bytes};
+use crate::mode::{Engine, ModeCtx, new_copy_mode};
+use crate::pane::PaneRt;
+use crate::prompt::{PromptState, message_style};
+
+pub(crate) const PANE_TOKEN: usize = 1 << 32;
+pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
+
+/// `TERM` inside panes. xterm-256color has a terminfo entry on every
+/// system (unlike a `lif` entry would), and libghostty-vt implements the
+/// xterm control set, so what terminfo promises is what the pane does.
+pub(crate) const PANE_TERM: &str = "xterm-256color";
+
+/// Variables a pane never inherits: they would make programs think they
+/// run directly under another multiplexer.
+const ENV_REMOVE: &[&str] = &["TMUX", "TMUX_PANE"];
+
+pub(crate) struct Rt {
+    pub(crate) registry: Registry,
+    pub(crate) panes: HashMap<PaneId, PaneRt>,
+    pub(crate) pids: HashMap<u32, PaneId>,
+    pub(crate) clients: BTreeMap<ClientId, ClientRt>,
+    pub(crate) reaper: ChildReaper,
+    pub(crate) socket: String,
+    pub(crate) server_pid: u32,
+    /// The outer terminal's default colors, as the latest probe found them.
+    pub(crate) default_colors: (Option<Rgb>, Option<Rgb>),
+    /// Environment for new panes, refreshed from the client on every attach.
+    pub(crate) session_env: HashMap<SessionId, Vec<(String, String)>>,
+    /// The terminal of a pane killed for `respawn-pane`, kept until the
+    /// model call that killed it returns.
+    pub(crate) respawn_stash: Option<(PaneId, Engine, PaneFrame)>,
+    /// Client views must be recomputed from the model.
+    pub(crate) views_stale: bool,
+    pub(crate) shutdown: bool,
+    pub(crate) prompt_history: Vec<String>,
+    pub(crate) scratch: Vec<u8>,
+    pub(crate) server_env_zellij: Vec<OsString>,
+}
+
+pub(crate) fn pane_token(p: PaneId) -> Token {
+    Token(PANE_TOKEN | p.0 as usize)
+}
+
+impl Rt {
+    pub(crate) fn new(registry: Registry, reaper: ChildReaper, socket: String) -> Self {
+        let server_env_zellij = std::env::vars_os().map(|(k, _)| k).filter(|k| k.to_string_lossy().starts_with("ZELLIJ")).collect();
+        Rt {
+            registry,
+            panes: HashMap::new(),
+            pids: HashMap::new(),
+            clients: BTreeMap::new(),
+            reaper,
+            socket,
+            server_pid: std::process::id(),
+            default_colors: (None, None),
+            session_env: HashMap::new(),
+            respawn_stash: None,
+            views_stale: true,
+            shutdown: false,
+            prompt_history: Vec::new(),
+            scratch: Vec::new(),
+            server_env_zellij,
+        }
+    }
+
+    /// Queue bytes for a pane's program and try to write them now.
+    pub(crate) fn write_pane(&mut self, pane: PaneId, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if p.pty.is_none() {
+            return;
+        }
+        p.wq.push(bytes);
+        self.flush_pane(pane);
+    }
+
+    /// Write a pane's queue and keep WRITABLE interest in step with it.
+    pub(crate) fn flush_pane(&mut self, pane: PaneId) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        let Some(pty) = p.pty.as_mut() else { return };
+        let want = match p.wq.flush(pty) {
+            Ok(done) => !done,
+            Err(_) => {
+                // The program is gone; its exit is reported by the reaper.
+                p.wq = Default::default();
+                false
+            }
+        };
+        if want != p.want_write {
+            p.want_write = want;
+            let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+            let _ = self.registry.reregister(&mut SourceFd(&p.raw_fd()), pane_token(pane), interest);
+        }
+    }
+
+    /// Flush a client's output and keep WRITABLE interest in step with it.
+    pub(crate) fn flush_client(&mut self, id: ClientId) {
+        let Some(c) = self.clients.get_mut(&id) else { return };
+        match c.flush() {
+            Ok(pending) => {
+                if pending != c.want_write {
+                    c.want_write = pending;
+                    let interest = if pending { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+                    let _ = self.registry.reregister(&mut c.stream, c.token, interest);
+                }
+                if !pending && c.closing {
+                    c.dead = true;
+                }
+            }
+            Err(e) => {
+                log!("client {id}: write failed: {e}");
+                c.dead = true;
+            }
+        }
+    }
+
+    pub(crate) fn send_output(&mut self, id: ClientId, bytes: &[u8]) {
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.send_output(bytes);
+        }
+        self.flush_client(id);
+    }
+
+    pub(crate) fn needs_frame(&mut self, id: ClientId) {
+        if let Some(a) = self.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+            a.needs_frame = true;
+        }
+    }
+
+    pub(crate) fn mark_all(&mut self, status: bool) {
+        for c in self.clients.values_mut() {
+            if let Some(a) = c.att.as_mut() {
+                a.needs_frame = true;
+                a.status_stale |= status;
+            }
+        }
+    }
+
+    fn pane_env(&self, spec: &SpawnSpec) -> Vec<(OsString, OsString)> {
+        let mut env: Vec<(OsString, OsString)> = Vec::new();
+        let from_client = spec.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.hello.as_ref()).map(|h| &h.env);
+        let session = self.session_env.get(&spec.session);
+        let base: &[(String, String)] = match (session, from_client) {
+            (Some(s), _) => s,
+            (None, Some(c)) => c,
+            (None, None) => &[],
+        };
+        for (k, v) in base {
+            if k.is_empty() || k.contains('=') || k == "TERM" || k.starts_with("LIF") || k.starts_with("TMUX") || k.starts_with("ZELLIJ") {
+                continue;
+            }
+            env.push((k.into(), v.into()));
+        }
+        let mut set = |k: &str, v: String| {
+            env.retain(|(x, _)| x != k);
+            env.push((k.into(), v.into()));
+        };
+        set("COLORTERM", "truecolor".into());
+        set("TERM_PROGRAM", "lif".into());
+        set("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION").into());
+        set("LIF", format!("{},{},{}", self.socket, self.server_pid, spec.session.0));
+        set("LIF_PANE", spec.pane.to_string());
+        if let SpawnCommand::LoginShell { shell } = &spec.command {
+            set("SHELL", shell.clone());
+        }
+        env
+    }
+
+    fn attach_new(&mut self, client: ClientId, session: SessionId) {
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        let hello = c.hello.clone().unwrap_or_default();
+        let var = |k: &str| hello.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str()).unwrap_or("");
+        let probe = CapsProbe::from_env(&hello.term, var("COLORTERM"), var("TERM_PROGRAM"));
+        let caps = probe.caps();
+        let mut att = Box::new(Attached {
+            session,
+            parser: InputParser::new(),
+            probe,
+            renderer: Renderer::new(caps),
+            enter_caps: caps,
+            kitty_pushed: false,
+            events: Vec::new(),
+            input_deadline: None,
+            key_deadline: None,
+            needs_frame: true,
+            last_frame: None,
+            frame_deadline: None,
+            view: None,
+            status: StyledLine::new(),
+            status_stale: true,
+            clock: false,
+            clock_deadline: None,
+            message: None,
+            prompt: None,
+            prompt_line: StyledLine::new(),
+            display_panes: None,
+            mouse: (false, false),
+            mouse_opt: false,
+            drag: None,
+            focused: true,
+            active_pane: None,
+            paste: None,
+            clip_reads: Default::default(),
+        });
+        c.send(&ServerMsg::Attached);
+        let mut b = Vec::new();
+        lif_input::write_queries(&mut b);
+        lif_input::write_enter(&caps, &mut b);
+        c.send_output(&b);
+        crate::panic::set(std::os::fd::AsRawFd::as_raw_fd(&c.stream), emergency_bytes(&att));
+        att.needs_frame = true;
+        c.att = Some(att);
+        self.session_env.insert(session, hello.env.clone());
+        self.flush_client(client);
+    }
+}
+
+impl PaneRt {
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.pty.as_ref().map(std::os::fd::AsRawFd::as_raw_fd).unwrap_or(-1)
+    }
+}
+
+fn exit_message(reason: &DetachReason) -> (ExitReason, String) {
+    match reason {
+        DetachReason::Detached { session } => (ExitReason::Detached, format!("[detached (from session {session})]")),
+        DetachReason::Kicked { session } => (ExitReason::Kicked, format!("[detached (from session {session})]")),
+        DetachReason::SessionEnded => (ExitReason::SessionEnded, "[exited]".into()),
+        DetachReason::ServerExit => (ExitReason::ServerExit, "[server exited]".into()),
+    }
+}
+
+impl Host for Rt {
+    fn spawn_pane(&mut self, spec: &SpawnSpec) -> Result<(), String> {
+        let argv: Vec<OsString> = match &spec.command {
+            SpawnCommand::LoginShell { .. } => Vec::new(),
+            SpawnCommand::Shell { shell, command } => vec![shell.into(), "-c".into(), command.into()],
+            SpawnCommand::Argv(v) => v.iter().map(OsString::from).collect(),
+        };
+        let mut env_remove: Vec<OsString> = ENV_REMOVE.iter().map(OsString::from).collect();
+        env_remove.extend(self.server_env_zellij.iter().cloned());
+        let opts = SpawnOptions {
+            argv,
+            cwd: (!spec.cwd.is_empty()).then(|| PathBuf::from(&spec.cwd)),
+            env: self.pane_env(spec),
+            env_remove,
+            term: PANE_TERM.into(),
+            size: spec.size,
+            pixels: PixelSize::default(),
+        };
+        let stash = match self.respawn_stash.take() {
+            Some((p, e, f)) if spec.respawn && p == spec.pane => Some((e, f)),
+            other => {
+                self.respawn_stash = other;
+                None
+            }
+        };
+        let (mut engine, frame) = match stash {
+            Some(x) => x,
+            None => {
+                let vo = VtOptions {
+                    size: spec.size,
+                    pixels: PixelSize::default(),
+                    scrollback_bytes: if spec.history_limit == 0 { 0 } else { spec.scrollback_bytes },
+                    default_fg: self.default_colors.0,
+                    default_bg: self.default_colors.1,
+                    default_cursor: None,
+                };
+                let e = Engine::new(&vo).map_err(|e| e.to_string())?;
+                (e, PaneFrame::new(spec.size))
+            }
+        };
+        if engine.size() != spec.size {
+            engine.resize(spec.size, PixelSize::default());
+        }
+        let pty = Pty::spawn(&opts).map_err(|e| e.to_string())?;
+        let pid = pty.pid();
+        self.reaper.watch(pid);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
+        if let Err(e) = self.registry.register(&mut SourceFd(&fd), pane_token(spec.pane), Interest::READABLE) {
+            // Dropping the PTY hangs the child up; the reaper collects it.
+            crate::sys::kill_group(pid, libc::SIGHUP);
+            drop(pty);
+            return Err(e.to_string());
+        }
+        log!("pane {} spawned pid {pid} size {}x{}", spec.pane, spec.size.cols, spec.size.rows);
+        self.pids.insert(pid, spec.pane);
+        let mut p = PaneRt::new(spec.pane, pty, engine, frame, spec.size);
+        p.current_path = spec.cwd.clone();
+        self.panes.insert(spec.pane, p);
+        // The child may have exited before it was watched.
+        self.views_stale = true;
+        Ok(())
+    }
+
+    fn kill_pane(&mut self, pane: PaneId) {
+        let Some(mut p) = self.panes.remove(&pane) else { return };
+        log!("pane {pane} killed");
+        if let Some(pty) = p.pty.take() {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
+            let _ = self.registry.deregister(&mut SourceFd(&fd));
+            if self.pids.remove(&p.pid).is_some() {
+                crate::sys::kill_group(p.pid, libc::SIGHUP);
+            }
+            drop(pty);
+        }
+        self.pids.retain(|_, v| *v != pane);
+        p.mode = None;
+        self.respawn_stash = Some((pane, p.engine, p.frame));
+        self.views_stale = true;
+    }
+
+    fn resize_pane(&mut self, pane: PaneId, size: Size) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if size.is_empty() {
+            return;
+        }
+        p.size = size;
+        p.engine.resize(size, PixelSize::default());
+        if let Some(pty) = p.pty.as_ref() {
+            let _ = pty.resize(size, PixelSize::default());
+        }
+        p.update_mode();
+        self.views_stale = true;
+    }
+
+    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) {
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        if let Some(p) = self.panes.get_mut(&pane) {
+            match input {
+                PaneInput::Key(k) => {
+                    if let Some(m) = p.mode.as_mut() {
+                        let a = m.key(k, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
+                        if a == crate::mode::ModeAction::Exit {
+                            p.leave_mode();
+                        }
+                    } else {
+                        p.engine.encode_key(k, &mut buf);
+                    }
+                }
+                PaneInput::Text(t) => buf.extend_from_slice(t.as_bytes()),
+                PaneInput::Bytes(b) => buf.extend_from_slice(b),
+                PaneInput::Paste { data, bracketed } => {
+                    if bracketed {
+                        p.engine.encode_paste(data, &mut buf);
+                    } else {
+                        buf.extend_from_slice(data);
+                    }
+                }
+                PaneInput::Reset => {
+                    p.engine.feed(b"\x1bc");
+                    let mut junk = Vec::new();
+                    p.engine.drain_replies(&mut junk);
+                }
+            }
+        }
+        self.write_pane(pane, &buf);
+        self.scratch = buf;
+    }
+
+    fn pane_info(&self, pane: PaneId) -> PaneInfo<'_> {
+        let Some(p) = self.panes.get(&pane) else { return PaneInfo::default() };
+        let path = if p.current_path.is_empty() { p.engine.pwd() } else { p.current_path.as_str() };
+        PaneInfo {
+            pid: p.pid,
+            title: p.engine.title(),
+            current_command: &p.current_command,
+            current_path: path,
+            history_size: p.engine.scrollback_rows(),
+            history_bytes: p.engine.memory().resident_bytes,
+            in_mode: p.mode.is_some(),
+        }
+    }
+
+    fn capture_pane(&self, pane: PaneId, range: CaptureRange) -> String {
+        let Some(p) = self.panes.get(&pane) else { return String::new() };
+        let hist = p.engine.scrollback_rows() as i64;
+        let rows = p.size.rows as i64;
+        let total = hist + rows;
+        let pos = |l: LinePos| -> i64 {
+            let v = match l {
+                LinePos::HistoryStart => 0,
+                LinePos::ScreenEnd => total - 1,
+                LinePos::Line(n) => hist + n,
+            };
+            v.clamp(0, (total - 1).max(0))
+        };
+        let (mut a, mut b) = (pos(range.start), pos(range.end));
+        if b < a {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let text = p.engine.text(TextRange::Rows { start: a as usize, end: b as usize + 1 }, range.join_wrapped);
+        let mut out = String::with_capacity(text.len() + 64);
+        let mut lines = 0i64;
+        if !text.is_empty() {
+            for line in text.split('\n') {
+                out.push_str(if range.keep_trailing { line } else { line.trim_end_matches(' ') });
+                out.push('\n');
+                lines += 1;
+            }
+        }
+        if !range.join_wrapped {
+            while lines < b - a + 1 {
+                out.push('\n');
+                lines += 1;
+            }
+        }
+        out
+    }
+
+    fn attach_client(&mut self, client: ClientId, session: SessionId) {
+        let attached = self.clients.get(&client).is_some_and(|c| c.att.is_some());
+        if attached {
+            let hello_env = self.clients.get(&client).and_then(|c| c.hello.as_ref()).map(|h| h.env.clone());
+            if let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) {
+                a.session = session;
+                a.renderer.invalidate();
+                a.needs_frame = true;
+                a.status_stale = true;
+                a.prompt = None;
+                a.display_panes = None;
+            }
+            if let Some(env) = hello_env {
+                self.session_env.insert(session, env);
+            }
+        } else {
+            self.attach_new(client, session);
+        }
+        log!("client {client} attached to session {session}");
+        self.views_stale = true;
+    }
+
+    fn detach_client(&mut self, client: ClientId, reason: DetachReason) {
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        let (why, message) = exit_message(&reason);
+        if let Some(mut att) = c.att.take() {
+            let mut b = Vec::new();
+            leave_bytes(&mut att, &mut b);
+            c.send_output(&b);
+            crate::panic::remove(std::os::fd::AsRawFd::as_raw_fd(&c.stream));
+        }
+        c.send(&ServerMsg::Exit { reason: why, message });
+        c.closing = true;
+        log!("client {client} detached: {reason:?}");
+        self.flush_client(client);
+        self.views_stale = true;
+    }
+
+    fn enter_copy_mode(&mut self, _client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if opts.cancel {
+            p.leave_mode();
+        } else if let Some(m) = p.mode.as_mut() {
+            m.reenter(opts, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
+        } else {
+            let m = new_copy_mode(opts, &mut ModeCtx { engine: &mut p.engine, rows: p.size.rows });
+            p.mode = Some(m);
+        }
+        self.views_stale = true;
+        self.mark_all(true);
+    }
+
+    fn show_message(&mut self, client: ClientId, text: &str, duration_ms: u64) {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
+        let line = vec![Span::new(text.replace(['\n', '\r'], " "), message_style())];
+        let expires = (duration_ms > 0).then(|| Instant::now() + std::time::Duration::from_millis(duration_ms));
+        a.message = Some(Message { line, expires });
+        a.needs_frame = true;
+    }
+
+    fn prompt(&mut self, client: ClientId, prompt: Prompt) {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
+        a.prompt = Some(PromptState::new(prompt));
+        a.needs_frame = true;
+    }
+
+    fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str) {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
+        let labels = a
+            .view
+            .as_ref()
+            .map(|v| v.panes.iter().enumerate().map(|(i, (p, _))| (*p, i.to_string())).collect())
+            .unwrap_or_default();
+        a.display_panes = Some(DisplayPanes {
+            expires: Instant::now() + std::time::Duration::from_millis(duration_ms.max(1)),
+            template: template.to_string(),
+            labels,
+        });
+        a.needs_frame = true;
+    }
+
+    fn bell(&mut self, client: ClientId) {
+        self.send_output(client, b"\x07");
+    }
+
+    fn redraw(&mut self, what: Redraw) {
+        self.views_stale = true;
+        match what {
+            Redraw::Client(c) => {
+                if let Some(a) = self.clients.get_mut(&c).and_then(|c| c.att.as_mut()) {
+                    a.needs_frame = true;
+                    a.status_stale = true;
+                }
+            }
+            Redraw::Status(s) | Redraw::Session(s) => {
+                for c in self.clients.values_mut() {
+                    if let Some(a) = c.att.as_mut()
+                        && a.session == s
+                    {
+                        a.needs_frame = true;
+                        a.status_stale = true;
+                    }
+                }
+            }
+            Redraw::Window(_) => self.mark_all(true),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        log!("model asked for shutdown");
+        self.shutdown = true;
+    }
+}

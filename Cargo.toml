@@ -19,6 +19,9 @@ lif-client = { path = "crates/lif-client" }
 lif-core = { path = "crates/lif-core" }
 lif-input = { path = "crates/lif-input" }
 lif-render = { path = "crates/lif-render" }
+lif-server = { path = "crates/lif-server" }
+lif-copy = { path = "crates/lif-copy" }
+lif-config = { path = "crates/lif-config" }
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # libghostty-vt 1.0.1 (needs Zig 0.17 on PATH at build time). The crates.io

@@ -192,6 +192,27 @@ pub trait VtEngine: Sized {
     /// program enabled them and making it safe otherwise.
     fn encode_paste(&mut self, data: &[u8], out: &mut Vec<u8>);
 
+    /// Encode one piece of a paste that arrives in pieces (a bracketed
+    /// paste from the outer terminal, streamed through with bounded
+    /// memory): what [`VtEngine::encode_paste`] does to the text, but
+    /// without the bracketed-paste markers. The caller writes `ESC [ 200 ~`
+    /// once before the first piece and `ESC [ 201 ~` after the last when
+    /// [`PaneModes::bracketed_paste`] was on at the start.
+    fn encode_paste_chunk(&mut self, data: &[u8], out: &mut Vec<u8>) {
+        const START: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+        let at = out.len();
+        self.encode_paste(data, out);
+        // encode_paste never lets ESC through from the data (that is what
+        // makes a paste safe), so markers can only be its own framing.
+        if out[at..].ends_with(END) {
+            out.truncate(out.len() - END.len());
+        }
+        if out[at..].starts_with(START) {
+            out.drain(at..at + START.len());
+        }
+    }
+
     /// Encode a focus change; appends nothing unless focus events are on.
     fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>);
 

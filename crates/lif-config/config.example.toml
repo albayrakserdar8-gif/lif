@@ -1,0 +1,198 @@
+# lif configuration file
+#
+# lif reads this file once, when the server starts, from the first of:
+#   $LIF_CONFIG
+#   $XDG_CONFIG_HOME/lif/config.toml
+#   ~/.config/lif/config.toml
+# A missing file is fine. Mistakes are reported when the server starts
+# (file:line:column and what was expected) and never stop lif from starting;
+# everything else in the file still applies.
+#
+# Every value below is lif's default, so this file changes nothing until you
+# edit it: keep what you change, delete the rest. Each setting is the same as
+# running a tmux command at startup; the command is shown after "=>".
+# Key bindings use tmux key names and tmux command strings.
+
+# ---------------------------------------------------------------- prefix ----
+
+# The prefix key. Changing it is the whole job: the new key also sends
+# itself to the pane when pressed twice, and C-b is freed.
+#   prefix = "C-a"  =>  set -g prefix C-a; unbind C-b; bind C-a send-prefix
+prefix = "C-b"
+
+# A second prefix key, or false for none.  => set -g prefix2 None
+prefix2 = false
+
+# Milliseconds during which a repeatable binding (repeat = true below) can be
+# pressed again without the prefix. 0 disables repeating.
+repeat-time = 500
+
+# --------------------------------------------------------- general ----------
+
+# Mouse: click to select panes, drag borders, scroll.  => set -g mouse on
+mouse = true
+
+# Copy mode keys: "emacs" or "vi" (the copy-mode or copy-mode-vi table).
+mode-keys = "emacs"
+
+# Whether copying sets the outer terminal's clipboard (OSC 52):
+# "off", "external" (lif sets it, programs in panes may not) or "on".
+set-clipboard = "external"
+
+# Scrollback kept per pane, in bytes. Accepts sizes: "512KB", "32MB", "1GB"
+# (1 KB = 1024 bytes).  => set -g scrollback-bytes 10485760
+scrollback = "10MB"
+
+# tmux's scrollback limit in lines, kept for scripts that read it; lif
+# budgets scrollback in bytes (above).
+history-limit = 2000
+
+# The shell new panes run (an absolute path), and a command to run instead
+# of a login shell. Both default to what the server starts with.
+# default-shell = "/bin/zsh"
+# default-command = ""
+
+# Milliseconds messages stay on the status line.
+display-time = 750
+
+# Milliseconds pane numbers stay up (display-panes, prefix q).
+display-panes-time = 1000
+
+# Accepted for tmux compatibility; lif never waits after Escape.
+escape-time = 10
+
+# Stop the server when the last session closes.
+exit-empty = true
+
+# How many paste buffers to keep.
+buffer-limit = 50
+
+# What happens when a session's last window closes for attached clients:
+# "off", "on" (detach), "no-detached", "previous" or "next" (switch session).
+detach-on-destroy = "on"
+
+# ------------------------------------------------------ windows and panes ---
+
+# Number of the first window and the first pane.
+base-index = 0
+pane-base-index = 0
+
+# Renumber windows to close gaps when one closes.
+renumber-windows = false
+
+# Name windows after the program running in them, using this format.
+automatic-rename = true
+automatic-rename-format = "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"
+
+# Keep a pane open when its program exits: "off", "on" or "failed" (only on
+# a non-zero exit status).
+remain-on-exit = "off"
+
+# Bells and activity: which windows' bells reach you ("none", "any",
+# "current", "other"), whether a bell is also shown as a message ("off",
+# "on", "both"), and which windows are watched for bells and output.
+bell-action = "any"
+visual-bell = "off"
+monitor-bell = true
+monitor-activity = false
+
+# Size of sessions created without a client, and how a window shared by
+# clients of different sizes is sized: "largest", "smallest", "manual" or
+# "latest" (the client that was active last).
+default-size = "80x24"
+window-size = "latest"
+
+# Layout sizes for main-horizontal / main-vertical, in cells or "50%".
+main-pane-width = 80
+main-pane-height = 24
+other-pane-width = 0
+other-pane-height = 0
+
+# Most columns the tiled layout uses (0: no limit).
+tiled-layout-max-columns = 0
+
+# ---------------------------------------------------------- status line -----
+
+[status]
+# Show the status line. (status = false at the top of the file also works.)
+enabled = true
+# "top" or "bottom".
+position = "bottom"
+# Where the window list goes: "left", "centre", "right", "absolute-centre".
+justify = "left"
+# Seconds between status line refreshes (for clocks); 0 for never.
+interval = 15
+# Left and right parts: tmux formats, at most this many columns each.
+left = "[#{session_name}] "
+left-length = 10
+right = '#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:pane_title}" %H:%M %d-%b-%y'
+right-length = 40
+# How each window is shown in the list, and what goes between them.
+window-format = "#I:#W#{?window_flags,#{window_flags}, }"
+current-window-format = "#I:#W#{?window_flags,#{window_flags}, }"
+separator = " "
+
+# ---------------------------------------------------------------- theme -----
+
+# Styles, as a table or as a tmux style string ("fg=black,bg=green,bold").
+# Table keys:
+#   fg, bg, underline-color   "black" "red" "green" "yellow" "blue" "magenta"
+#                             "cyan" "white", "bright" + any of those,
+#                             "colour0".."colour255", "#rrggbb", "default"
+#   bold, dim, italic, blink, reverse, hidden, strikethrough, overline
+#                             true or false
+#   underline                 true, false, "single", "double", "curly",
+#                             "dotted" or "dashed"
+# "default" (or {}) means the surrounding style: the status line's for its
+# parts, the terminal's for the status line itself.
+[theme]
+status = { bg = "green", fg = "black" }
+status-left = "default"
+status-right = "default"
+# Window list entries: every window, the current one, the last one, and
+# windows with activity or a bell.
+window = "default"
+current-window = { underline = true }
+last-window = "default"
+activity = { reverse = true }
+bell = { reverse = true }
+# Pane borders, the copy-mode selection and messages are drawn in lif's
+# built-in colors for now; these keys are accepted but have no effect yet
+# (lif reports a warning for them):
+# border = { fg = "default" }
+# active-border = { fg = "green" }
+# selection = { fg = "black", bg = "yellow" }
+# message = { fg = "black", bg = "yellow" }
+
+# ---------------------------------------------------------- key bindings ----
+
+# [keys] binds keys pressed after the prefix. Keys are tmux key names:
+# "a", "A", "|", "C-a" (Ctrl), "M-Left" (Alt/Meta), "S-F5" (Shift),
+# "Enter", "Space", "Tab", "BSpace", "Escape", "Up", "PPage", "F1".. "F12".
+# A value is:
+#   "split-window -h"                       a tmux command string
+#   ["split-window -h", "select-layout tiled"]   several commands in turn
+#   { command = "resize-pane -L 5", repeat = true }
+#                                           repeatable: press it again within
+#                                           repeat-time without the prefix
+#                                           (note = "..." adds a description)
+#   false  (or "none")                      remove a default binding
+# Bindings not mentioned keep lif's defaults (tmux's).
+[keys]
+'"' = "split-window"
+"%" = "split-window -h"
+Up = { command = "select-pane -U", repeat = true }
+# Examples:
+# "|" = "split-window -h -c '#{pane_current_path}'"
+# "-" = "split-window -v -c '#{pane_current_path}'"
+# h = { command = "select-pane -L", repeat = true }
+# x = "kill-pane"            # no confirmation
+# "C-o" = false              # unbind rotate-window
+
+# [keys.root] binds keys without the prefix: they no longer reach programs.
+[keys.root]
+# "M-Left" = "select-pane -L"
+# "M-Right" = "select-pane -R"
+
+# [keys.copy-mode] and [keys.copy-mode-vi] bind keys in copy mode (emacs and
+# vi mode-keys) the same way.

@@ -655,3 +655,21 @@ fn default_color_queries() {
     v.feed(b"\x1b]11;?\x1b\\");
     assert_eq!(replies(&mut v), b"\x1b]11;rgb:0000/0000/0000\x1b\\");
 }
+
+#[test]
+fn paste_chunks_carry_no_markers() {
+    let mut v = vt(20, 4);
+    let mut out = Vec::new();
+    // Bracketed: the text, with ESC removed, and no markers of its own.
+    v.feed(b"\x1b[?2004h");
+    v.encode_paste_chunk(b"ab\x1b[201~cd\n", &mut out);
+    assert!(!out.windows(6).any(|w| w == b"\x1b[200~" || w == b"\x1b[201~"), "{out:?}");
+    assert!(!out.contains(&0x1b), "{out:?}");
+    assert!(out.starts_with(b"ab"), "{out:?}");
+    // Not bracketed: same as encode_paste.
+    v.feed(b"\x1b[?2004l");
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    v.encode_paste_chunk(b"x\ny", &mut a);
+    v.encode_paste(b"x\ny", &mut b);
+    assert_eq!(a, b);
+}

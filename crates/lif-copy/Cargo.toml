@@ -1,0 +1,16 @@
+[package]
+name = "lif-copy"
+description = "Copy mode for lif: scrollback navigation, selection and search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lif-types.workspace = true
+# KeyCode: tmux key-name parsing and key-event normalization for the tables.
+lif-core.workspace = true

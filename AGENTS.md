@@ -71,4 +71,8 @@ speed and a small footprint. Read this file before changing anything.
 | `lif-core` | Sessions, windows, panes, layouts, command language, key bindings (pure, no I/O) |
 | `lif-input` | Parser for bytes arriving from the client's terminal |
 | `lif-render` | Compositor and diff renderer onto the client's terminal |
+| `lif-server` | The server: event loop, panes, clients, frame scheduling |
+| `lif` | The binary: CLI, server start-up, end-to-end tests |
+| `lif-copy` | Copy mode: scrollback navigation, selection, search (pure) |
+| `lif-config` | TOML configuration file |
 | `bench/` | Benchmark harness comparing lif with tmux and zellij |

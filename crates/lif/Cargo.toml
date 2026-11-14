@@ -1,0 +1,23 @@
+[package]
+name = "lif"
+description = "lif: a fast, small terminal multiplexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lif-types.workspace = true
+lif-proto.workspace = true
+lif-client.workspace = true
+lif-server.workspace = true
+lif-core.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+lif-pty.workspace = true
+lif-vt.workspace = true
