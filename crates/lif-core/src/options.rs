@@ -54,11 +54,18 @@ use Scope::*;
 /// Every option lif knows, sorted by name.
 ///
 /// Notes on lif-specific meanings:
-/// - `escape-time` is accepted for compatibility and unused: lif's input
-///   parser does not wait to disambiguate Escape.
-/// - `history-limit` (lines, tmux's name) is kept for scripts; the server
-///   budgets scrollback in bytes with `scrollback-bytes` and may derive one
-///   from the other.
+/// - `escape-time` (milliseconds) is how long a lone Escape from a legacy
+///   terminal waits for the rest of a key sequence (Alt+key, arrows) in the
+///   same read; 0 never waits (then an Alt+key split across reads arrives
+///   as Escape and the key, as in tmux). Terminals speaking the kitty
+///   keyboard protocol, which lif turns on when available, send Escape
+///   unambiguously and never wait.
+/// - Scrollback has two limits and both hold: `history-limit` in lines
+///   (tmux's) and `scrollback-bytes`, a memory budget. At 200 columns a
+///   line of history costs about 1.7 KB until the pane is quiet, when it is
+///   compressed (to about 50-400 bytes); the default 4000 lines keep twice
+///   tmux's history in about tmux's memory. Changing either applies to
+///   existing panes too.
 pub(crate) static DEFS: &[Def] = &[
     d("automatic-rename", Window, Flag, "on"),
     d("automatic-rename-format", Window, Str, "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"),
@@ -73,9 +80,9 @@ pub(crate) static DEFS: &[Def] = &[
     d("detach-on-destroy", Session, Choice(&["off", "on", "no-detached", "previous", "next"]), "on"),
     d("display-panes-time", Window, Number(1, MAXI), "1000"),
     d("display-time", Session, Number(0, MAXI), "750"),
-    d("escape-time", Server, Number(0, MAXI), "10"),
+    d("escape-time", Server, Number(0, MAXI), "5"),
     d("exit-empty", Server, Flag, "on"),
-    d("history-limit", Session, Number(0, MAXI), "2000"),
+    d("history-limit", Session, Number(0, MAXI), "4000"),
     d("main-pane-height", Window, SizeStr, "24"),
     d("main-pane-width", Window, SizeStr, "80"),
     d("message-style", Session, Str, "bg=yellow,fg=black"),

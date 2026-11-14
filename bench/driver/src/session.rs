@@ -266,9 +266,16 @@ impl Session {
             }
             self.drain();
             self.seen = None;
-            let key = if esc { 0x1b } else { c };
+            // A terminal with kitty keyboard flags pushed sends the Escape
+            // key unambiguously as CSI 27 u.
+            let kitty = self.answer.as_ref().is_some_and(|a| a.kitty_flags != 0);
+            let key: &[u8] = match (esc, kitty) {
+                (true, true) => b"\x1b[27u",
+                (true, false) => b"\x1b",
+                (false, _) => std::slice::from_ref(&c),
+            };
             let t0 = now();
-            if let Err(e) = self.type_bytes(&[key]) {
+            if let Err(e) = self.type_bytes(key) {
                 return err(&e);
             }
             let got = self.pump_until(t0 + Duration::from_millis(timeout_ms), |s| s.seen.is_some());
@@ -353,7 +360,7 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 
 /// The `hold` main loop: client output and stdin commands, until `quit`
 /// or stdin closes.
-pub fn hold(argv: &[String], cols: u16, rows: u16, capture: Option<&str>, answer: bool) -> i32 {
+pub fn hold(argv: &[String], cols: u16, rows: u16, capture: Option<&str>, answer: bool, kitty: bool) -> i32 {
     let mut s = match Session::new(argv, cols, rows) {
         Ok(s) => s,
         Err(e) => {
@@ -363,6 +370,9 @@ pub fn hold(argv: &[String], cols: u16, rows: u16, capture: Option<&str>, answer
     };
     if !answer {
         s.answer = None;
+    }
+    if let Some(a) = s.answer.as_mut() {
+        a.kitty = kitty;
     }
     if let Some(path) = capture {
         match std::fs::File::create(path) {

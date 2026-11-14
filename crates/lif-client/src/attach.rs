@@ -3,6 +3,14 @@
 //! One thread, one poll(2) over four fds: the signal self-pipe, the socket,
 //! the terminal input and (only while it is full) the terminal output.
 //!
+//! Direct terminal. When both sides announced `Caps::TTY`, the client
+//! names its terminal in `UseTty` once it is in raw mode, and if the server
+//! answers `Tty { direct: true }` the server reads and writes the terminal
+//! itself: the client then reads nothing from it and only forwards
+//! resizes, signals and the server's `Exit` (and still writes any
+//! `Output`). Until the answer the terminal is not read at all, so no key
+//! can go both ways.
+//!
 //! Bounds: bytes to the server are queued only up to [`SOCK_HIGH`] plus one
 //! read. Bytes to the terminal are never copied out of the decoder: `Output`
 //! data is written straight from the decoder buffer as it arrives, what the
@@ -25,7 +33,7 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use lif_proto::{encode_input, type_id, ClientMsg, ExitReason, ServerMsg};
+use lif_proto::{encode_input, type_id, Caps, ClientMsg, ExitReason, ServerMsg};
 use lif_types::{PixelSize, Size};
 
 use crate::conn::Connection;
@@ -201,6 +209,18 @@ struct Relay {
     term_dead: bool,
     /// The terminating signal that ended the loop.
     signal: Option<i32>,
+    tty: TtyUse,
+}
+
+/// Who reads the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TtyUse {
+    /// The client, relaying keys as `Input`.
+    Relay,
+    /// `UseTty` sent, no answer yet: nobody.
+    Asked,
+    /// The server.
+    Server,
 }
 
 impl Relay {
@@ -215,6 +235,7 @@ impl Relay {
             last_size: Default::default(),
             term_dead: false,
             signal: None,
+            tty: TtyUse::Relay,
         }
     }
 
@@ -262,6 +283,11 @@ impl Relay {
         self.last_size = (conn.hello_size, conn.hello_pixels);
         self.resize_pending = true;
         let sock = conn.stream.as_raw_fd();
+        if conn.caps().contains(Caps::TTY) {
+            let (path, dev) = sys::tty_identity(fds.tty, fds.input, fds.output).unwrap_or_default();
+            ClientMsg::UseTty { path, dev }.encode(&mut self.sock_out)?;
+            self.tty = TtyUse::Asked;
+        }
         loop {
             if let Some(exit) = self.write_frames(conn, fds)? {
                 return Ok(End::Exit(exit));
@@ -274,7 +300,7 @@ impl Relay {
             }
             self.flush_sock(sock)?;
 
-            let want_input = self.input_open && self.sock_pending() < SOCK_HIGH;
+            let want_input = self.input_open && self.sock_pending() < SOCK_HIGH && self.tty == TtyUse::Relay;
             let mut sock_events = 0;
             if !self.out_blocked {
                 sock_events |= libc::POLLIN;
@@ -428,8 +454,14 @@ impl Relay {
             let Some(frame) = conn.dec.peek_frame()? else { return Ok(None) };
             let msg = frame.decode::<ServerMsg>();
             conn.dec.consume_frame();
-            if let ServerMsg::Exit { reason, message } = msg? {
-                return Ok(Some(ExitInfo { cause: ExitCause::Server, reason, message, signal: None }));
+            match msg? {
+                ServerMsg::Exit { reason, message } => {
+                    return Ok(Some(ExitInfo { cause: ExitCause::Server, reason, message, signal: None }));
+                }
+                ServerMsg::Tty { direct } if self.tty == TtyUse::Asked => {
+                    self.tty = if direct { TtyUse::Server } else { TtyUse::Relay };
+                }
+                _ => {}
             }
             // Anything else is meaningless while attached (or unknown, rule 2).
         }

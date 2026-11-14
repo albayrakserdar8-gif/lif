@@ -23,8 +23,9 @@ pub const MAX_STRING: usize = 1 << 20;
 /// Suggested one-shot timer for [`Pending::Ambiguous`]: how long a lone ESC
 /// (or ESC plus a sequence introducer) waits to see whether more bytes
 /// follow before it is taken as the Escape (or Alt+key) it looks like. The
-/// server decides; 5 ms is far below human perception and well above the
-/// time a terminal needs to write one sequence.
+/// server uses its `escape-time` option (default this); 5 ms is far below
+/// human perception and well above the time a terminal needs to write one
+/// sequence.
 pub const DEFAULT_ESC_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Suggested timer for [`Pending::Incomplete`]: a sequence that is certainly

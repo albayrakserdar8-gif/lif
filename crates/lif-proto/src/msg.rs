@@ -7,12 +7,14 @@ pub mod type_id {
     pub const INPUT: u16 = 0x03;
     pub const RESIZE: u16 = 0x04;
     pub const DETACH: u16 = 0x05;
+    pub const USE_TTY: u16 = 0x06;
 
     pub const WELCOME: u16 = 0x101;
     pub const COMMAND_DONE: u16 = 0x102;
     pub const ATTACHED: u16 = 0x103;
     pub const OUTPUT: u16 = 0x104;
     pub const EXIT: u16 = 0x105;
+    pub const TTY: u16 = 0x106;
 }
 
 /// Optional capabilities, exchanged in `Hello` / `Welcome`. A side may only
@@ -22,7 +24,11 @@ pub struct Caps(pub u64);
 
 impl Caps {
     pub const NONE: Caps = Caps(0);
-    // No optional capabilities exist yet. Add them here as single bits.
+    /// The client's terminal is a tty the server may open itself and use
+    /// directly while the client is attached (`UseTty` / `Tty`), instead
+    /// of relaying every key and frame through the client: each keystroke
+    /// echo then costs two fewer process wake-ups.
+    pub const TTY: Caps = Caps(1);
 
     pub const fn contains(self, other: Caps) -> bool {
         self.0 & other.0 == other.0
@@ -88,6 +94,12 @@ pub enum ClientMsg {
     Resize { size: Size, pixels: PixelSize },
     /// The client is going away (e.g. it got SIGHUP). Only while attached.
     Detach,
+    /// Sent once, right after `Attached` and after the terminal was put in
+    /// raw mode, when both sides announced [`Caps::TTY`]: the terminal's
+    /// device path and `st_rdev` (an empty path declines). Until it
+    /// arrives the server writes nothing for the terminal, and the client
+    /// reads nothing from it until the server's [`ServerMsg::Tty`].
+    UseTty { path: String, dev: u64 },
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }
@@ -105,6 +117,10 @@ pub enum ServerMsg {
     /// restore the terminal; the client leaves raw mode, prints `message` if
     /// it is not empty, and exits.
     Exit { reason: ExitReason, message: String },
+    /// Answer to `UseTty`. `direct`: the server opened the terminal and
+    /// reads and writes it itself from now on; the client stops reading it
+    /// and only forwards resizes and signals. Otherwise the client relays.
+    Tty { direct: bool },
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }

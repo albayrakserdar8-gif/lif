@@ -85,6 +85,31 @@ pub(crate) fn winsize(fd: RawFd) -> io::Result<libc::winsize> {
     Ok(ws)
 }
 
+/// The device path and `st_rdev` of the terminal on `tty`, provided
+/// `input` and `output` are that same terminal.
+pub(crate) fn tty_identity(tty: RawFd, input: RawFd, output: RawFd) -> Option<(String, u64)> {
+    let rdev = |fd: RawFd| -> Option<u64> {
+        // SAFETY: stat is plain data; fstat fills it for a valid fd.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: valid stat pointer; a bad fd is an error, not UB.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+            return None;
+        }
+        Some(st.st_rdev as u64)
+    };
+    let dev = rdev(tty)?;
+    if !isatty(tty) || rdev(input)? != dev || rdev(output)? != dev {
+        return None;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is valid for its length; ttyname_r NUL-terminates on success.
+    if unsafe { libc::ttyname_r(tty, buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&b| b == 0)?;
+    Some((String::from_utf8(buf[..n].to_vec()).ok()?, dev))
+}
+
 pub(crate) fn isatty(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the fd.
     unsafe { libc::isatty(fd) == 1 }

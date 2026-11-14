@@ -21,6 +21,8 @@ ghostty = ["dep:libghostty-vt"]
 [dev-dependencies]
 # Key round-trip tests start from the bytes an outer terminal sends.
 lif-input.workspace = true
+# The memory measurement reads the process footprint.
+libc.workspace = true
 
 [[test]]
 name = "ghostty"
@@ -28,4 +30,8 @@ required-features = ["ghostty"]
 
 [[test]]
 name = "bench"
+required-features = ["ghostty"]
+
+[[test]]
+name = "memory"
 required-features = ["ghostty"]

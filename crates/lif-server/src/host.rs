@@ -19,7 +19,7 @@ use lif_vt::{Rgb, TextOptions, TextRange, VtEngine, VtOptions};
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
 
-use crate::client::{Attached, ClientRt, DisplayPanes, Message, emergency_bytes, leave_bytes};
+use crate::client::{Attached, ClientRt, DisplayPanes, Message, TermOut, leave_bytes};
 use crate::mode::{Engine, ModeAction, ModeCtx, new_copy_mode};
 use crate::pane::PaneRt;
 use crate::prompt::PromptState;
@@ -33,6 +33,8 @@ pub(crate) struct CopyConfig {
 
 pub(crate) const PANE_TOKEN: usize = 1 << 32;
 pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
+/// A client's terminal, opened by the server (`TermOut::Direct`).
+pub(crate) const TTY_TOKEN: usize = 4 << 32;
 
 /// `TERM` inside panes. xterm-256color has a terminfo entry on every
 /// system (unlike a `lif` entry would), and libghostty-vt implements the
@@ -73,6 +75,8 @@ pub(crate) struct Rt {
     pub(crate) mode_changed: Vec<PaneId>,
     /// Configuration problems found at start-up, for the first client.
     pub(crate) startup_message: Option<String>,
+    /// The `escape-time` option (kept current by `Server::apply_options`).
+    pub(crate) escape_time: std::time::Duration,
 }
 
 pub(crate) fn pane_token(p: PaneId) -> Token {
@@ -113,6 +117,7 @@ impl Rt {
             mode_actions: Vec::new(),
             mode_changed: Vec::new(),
             startup_message: None,
+            escape_time: lif_input::DEFAULT_ESC_TIMEOUT,
         }
     }
 
@@ -127,6 +132,18 @@ impl Rt {
         }
         p.wq.push(bytes);
         self.flush_pane(pane);
+    }
+
+    /// [`Rt::write_pane`] for input a client typed (keys, mouse, paste):
+    /// the pane's next output is its echo (see `crate::ECHO_WINDOW`).
+    pub(crate) fn write_input(&mut self, pane: PaneId, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.note_input(Instant::now());
+        }
+        self.write_pane(pane, bytes);
     }
 
     /// Write a pane's queue and keep WRITABLE interest in step with it.
@@ -158,13 +175,25 @@ impl Rt {
             crate::panic::set_mid_frame(std::os::fd::AsRawFd::as_raw_fd(&c.stream), mid);
         }
         match result {
-            Ok(pending) => {
-                if pending != c.want_write {
-                    c.want_write = pending;
-                    let interest = if pending { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+            Ok((sock, tty)) => {
+                // The socket waits behind the terminal: only the terminal's
+                // writability matters until it drained.
+                let want = sock && !tty;
+                if want != c.want_write {
+                    c.want_write = want;
+                    let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
                     let _ = self.registry.reregister(&mut c.stream, c.token, interest);
                 }
-                if !pending && c.closing {
+                if let Some(t) = c.tty_mut()
+                    && !t.dead
+                    && tty != t.want_write
+                {
+                    t.want_write = tty;
+                    let interest = if tty { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+                    let fd = std::os::fd::AsRawFd::as_raw_fd(&t.fd);
+                    let _ = self.registry.reregister(&mut SourceFd(&fd), t.token, interest);
+                }
+                if !sock && !tty && c.closing {
                     c.dead = true;
                 }
             }
@@ -271,13 +300,18 @@ impl Rt {
             att.message = Some(Message { line: vec![Span::new(text, att.msg_style)], expires: None });
         }
         c.send(&ServerMsg::Attached);
+        if c.caps.contains(lif_proto::Caps::TTY) {
+            // Nothing reaches the terminal before the client put it in raw
+            // mode and said which one it is (UseTty).
+            c.term_out = TermOut::Hold(Vec::new());
+        }
         let mut b = Vec::new();
         lif_input::write_queries(&mut b);
         lif_input::write_enter(&caps, &mut b);
         c.send_output(&b);
-        crate::panic::set(std::os::fd::AsRawFd::as_raw_fd(&c.stream), emergency_bytes(&att));
         att.needs_frame = true;
         c.att = Some(att);
+        c.arm_panic();
         self.session_env.insert(session, hello.env.clone());
         self.flush_client(client);
     }
@@ -329,13 +363,15 @@ impl Host for Rt {
                 let vo = VtOptions {
                     size: spec.size,
                     pixels: PixelSize::default(),
-                    scrollback_bytes: if spec.history_limit == 0 { 0 } else { spec.scrollback_bytes },
+                    scrollback_bytes: crate::pane::scrollback_limits(spec.scrollback_bytes, spec.history_limit).0,
+                    scrollback_lines: crate::pane::scrollback_limits(spec.scrollback_bytes, spec.history_limit).1,
                     default_fg: self.default_colors.0,
                     default_bg: self.default_colors.1,
                     default_cursor: None,
                 };
                 let e = Engine::new(&vo).map_err(|e| e.to_string())?;
-                (e, PaneFrame::new(spec.size))
+                // The frame is filled the first time a client shows the pane.
+                (e, PaneFrame::default())
             }
         };
         if engine.size() != spec.size {
@@ -355,6 +391,11 @@ impl Host for Rt {
         self.pids.insert(pid, spec.pane);
         let mut p = PaneRt::new(spec.pane, pty, engine, frame, spec.size);
         p.current_path = spec.cwd.clone();
+        p.scrollback = crate::pane::scrollback_limits(spec.scrollback_bytes, spec.history_limit);
+        if spec.respawn {
+            // A respawned pane keeps its terminal: give it the current limits.
+            p.engine.set_scrollback_limits(p.scrollback.0, p.scrollback.1);
+        }
         self.panes.insert(spec.pane, p);
         // The child may have exited before it was watched.
         self.views_stale = true;
@@ -385,6 +426,9 @@ impl Host for Rt {
         }
         p.size = size;
         p.engine.resize(size, PixelSize::default());
+        // The engine gives back what the resize left behind once the pane
+        // is quiet (see VtEngine::compact).
+        p.compact_at = Some(Instant::now() + crate::COMPACT_AFTER);
         if let Some(pty) = p.pty.as_ref() {
             let _ = pty.resize(size, PixelSize::default());
         }
@@ -505,7 +549,7 @@ impl Host for Rt {
             let mut b = Vec::new();
             leave_bytes(&mut att, &mut b);
             c.send_output(&b);
-            crate::panic::remove(std::os::fd::AsRawFd::as_raw_fd(&c.stream));
+            c.disarm_panic();
         }
         c.send(&ServerMsg::Exit { reason: why, message });
         c.closing = true;

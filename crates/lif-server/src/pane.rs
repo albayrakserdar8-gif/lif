@@ -98,6 +98,38 @@ pub(crate) struct PaneRt {
     pub(crate) paste_bracketed: Option<bool>,
     /// Refreshed during the current frame tick.
     pub(crate) refreshed: bool,
+    /// The scrollback limits in effect: (bytes, lines).
+    pub(crate) scrollback: (usize, Option<usize>),
+    /// Some attached client shows the pane (see `Server::sync_views`).
+    pub(crate) shown: bool,
+    /// When this pane's frame was last refreshed.
+    pub(crate) last_refresh: Option<Instant>,
+    /// `frame`'s dirty flags were set outside `refresh` (leaving a mode).
+    pub(crate) frame_marked: bool,
+    /// Input from a client reached the pane since its last refresh: its
+    /// next output is an echo and is drawn at once (see `ECHO_WINDOW`).
+    pub(crate) echo_credit: bool,
+    /// When a client's input last reached the pane.
+    pub(crate) input_at: Option<Instant>,
+    /// Output read since then.
+    pub(crate) echo_bytes: usize,
+}
+
+/// The engine limits for the `scrollback-bytes` and `history-limit`
+/// options: both hold (history-limit 0 means no scrollback at all).
+pub(crate) fn scrollback_limits(bytes: usize, lines: usize) -> (usize, Option<usize>) {
+    if lines == 0 { (0, Some(0)) } else { (bytes, Some(lines)) }
+}
+
+/// Whether a dirty pane may be drawn now for the echo of input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Echo {
+    /// Draw it now, without pacing.
+    Now,
+    /// Inside the echo window but too soon after the last frame.
+    At(Instant),
+    /// Not interactive: paced.
+    No,
 }
 
 /// What one round of reading did.
@@ -134,7 +166,47 @@ impl PaneRt {
             mode_cfg: None,
             paste_bracketed: None,
             refreshed: false,
+            last_refresh: None,
+            scrollback: (0, None),
+            shown: false,
+            frame_marked: false,
+            echo_credit: false,
+            input_at: None,
+            echo_bytes: 0,
         }
+    }
+
+    /// The pane's own content changed since its frame was refreshed. (A
+    /// mode's changes reach clients as `needs_frame` instead.)
+    pub(crate) fn changed(&self) -> bool {
+        self.engine.is_dirty() || self.frame_marked
+    }
+
+    /// Inside a synchronized update the program opened less than
+    /// `SYNC_TIMEOUT` ago: not drawn until then (returned).
+    pub(crate) fn held(&self, now: Instant) -> Option<Instant> {
+        let until = self.sync_since? + crate::SYNC_TIMEOUT;
+        (now < until).then_some(until)
+    }
+
+    pub(crate) fn echo(&self, now: Instant) -> Echo {
+        if self.echo_credit {
+            return Echo::Now;
+        }
+        match self.input_at {
+            Some(t) if now < t + crate::ECHO_WINDOW && self.echo_bytes < crate::ECHO_WINDOW_BYTES => match self.last_refresh {
+                Some(r) if now < r + crate::ECHO_INTERVAL => Echo::At(r + crate::ECHO_INTERVAL),
+                _ => Echo::Now,
+            },
+            _ => Echo::No,
+        }
+    }
+
+    /// Input from a client was written to the pane.
+    pub(crate) fn note_input(&mut self, now: Instant) {
+        self.echo_credit = true;
+        self.input_at = Some(now);
+        self.echo_bytes = 0;
     }
 
     /// Reads and feeds until EAGAIN, EOF or `budget` bytes. Many small
@@ -207,6 +279,7 @@ impl PaneRt {
             if view {
                 // The terminal's frame comes back in place of the mode's.
                 self.frame.mark_all_dirty();
+                self.frame_marked = true;
             }
         }
         self.searching = false;

@@ -182,3 +182,76 @@ fn idle_server_makes_no_wakeups() {
     t.pump(Duration::from_millis(10));
     assert!(t.exit.is_none());
 }
+
+/// A pane in copy mode draws nothing new while nobody types: the server
+/// stays asleep (modes report their changes, they are not polled).
+#[test]
+fn idle_copy_mode_makes_no_wakeups() {
+    let env = Env::new();
+    let o = env.command().args(["-v", "new-session", "-d", "-s", "cm"]).output().unwrap();
+    assert!(o.status.success());
+    let pid = env.server_pid();
+    let log = env.dir.join(format!("lif-server-{pid}.log"));
+    let mut t = Term::spawn(&env, &["attach", "-t", "cm"], Size::new(80, 24));
+    t.wait_text("$");
+    t.write(b"\x02[");
+    t.wait_for("copy mode", secs(10), |t| t.screen().contains("[0/"));
+    t.settle(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(2500));
+    let a = stats(pid, &log);
+    std::thread::sleep(Duration::from_secs(3));
+    let b = stats(pid, &log);
+    eprintln!("idle in copy mode: {} loop iterations in 3 s", b - a);
+    assert!(b - a <= 2, "idle server in copy mode iterated {} times", b - a);
+}
+
+/// Panes born large and shrunk by later splits (a tiled layout filling
+/// up) give back what the resizes left behind, and panes no client shows
+/// keep no frame: memory per pane stays near what a pane of its size holds.
+#[test]
+fn tiled_hidden_panes_stay_small() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "tiles", "-x", "200", "-y", "50"]);
+    env.wait_capture("tiles", "$");
+    let pid = env.server_pid();
+    std::thread::sleep(Duration::from_millis(2500));
+    let before = rss_kib(pid);
+    const N: u64 = 30;
+    for _ in 0..N {
+        env.ok(&["split-window", "-d", "-t", "tiles"]);
+        env.ok(&["select-layout", "-t", "tiles", "tiled"]);
+    }
+    // Past the compaction that follows the last resize (COMPACT_AFTER).
+    std::thread::sleep(Duration::from_millis(3500));
+    let after = rss_kib(pid);
+    let per = after.saturating_sub(before) / N;
+    eprintln!("{N} tiled panes, no client: rss {before} -> {after} KiB, {per} KiB per pane");
+    assert!(per < 200, "{per} KiB per idle pane");
+}
+
+/// Buffers that grow during a flood (frames, reads, the renderer's) do not
+/// keep their flood size: with a small scrollback budget the server returns
+/// close to where it started.
+#[test]
+fn flood_leaves_no_flood_sized_buffers() {
+    let env = Env::new();
+    let big = env.home.join("big.txt");
+    big_file(&big, 40 << 20);
+    env.ok(&["new-session", "-d", "-s", "fl", "-x", "120", "-y", "40"]);
+    env.ok(&["set-option", "-g", "scrollback-bytes", "500000"]);
+    env.ok(&["new-window", "-t", "fl"]);
+    env.ok(&["kill-window", "-t", "fl:0"]);
+    let mut t = Term::spawn(&env, &["attach", "-t", "fl"], Size::new(120, 41));
+    t.wait_text("$");
+    t.settle(Duration::from_millis(300));
+    let pid = env.server_pid();
+    std::thread::sleep(Duration::from_millis(2500));
+    let before = rss_kib(pid);
+    t.type_str(&format!("cat {}; echo FLOOD''DONE\r", big.display()));
+    t.wait_for("the flood to end", Duration::from_secs(120), |t| t.screen().contains("FLOODDONE"));
+    t.settle(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(3000));
+    let after = rss_kib(pid);
+    eprintln!("40 MB flood: server rss {before} -> {after} KiB");
+    assert!(after < before + 4096, "server RSS stayed at {after} KiB after a flood (was {before})");
+}

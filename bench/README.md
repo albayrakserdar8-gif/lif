@@ -180,7 +180,13 @@ The same is repeated (again in interleaved rounds) while a second pane runs `yes
 Bare ESC: the pane runs `lifbench-driver escprobe`, which sets raw mode and prints
 `~` (then erases it) for every ESC byte it receives. The driver sends a lone
 0x1b and times the `~`. 333 samples, 15-30 ms apart. tmux runs twice: default
-config (`escape-time` is 10 ms in 3.8) and `set -sg escape-time 0`.
+config (`escape-time` is 10 ms in 3.8) and `set -sg escape-time 0`; lif runs
+three times: default (`escape-time` 5 ms), `set-option -s escape-time 0`, and
+with a terminal that speaks the kitty keyboard protocol (`hold --kitty`: the
+driver answers `CSI ? u`, tracks the flags the client pushes, and while flags
+are pushed types Escape as `CSI 27 u`, as kitty, Ghostty, WezTerm or foot do).
+tmux 3.8 and zellij 0.46 do not push kitty flags, so for them that variant
+would be the legacy case again and is not run.
 
 ### 6. Binary
 
@@ -203,9 +209,13 @@ Size of the resolved binary and `otool -L` output; "non-system" means outside
   slower to consume, which matters for "none" (it bounds the bare-PTY case
   at what the driver can read) and for multiplexers that pace their output on
   client backpressure.
-- The driver answers terminal queries like a basic xterm-compatible terminal.
-  Clients that adapt to terminal capabilities (kitty keyboard protocol, sync
-  output 2026) may behave differently with a full-featured terminal.
+- The driver answers terminal queries like a basic xterm-compatible terminal
+  (sync output 2026 reported as supported; the kitty keyboard protocol only
+  with `--kitty`, used by the lif ESC variant). Clients that adapt to other
+  terminal capabilities may behave differently with a full-featured terminal.
+- lif (with `Caps::TTY`) has its server read and write the client's terminal
+  directly, as tmux does, so in both the attached client process is idle while
+  keys and frames flow; zellij relays through its client.
 - Throughput completion is "cat exited", i.e. the server has read the bytes;
   drawing may lag (see "tail").
 - zellij's floating onboarding plugin is suppressed as described above; its
@@ -216,6 +226,10 @@ Size of the resolved binary and `otool -L` output; "non-system" means outside
   threads in the server, so they are included).
 
 ## Adding a tool
+
+`lifbase` is the lif adapter with another binary (`bench/tmp/ab/lif-head`, or
+`$LIFBENCH_LIF_BASE`): copy an older build there to compare before and after in
+one interleaved run (`--tools tmux,lif,lifbase`).
 
 Write one subclass of `Adapter` in `lifbench.py` and add it to `ADAPTERS`:
 
@@ -241,10 +255,11 @@ tmux verbs `new-session -d -x 200 -y 50`, `attach -t`, `split-window -d -t [CMD]
 `kill-server`; detach is `C-b d`. The server is a daemon forked from the first
 client: its command line is that client's (so it names the private socket)
 and its parent is launchd, which is how its pid is found (ppid 1 and socket
-path in the command line). lif 0.1.0 does not read a config file yet, so the
-scrollback scenario sets `scrollback-bytes` (1 GiB) and `history-limit` with
-`set-option -g` after the server starts, then opens a fresh window and kills
-the first one, because options only apply to panes created afterwards.
+path in the command line). The scrollback scenario sets `scrollback-bytes`
+(1 GiB) and `history-limit` with `set-option -g` after the server starts, then
+opens a fresh window and kills the first one (lif now applies both options to
+existing panes too, but a fresh pane keeps the scenario identical to older
+runs).
 Retained scrollback lines are read back from every tool (`#{history_size}`
 for tmux and lif, a `dump-screen --full` line count for zellij) and reported.
 

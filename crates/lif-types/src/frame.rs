@@ -192,8 +192,15 @@ impl PaneFrame {
     pub fn reset(&mut self, size: Size) {
         self.size = size;
         self.rows.resize_with(size.rows as usize, FrameRow::default);
+        if self.rows.capacity() > 2 * self.rows.len() {
+            self.rows.shrink_to_fit();
+        }
         for row in &mut self.rows {
             row.cells.clear();
+            // A pane that shrank gives the memory of its wider rows back.
+            if row.cells.capacity() > 2 * size.cols as usize {
+                row.cells.shrink_to_fit();
+            }
             row.cells.resize(size.cols as usize, Cell::BLANK);
             row.clusters.clear();
             row.wrapped = false;

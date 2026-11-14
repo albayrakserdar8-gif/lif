@@ -25,11 +25,28 @@ pub struct Answerer {
     cols: u16,
     rows: u16,
     pub answered: u64,
+    /// Answer the kitty keyboard protocol query (`CSI ? u`) and track the
+    /// flags the client pushes, like kitty, Ghostty, WezTerm or foot.
+    pub kitty: bool,
+    /// Kitty keyboard flags the client has in effect (0: legacy keys).
+    pub kitty_flags: u32,
+    kitty_stack: Vec<u32>,
 }
 
 impl Answerer {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Answerer { st: St::Ground, seq: [0; MAX], len: 0, overflow: false, cols, rows, answered: 0 }
+        Answerer {
+            st: St::Ground,
+            seq: [0; MAX],
+            len: 0,
+            overflow: false,
+            cols,
+            rows,
+            answered: 0,
+            kitty: false,
+            kitty_flags: 0,
+            kitty_stack: Vec::new(),
+        }
     }
 
     fn push(&mut self, b: u8) {
@@ -116,7 +133,38 @@ impl Answerer {
         }
     }
 
+    /// Kitty keyboard protocol: query, push, pop, set.
+    fn kitty_csi(&mut self, out: &mut Vec<u8>) -> bool {
+        let s = &self.seq[..self.len];
+        if !self.kitty || s.last() != Some(&b'u') {
+            return false;
+        }
+        let num = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|t| t.split(';').next()?.parse::<u32>().ok());
+        match s.first() {
+            Some(b'?') if s.len() == 2 => {
+                out.extend_from_slice(format!("\x1b[?{}u", self.kitty_flags).as_bytes());
+                self.answered += 1;
+            }
+            Some(b'>') => {
+                self.kitty_stack.push(self.kitty_flags);
+                self.kitty_flags = num(&s[1..s.len() - 1]).unwrap_or(0);
+            }
+            Some(b'<') => {
+                let n = num(&s[1..s.len() - 1]).unwrap_or(1).max(1);
+                for _ in 0..n {
+                    self.kitty_flags = self.kitty_stack.pop().unwrap_or(0);
+                }
+            }
+            Some(b'=') => self.kitty_flags = num(&s[1..s.len() - 1]).unwrap_or(0),
+            _ => return false,
+        }
+        true
+    }
+
     fn csi(&mut self, out: &mut Vec<u8>) {
+        if self.kitty_csi(out) {
+            return;
+        }
         let s = &self.seq[..self.len];
         let reply: Vec<u8> = match s {
             b"c" | b"0c" => b"\x1b[?62;22c".to_vec(),
@@ -185,6 +233,20 @@ mod tests {
     fn split_across_reads_and_osc() {
         assert_eq!(run(&[b"x\x1b", b"]11;", b"?\x1b", b"\\y"]), b"\x1b]11;rgb:0000/0000/0000\x1b\\");
         assert_eq!(run(&[b"\x1b]10;?\x07"]), b"\x1b]10;rgb:ffff/ffff/ffff\x07");
+    }
+
+    #[test]
+    fn kitty_keyboard_query_push_pop() {
+        let mut a = Answerer::new(200, 50);
+        let mut out = Vec::new();
+        a.feed(b"\x1b[?u", &mut out);
+        assert!(out.is_empty(), "a legacy terminal does not answer");
+        a.kitty = true;
+        a.feed(b"\x1b[?u\x1b[>31u", &mut out);
+        assert_eq!(out, b"\x1b[?0u");
+        assert_eq!(a.kitty_flags, 31);
+        a.feed(b"\x1b[<u", &mut out);
+        assert_eq!(a.kitty_flags, 0);
     }
 
     #[test]

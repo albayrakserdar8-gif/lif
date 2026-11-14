@@ -28,6 +28,8 @@ fn client_msgs() -> Vec<ClientMsg> {
         ClientMsg::Input(vec![]),
         ClientMsg::Resize { size: Size::new(80, 24), pixels: PixelSize { width: 640, height: 480 } },
         ClientMsg::Detach,
+        ClientMsg::UseTty { path: "/dev/ttys004".into(), dev: 0x1000_0004 },
+        ClientMsg::UseTty { path: String::new(), dev: 0 },
     ]
 }
 
@@ -44,6 +46,8 @@ fn server_msgs() -> Vec<ServerMsg> {
         ServerMsg::Exit { reason: ExitReason::ServerExit, message: "bye".into() },
         ServerMsg::Exit { reason: ExitReason::Kicked, message: "kicked".into() },
         ServerMsg::Exit { reason: ExitReason::Error, message: "oops".into() },
+        ServerMsg::Tty { direct: true },
+        ServerMsg::Tty { direct: false },
     ]
 }
 
@@ -547,8 +551,8 @@ fn random_garbage_and_truncations_never_panic() {
         for _ in 0..rng.below(20) {
             let len = rng.below(64);
             let tid = match rng.below(3) {
-                0 => rng.below(6) as u16,
-                1 => 0x100 + rng.below(6) as u16,
+                0 => rng.below(7) as u16,
+                1 => 0x100 + rng.below(7) as u16,
                 _ => rng.next() as u16,
             };
             s.extend(raw_frame(tid, &rng.bytes(len)));
@@ -572,7 +576,7 @@ fn random_garbage_and_truncations_never_panic() {
         // Every payload decoder on random and truncated payloads.
         let n = rng.below(128);
         let p = rng.bytes(n);
-        for tid in [1u16, 2, 3, 4, 5, 0x101, 0x102, 0x103, 0x104, 0x105] {
+        for tid in [1u16, 2, 3, 4, 5, 6, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106] {
             let _ = ClientMsg::decode(tid, &p);
             let _ = ServerMsg::decode(tid, &p);
         }

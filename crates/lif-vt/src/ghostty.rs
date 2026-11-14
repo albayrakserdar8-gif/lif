@@ -58,6 +58,9 @@ const MAX_PENDING_REPLIES: usize = 1 << 20;
 const MAX_PENDING_EVENTS: usize = 1024;
 /// Bounded work per [`VtEngine::compact`] call.
 const COMPACT_STEPS: usize = 16;
+/// Terminals holding at most this much (two standard storage pages) are
+/// repacked after a resize; see `GhosttyVt::repack`.
+const REPACK_MAX_BYTES: usize = 1 << 20;
 /// Cell size assumed for pixel reports when the outer terminal never told us.
 const FALLBACK_CELL_PX: (u32, u32) = (8, 16);
 
@@ -125,6 +128,9 @@ pub struct GhosttyVt {
     trim: rows::TrimCounter,
     /// The row `row_scan` read last (which way a scan goes).
     last_scan: Option<usize>,
+    /// Width changed since the last repack (see `GhosttyVt::repack`).
+    resized: bool,
+    repacks: u64,
 }
 
 fn engine_err(e: libghostty_vt::Error) -> VtError {
@@ -289,6 +295,60 @@ impl GhosttyVt {
     }
 }
 
+impl GhosttyVt {
+    /// Drop the render state (libghostty's copy of the viewport, about 80
+    /// bytes per cell, sized by the largest viewport it ever saw) and the
+    /// iterators; the next `refresh` rebuilds them and rewrites the frame.
+    fn release_render_state(&mut self) {
+        if let (Ok(render), Ok(rows), Ok(cells)) = (RenderState::new(), RowIterator::new(), CellIterator::new()) {
+            self.render = render;
+            self.rows = rows;
+            self.cells = cells;
+            self.dirty = true;
+        }
+    }
+
+    /// Rebuild the terminal from a snapshot of itself (libghostty's
+    /// complete-state format: screens, cursor, modes, colors, palette,
+    /// limits, title, pwd, tab stops, parser state). Why: a resize that
+    /// reflows recycles a storage page by zeroing all of it (about 400 KB
+    /// resident however little the pane shows) and parks freed pages in the
+    /// terminal's pool; a fresh terminal touches only what it holds. Only
+    /// for small terminals (the copy costs about what they hold) and never
+    /// while rows are tracked (`track_trimmed`), whose positions live in
+    /// the old one. Returns whether it happened.
+    fn repack(&mut self) -> bool {
+        if self.trim.tracking() {
+            return false;
+        }
+        match self.term.memory_usage() {
+            Ok(m) if (m.primary_resident_bytes + m.alternate_resident_bytes) as usize <= REPACK_MAX_BYTES => {}
+            _ => return false,
+        }
+        // Fails mid-sequence (the parser is not at ground): next time.
+        let Ok(Some(bytes)) = self.term.encode_snapshot_alloc(None) else { return false };
+        let Ok(decoder) = libghostty_vt::snapshot::Decoder::new_buf(&bytes) else { return false };
+        let Ok(fresh) = decoder.decode() else { return false };
+        let old = std::mem::replace(&mut self.term, fresh);
+        if self.install_effects().is_err() {
+            // The old terminal still has its callbacks.
+            self.term = old;
+            return false;
+        }
+        drop(old);
+        self.release_render_state();
+        self.compacted_at = None;
+        self.repacks += 1;
+        true
+    }
+
+    /// How often the terminal was rebuilt by `compact` (for tests).
+    #[doc(hidden)]
+    pub fn repacks(&self) -> u64 {
+        self.repacks
+    }
+}
+
 impl VtEngine for GhosttyVt {
     fn new(opts: &VtOptions) -> Result<Self, VtError> {
         if opts.size.is_empty() {
@@ -298,6 +358,7 @@ impl VtEngine for GhosttyVt {
         let (cw, ch) = cell_px(opts.size, opts.pixels);
         term.resize(opts.size.cols, opts.size.rows, cw, ch).map_err(engine_err)?;
         term.set_scrollback_max_bytes(Some(opts.scrollback_bytes)).map_err(engine_err)?;
+        term.set_scrollback_max_lines(opts.scrollback_lines).map_err(engine_err)?;
         // Mode 2027 (grapheme clustering) on by default, like Ghostty, kitty
         // and WezTerm: ZWJ emoji and flags occupy one cluster, so widths
         // agree with modern outer terminals. Programs can still turn it off.
@@ -324,6 +385,8 @@ impl VtEngine for GhosttyVt {
             compacted_at: None,
             trim: rows::TrimCounter::default(),
             last_scan: None,
+            resized: false,
+            repacks: 0,
         };
         vt.install_effects().map_err(engine_err)?;
         vt.apply_default_colors(opts.default_fg, opts.default_bg, opts.default_cursor).map_err(engine_err)?;
@@ -371,6 +434,8 @@ impl VtEngine for GhosttyVt {
         }
         let (cw, ch) = cell_px(size, pixels);
         if self.term.resize(size.cols, size.rows, cw, ch).is_ok() {
+            // Only a change of width reflows (and zeroes whole pages).
+            self.resized |= size.cols != self.size.cols;
             self.size = size;
             self.pixels = pixels;
             self.dirty = true;
@@ -590,6 +655,17 @@ impl VtEngine for GhosttyVt {
         self.links.get(id)
     }
 
+    fn set_scrollback_limits(&mut self, bytes: usize, lines: Option<usize>) {
+        // Only fails on allocation failure; the old limits then stay.
+        let _ = self.term.set_scrollback_max_bytes(Some(bytes));
+        let _ = self.term.set_scrollback_max_lines(lines);
+        self.dirty = true;
+    }
+
+    fn release_caches(&mut self) {
+        self.release_render_state();
+    }
+
     fn memory(&self) -> VtMemory {
         match self.term.memory_usage() {
             Ok(m) => VtMemory {
@@ -602,20 +678,27 @@ impl VtEngine for GhosttyVt {
         }
     }
 
-    fn compact(&mut self) {
-        let Ok(now) = self.term.compression_activity() else { return };
+    fn compact(&mut self) -> bool {
+        if self.resized {
+            self.resized = false;
+            if self.repack() {
+                return false;
+            }
+        }
+        let Ok(now) = self.term.compression_activity() else { return false };
         if self.compacted_at == Some(now) {
-            return;
+            return false;
         }
         for _ in 0..COMPACT_STEPS {
             match self.term.compress(CompressionMode::Incremental) {
                 Ok(CompressionResult::Pending) => continue,
                 Ok(CompressionResult::Complete | CompressionResult::Unsupported) => {
                     self.compacted_at = self.term.compression_activity().ok();
-                    return;
+                    return false;
                 }
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
+        true
     }
 }

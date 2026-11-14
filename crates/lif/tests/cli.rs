@@ -15,7 +15,7 @@ fn cli_commands_exact_output() {
     let lw = env.ok(&["list-windows", "-t", "work"]);
     assert!(lw.starts_with("0: win* (1 panes) [200x50] [layout ") && lw.ends_with(",200x50,0,0,0] @0 (active)\n"), "{lw:?}");
     let lp = env.ok(&["list-panes", "-t", "work"]);
-    assert!(lp.starts_with("0: [200x50] [history 0/2000, ") && lp.ends_with(" bytes] %0 (active)\n"), "{lp:?}");
+    assert!(lp.starts_with("0: [200x50] [history 0/4000, ") && lp.ends_with(" bytes] %0 (active)\n"), "{lp:?}");
     assert_eq!(env.ok(&["display-message", "-p", "-t", "work", "#{session_name}:#{window_index}.#{pane_index} #{pane_width}x#{pane_height} #{window_name}"]), "work:0.0 200x50 win\n");
     env.wait_capture("work", "$");
     assert_eq!(env.ok(&["send-keys", "-t", "work", "echo sent''keys", "Enter"]), "");

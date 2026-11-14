@@ -215,8 +215,12 @@ fn long_command_output_opens_a_pager() {
 #[test]
 fn search_through_a_huge_history_keeps_everything_live() {
     let env = Env::new();
-    // 300k rows of history (the budget is raised before the pane exists).
-    let mut t = Term::spawn(&env, &["set", "-g", "scrollback-bytes", "300000000", ";", "new-session", "-s", "h"], Size::new(80, 24));
+    // 300k rows of history (both limits are raised before the pane exists).
+    let mut t = Term::spawn(
+        &env,
+        &["set", "-g", "scrollback-bytes", "300000000", ";", "set", "-g", "history-limit", "400000", ";", "new-session", "-s", "h"],
+        Size::new(80, 24),
+    );
     t.wait_text("$");
     env.ok(&["set", "-g", "mode-keys", "vi"]);
     t.type_str("seq 1 300000; echo seq''done\r");

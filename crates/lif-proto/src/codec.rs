@@ -210,6 +210,10 @@ impl ClientMsg {
                 put_pixels(o, *pixels);
             }),
             ClientMsg::Detach => frame(out, type_id::DETACH, |_| {}),
+            ClientMsg::UseTty { path, dev } => frame(out, type_id::USE_TTY, |o| {
+                put_bytes(o, path.as_bytes());
+                put_u64(o, *dev);
+            }),
             ClientMsg::Unknown { .. } => Err(ProtoError::NotEncodable),
         }
     }
@@ -233,6 +237,7 @@ impl ClientMsg {
             type_id::INPUT => ClientMsg::Input(r.opt(|r| r.bytes().map(<[u8]>::to_vec))?),
             type_id::RESIZE => ClientMsg::Resize { size: r.opt(Reader::size)?, pixels: r.opt(Reader::pixels)? },
             type_id::DETACH => ClientMsg::Detach,
+            type_id::USE_TTY => ClientMsg::UseTty { path: r.opt(Reader::string)?, dev: r.opt(Reader::u64)? },
             _ => ClientMsg::Unknown { type_id },
         })
     }
@@ -259,6 +264,7 @@ impl ServerMsg {
                 o.push(exit_reason_to_u8(*reason));
                 put_bytes(o, message.as_bytes());
             }),
+            ServerMsg::Tty { direct } => frame(out, type_id::TTY, |o| put_bool(o, *direct)),
             ServerMsg::Unknown { .. } => Err(ProtoError::NotEncodable),
         }
     }
@@ -284,6 +290,7 @@ impl ServerMsg {
                 reason: exit_reason_from_u8(r.opt(Reader::u8)?),
                 message: r.opt(Reader::string)?,
             },
+            type_id::TTY => ServerMsg::Tty { direct: r.opt(Reader::bool)? },
             _ => ServerMsg::Unknown { type_id },
         })
     }

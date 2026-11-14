@@ -1,0 +1,898 @@
+.Dd November 15, 2026
+.Dt LIF 1
+.Os
+.Sh NAME
+.Nm lif
+.Nd terminal multiplexer with tmux commands and key bindings
+.Sh SYNOPSIS
+.Nm
+.Op Fl 2uvV
+.Op Fl f Ar file
+.Op Fl L Ar socket-name
+.Op Fl S Ar socket-path
+.Op Ar command Op Ar flags
+.Sh DESCRIPTION
+.Nm
+runs programs in panes inside windows inside sessions, keeps them running
+when the terminal goes away, and lets several terminals attach to the same
+session.
+It implements a large part of
+.Xr tmux 1 Ns 's
+command language, targets, formats, options and default key bindings.
+.Pp
+The first
+.Nm
+command that needs a server starts one in the background on the socket.
+The server reads its configuration file once at start-up (see
+.Sx FILES ) .
+Without a
+.Ar command ,
+.Nm
+runs
+.Ic new-session .
+Several commands can be given on one command line, separated by a
+.Ql \e\&;
+argument.
+.Pp
+By default the prefix key is
+.Ql C-b ;
+keys pressed after it run the commands of the prefix key table (see
+.Sx KEY BINDINGS ) .
+.Sh OPTIONS
+.Bl -tag -width "-S socket-path"
+.It Fl 2 , Fl u
+Accepted for tmux compatibility; 256 colors and UTF-8 are always on.
+.It Fl f Ar file
+Configuration file for a server started by this command.
+A relative path is relative to the current directory.
+A server that is already running keeps its configuration.
+.It Fl h
+Print the usage line and exit.
+.It Fl L Ar socket-name
+Use the socket
+.Ar socket-name
+in the default socket directory instead of
+.Pa default .
+.It Fl S Ar socket-path
+Use the socket at
+.Ar socket-path .
+.It Fl v
+Make a server started by this command log to
+.Pa lif-server- Ns Ar pid Ns Pa .log
+in the socket's directory.
+.It Fl V
+Print the version and exit.
+.El
+.Sh FILE COMMANDS
+These commands work on configuration files and need no server:
+.Bl -tag -width Ds
+.It Ic check-config Op Ar file
+Check
+.Ar file
+(by default the file the server would read) and print each problem as
+.Ar file : Ns Ar line : Ns Ar column : Li "error: " Ns Ar message .
+Prints nothing for a file without problems.
+.It Ic print-config
+Print the documented example configuration, in which every value is the
+default.
+.It Ic migrate-tmux-conf Op Ar file
+Translate a
+.Xr tmux 1
+configuration file (by default
+.Pa ~/.tmux.conf )
+to
+.Nm Ns 's
+TOML format on standard output, and print each line that was not
+translated, with the reason, on standard error.
+.El
+.Sh TARGETS
+Commands find sessions, windows and panes with
+.Fl t
+(and
+.Fl s
+for a source) as in
+.Xr tmux 1 :
+.Ar session : Ns Ar window . Ns Ar pane ,
+where each part may be a name, an index, a unique prefix or a glob, or an id
+.Li ($1, @2, %3) .
+A leading
+.Ql =
+asks for an exact name.
+Windows can also be
+.Li "{start} ^ {end} $ {last} ! {next} + {previous} -"
+and
+.Li +N , -N ;
+panes
+.Li "{last} ! {next} + {previous} - {top} {bottom} {left} {right}"
+and
+.Li {up-of} {down-of} {left-of} {right-of} .
+Inside a pane,
+.Nm
+commands without
+.Fl t
+act on that pane when they reach the same server.
+.Sh FORMATS
+Formats are expanded in
+.Fl F
+arguments,
+.Ic display-message ,
+window names, working directories and the status line:
+.Li #{name} ,
+the aliases
+.Li #S #I #W #P #T #D #F #H #h ## ,
+conditionals
+.Li #{?cond,a,b} ,
+comparisons
+.Li #{==:a,b} ,
+and modifiers such as
+.Li "#{t:...} #{b:...} #{=N:...}"
+(the full list is in
+.Pa docs/tmux-migration.md ) .
+A name that is not a variable is looked up as an option.
+.Li #(command)
+expands to nothing.
+.Sh COMMANDS
+Commands, their aliases and their flags as
+.Nm
+accepts them.
+Flags of the
+.Xr tmux 1
+command that are not shown are rejected with
+.Dq unknown flag .
+Any unambiguous prefix of a command name works.
+.Bl -tag -width Ds
+.It Xo
+.Ic attach-session Pq Ic attach
+.Op Fl d
+.Op Fl c Ar working-directory
+.Op Fl t Ar target-session
+.Xc
+Attach this terminal to a session (the most recently used one without -t).
+-d detaches other clients; -c sets the session working directory.
+.It Xo
+.Ic bind-key Pq Ic bind
+.Op Fl nr
+.Op Fl N Ar note
+.Op Fl T Ar key-table
+.Ar key Oo Ar command Oo Ar argument Ar ... Oc Oc
+.Xc
+Bind key in table (prefix by default; -n for root) to a command. -r makes it
+repeatable, -N adds a note.
+.It Xo
+.Ic break-pane Pq Ic breakp
+.Op Fl abdP
+.Op Fl F Ar format
+.Op Fl n Ar window-name
+.Op Fl s Ar src-pane
+.Op Fl t Ar dst-window
+.Xc
+Move a pane into a new window of its own.
+.It Xo
+.Ic capture-pane Pq Ic capturep
+.Op Fl eJNpq
+.Op Fl b Ar buffer-name
+.Op Fl E Ar end-line
+.Op Fl S Ar start-line
+.Op Fl t Ar target-pane
+.Xc
+Copy the text of a pane into a buffer, or print it with -p. -S and -E choose
+lines (negative numbers are history, - is the start or end), -J joins
+wrapped lines, -e keeps colors and attributes, -N keeps trailing spaces.
+.It Xo
+.Ic command-prompt
+.Op Fl 1FikNP
+.Op Fl I Ar inputs
+.Op Fl p Ar prompts
+.Op Fl T Ar prompt-type
+.Op Fl t Ar target-client
+.Oo Ar template Oc
+.Xc
+Open the command prompt on the status line, optionally with a template in
+which %% or %1 is replaced by the answer.
+.It Xo
+.Ic confirm-before Pq Ic confirm
+.Op Fl by
+.Op Fl c Ar confirm-key
+.Op Fl p Ar prompt
+.Op Fl t Ar target-client
+.Ar command
+.Xc
+Ask y/n on the status line and run command on y.
+.It Xo
+.Ic copy-mode
+.Op Fl deHMqu
+.Op Fl t Ar target-pane
+.Xc
+Enter copy mode. -u scrolls one page up, -e leaves at the bottom, -H hides
+the position, -q leaves any mode.
+.It Xo
+.Ic delete-buffer Pq Ic deleteb
+.Op Fl b Ar buffer-name
+.Xc
+Delete the newest paste buffer, or the one named with -b.
+.It Xo
+.Ic detach-client Pq Ic detach
+.Op Fl aP
+.Op Fl s Ar target-session
+.Op Fl t Ar target-client
+.Xc
+Detach the current client, or the one named with -t; -s detaches all clients
+of a session, -a all other clients.
+.It Xo
+.Ic display-message Pq Ic display
+.Op Fl lp
+.Op Fl c Ar target-client
+.Op Fl d Ar delay
+.Op Fl t Ar target-pane
+.Op Fl F Ar format
+.Oo Ar message Oc
+.Xc
+Show a message on the status line, or print it with -p. The message is a
+format.
+.It Xo
+.Ic display-panes Pq Ic displayp
+.Op Fl bN
+.Op Fl d Ar duration
+.Op Fl t Ar target-pane
+.Oo Ar template Oc
+.Xc
+Show pane numbers; typing one selects that pane (or runs template with %%
+replaced by its id).
+.It Xo
+.Ic has-session Pq Ic has
+.Op Fl t Ar target-session
+.Xc
+Exit 0 if the session exists, 1 otherwise.
+.It Xo
+.Ic kill-pane Pq Ic killp
+.Op Fl a
+.Op Fl t Ar target-pane
+.Xc
+Destroy a pane (-a: all others in its window).
+.It Xo
+.Ic kill-server
+.Xc
+Destroy all sessions and stop the server.
+.It Xo
+.Ic kill-session
+.Op Fl aC
+.Op Fl t Ar target-session
+.Xc
+Destroy a session (-a: all others). -C clears alert flags instead.
+.It Xo
+.Ic kill-window Pq Ic killw
+.Op Fl a
+.Op Fl t Ar target-window
+.Xc
+Destroy a window (-a: all others in its session).
+.It Xo
+.Ic last-pane Pq Ic lastp
+.Op Fl Z
+.Op Fl t Ar target-window
+.Xc
+Select the previously active pane of the window.
+.It Xo
+.Ic last-window Pq Ic last
+.Op Fl t Ar target-session
+.Xc
+Select the previously current window.
+.It Xo
+.Ic list-buffers Pq Ic lsb
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Xc
+List paste buffers.
+.It Xo
+.Ic list-clients Pq Ic lsc
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl t Ar target-session
+.Xc
+List attached clients.
+.It Xo
+.Ic list-commands Pq Ic lscm
+.Op Fl F Ar format
+.Oo Ar command Oc
+.Xc
+List the commands lif implements, with aliases.
+.It Xo
+.Ic list-keys Pq Ic lsk
+.Op Fl 1N
+.Op Fl P Ar prefix-string
+.Op Fl T Ar key-table
+.Oo Ar key Oc
+.Xc
+List key bindings, of one table with -T; -N lists bindings with notes.
+.It Xo
+.Ic list-panes Pq Ic lsp
+.Op Fl as
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl t Ar target-window
+.Xc
+List panes of a window (-s: of a session, -a: all).
+.It Xo
+.Ic list-sessions Pq Ic ls
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Xc
+List sessions.
+.It Xo
+.Ic list-windows Pq Ic lsw
+.Op Fl a
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl t Ar target-session
+.Xc
+List windows of a session (-a: all).
+.It Xo
+.Ic move-window Pq Ic movew
+.Op Fl abdkr
+.Op Fl s Ar src-window
+.Op Fl t Ar dst-window
+.Xc
+Move a window to another index; -r renumbers the windows of a session.
+.It Xo
+.Ic new-session Pq Ic new
+.Op Fl ADdEPX
+.Op Fl c Ar start-directory
+.Op Fl F Ar format
+.Op Fl n Ar window-name
+.Op Fl s Ar session-name
+.Op Fl x Ar width
+.Op Fl y Ar height
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Create a session and attach to it unless -d is given. -A attaches if the
+session named with -s exists. -x and -y set the size of a detached session.
+.It Xo
+.Ic new-window Pq Ic neww
+.Op Fl abdkPS
+.Op Fl c Ar start-directory
+.Op Fl F Ar format
+.Op Fl n Ar window-name
+.Op Fl t Ar target-window
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Create a window.
+.It Xo
+.Ic next-layout Pq Ic nextl
+.Op Fl t Ar target-window
+.Xc
+Apply the next layout preset.
+.It Xo
+.Ic next-window Pq Ic next
+.Op Fl a
+.Op Fl t Ar target-session
+.Xc
+Select the next window (-a: the next with an alert).
+.It Xo
+.Ic paste-buffer Pq Ic pasteb
+.Op Fl dpr
+.Op Fl b Ar buffer-name
+.Op Fl s Ar separator
+.Op Fl t Ar target-pane
+.Xc
+Paste a buffer into a pane. -p uses bracketed paste if the program asked for
+it, -d deletes the buffer, -r keeps line feeds, -s sets the separator.
+.It Xo
+.Ic previous-layout Pq Ic prevl
+.Op Fl t Ar target-window
+.Xc
+Apply the previous layout preset.
+.It Xo
+.Ic previous-window Pq Ic prev
+.Op Fl a
+.Op Fl t Ar target-session
+.Xc
+Select the previous window.
+.It Xo
+.Ic refresh-client Pq Ic refresh
+.Op Fl S
+.Op Fl t Ar target-client
+.Xc
+Redraw a client (-S: only its status line).
+.It Xo
+.Ic rename-session Pq Ic rename
+.Op Fl t Ar target-session
+.Ar new-name
+.Xc
+Rename a session.
+.It Xo
+.Ic rename-window Pq Ic renamew
+.Op Fl t Ar target-window
+.Ar new-name
+.Xc
+Rename a window (this turns automatic-rename off for it).
+.It Xo
+.Ic resize-pane Pq Ic resizep
+.Op Fl DLRUZ
+.Op Fl t Ar target-pane
+.Op Fl x Ar width
+.Op Fl y Ar height
+.Xc
+Resize a pane by adjustment cells in a direction, to -x/-y cells or a
+percentage, or toggle zoom with -Z.
+.It Xo
+.Ic respawn-pane Pq Ic respawnp
+.Op Fl k
+.Op Fl c Ar start-directory
+.Op Fl t Ar target-pane
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Start a new process in a pane whose program has exited (-k: kill the running
+one first). The scrollback is kept.
+.It Xo
+.Ic rotate-window Pq Ic rotatew
+.Op Fl DUZ
+.Op Fl t Ar target-window
+.Xc
+Rotate the panes of a window (-D: the other way).
+.It Xo
+.Ic select-layout Pq Ic selectl
+.Op Fl Enop
+.Op Fl t Ar target-pane
+.Oo Ar layout-name Oc
+.Xc
+Apply a layout: even-horizontal, even-vertical, main-horizontal,
+main-vertical, main-horizontal-mirrored, main-vertical-mirrored, tiled, or a
+layout string. -E spreads panes evenly, -n and -p step through presets, -o
+undoes the last layout change.
+.It Xo
+.Ic select-pane Pq Ic selectp
+.Op Fl DLlRUZ
+.Op Fl t Ar target-pane
+.Xc
+Make a pane active, or the pane in a direction with -L, -R, -U, -D; -l
+selects the last pane.
+.It Xo
+.Ic select-window Pq Ic selectw
+.Op Fl lnpT
+.Op Fl t Ar target-window
+.Xc
+Select a window; -l last, -n next, -p previous, -T toggles to the last
+window if already current.
+.It Xo
+.Ic send-keys Pq Ic send
+.Op Fl FHlRX
+.Op Fl N Ar repeat-count
+.Op Fl t Ar target-pane
+.Oo Ar key Ar ... Oc
+.Xc
+Send keys to a pane. -l sends text literally, -H hexadecimal bytes, -N
+repeats, -R resets the terminal, -X runs a copy-mode command, -F expands
+formats.
+.It Xo
+.Ic send-prefix
+.Op Fl 2
+.Op Fl t Ar target-pane
+.Xc
+Send the prefix key (-2: prefix2) to a pane.
+.It Xo
+.Ic set-buffer Pq Ic setb
+.Op Fl a
+.Op Fl b Ar buffer-name
+.Op Fl n Ar new-buffer-name
+.Oo Ar data Oc
+.Xc
+Set a buffer's contents; -a appends, -n renames.
+.It Xo
+.Ic set-option Pq Ic set
+.Op Fl aFgoqsuw
+.Op Fl t Ar target-pane
+.Ar option Oo Ar value Oc
+.Xc
+Set an option. -g global, -s server, -w window, -u unset, -a append, -o only
+if unset, -q quiet, -F expand formats in the value.
+.It Xo
+.Ic set-window-option Pq Ic setw
+.Op Fl aFgoqu
+.Op Fl t Ar target-window
+.Ar option Oo Ar value Oc
+.Xc
+Same as set-option -w.
+.It Xo
+.Ic show-buffer Pq Ic showb
+.Op Fl b Ar buffer-name
+.Xc
+Print a buffer.
+.It Xo
+.Ic show-messages Pq Ic showmsgs
+.Op Fl JT
+.Op Fl t Ar target-client
+.Xc
+Print the message log, which includes configuration file errors.
+.It Xo
+.Ic show-options Pq Ic show
+.Op Fl gqsvw
+.Op Fl t Ar target-pane
+.Oo Ar option Oc
+.Xc
+Show options; -v values only.
+.It Xo
+.Ic show-window-options Pq Ic showw
+.Op Fl gv
+.Op Fl t Ar target-window
+.Oo Ar option Oc
+.Xc
+Same as show-options -w.
+.It Xo
+.Ic source-file Pq Ic source
+.Op Fl Fnqv
+.Op Fl t Ar target-pane
+.Ar path Ar ...
+.Xc
+Read a lif TOML configuration file. -q ignores a missing file, -n only
+checks it.
+.It Xo
+.Ic split-window Pq Ic splitw
+.Op Fl bdhPvZ
+.Op Fl c Ar start-directory
+.Op Fl F Ar format
+.Op Fl l Ar size
+.Op Fl p Ar percentage
+.Op Fl t Ar target-pane
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Split a pane: -h side by side, -v (default) top and bottom; -l size in cells
+or N%, -p percentage, -b before, -d without selecting it, -Z zoomed, -c
+working directory, -P print the new pane (format with -F).
+.It Xo
+.Ic start-server Pq Ic start
+.Xc
+Start the server without creating a session.
+.It Xo
+.Ic swap-pane Pq Ic swapp
+.Op Fl DdUZ
+.Op Fl s Ar src-pane
+.Op Fl t Ar dst-pane
+.Xc
+Swap two panes, or with -U / -D the pane and its neighbour.
+.It Xo
+.Ic swap-window Pq Ic swapw
+.Op Fl d
+.Op Fl s Ar src-window
+.Op Fl t Ar dst-window
+.Xc
+Swap two windows.
+.It Xo
+.Ic switch-client Pq Ic switchc
+.Op Fl lnpZ
+.Op Fl c Ar target-client
+.Op Fl t Ar target-session
+.Op Fl T Ar key-table
+.Xc
+Switch the client to another session (-n next, -p previous, -l last), or set
+its key table with -T.
+.It Xo
+.Ic unbind-key Pq Ic unbind
+.Op Fl anq
+.Op Fl T Ar key-table
+.Ar key
+.Xc
+Remove a binding (-a: all in the table, -n: root table).
+.El
+.Pp
+The other
+.Xr tmux 1
+commands are recognized and fail with
+.Dq unsupported command :
+.Ic choose-buffer ,
+.Ic choose-client ,
+.Ic choose-tree ,
+.Ic clear-history ,
+.Ic clear-prompt-history ,
+.Ic clock-mode ,
+.Ic customize-mode ,
+.Ic display-menu ,
+.Ic display-popup ,
+.Ic find-window ,
+.Ic if-shell ,
+.Ic join-pane ,
+.Ic link-window ,
+.Ic load-buffer ,
+.Ic lock-client ,
+.Ic lock-server ,
+.Ic lock-session ,
+.Ic move-pane ,
+.Ic new-pane ,
+.Ic pipe-pane ,
+.Ic resize-window ,
+.Ic respawn-window ,
+.Ic run-shell ,
+.Ic save-buffer ,
+.Ic server-access ,
+.Ic set-environment ,
+.Ic set-hook ,
+.Ic show-environment ,
+.Ic show-hooks ,
+.Ic show-prompt-history ,
+.Ic suspend-client ,
+.Ic switch-mode ,
+.Ic unlink-window ,
+.Ic wait-for .
+.Sh KEY BINDINGS
+The default prefix table.
+Keys marked repeatable can be pressed again without the prefix within
+.Ic repeat-time
+milliseconds.
+.Bl -tag -width "M-Right" -compact
+.It Li Space
+next-layout
+.It Li \&!
+break-pane
+.It Li \(dq
+split-window
+.It Li #
+list-buffers
+.It Li $
+command-prompt -I "#S" { rename-session "%%" }
+.It Li %
+split-window -h
+.It Li &
+confirm-before -p "kill-window #W? (y/n)" kill-window
+.It Li '
+command-prompt -p index { select-window -t ":%%" }
+.It Li \&(
+switch-client -p
+.It Li \&)
+switch-client -n
+.It Li \&,
+command-prompt -I "#W" { rename-window "%%" }
+.It Li -
+delete-buffer
+.It Li \&.
+command-prompt { move-window -t "%%" }
+.It Li 0
+select-window -t :=0
+.It Li 1
+select-window -t :=1
+.It Li 2
+select-window -t :=2
+.It Li 3
+select-window -t :=3
+.It Li 4
+select-window -t :=4
+.It Li 5
+select-window -t :=5
+.It Li 6
+select-window -t :=6
+.It Li 7
+select-window -t :=7
+.It Li 8
+select-window -t :=8
+.It Li 9
+select-window -t :=9
+.It Li \&:
+command-prompt
+.It Li \&;
+last-pane
+.It Li \&?
+list-keys
+.It Li E
+select-layout -E
+.It Li L
+switch-client -l
+.It Li \&[
+copy-mode
+.It Li \&]
+paste-buffer -p
+.It Li c
+new-window
+.It Li d
+detach-client
+.It Li i
+display-message
+.It Li l
+last-window
+.It Li n
+next-window
+.It Li o
+select-pane -t :.+
+.It Li p
+previous-window
+.It Li q
+display-panes
+.It Li r
+refresh-client
+.It Li x
+confirm-before -p "kill-pane #P? (y/n)" kill-pane
+.It Li z
+resize-pane -Z
+.It Li {
+swap-pane -U
+.It Li }
+swap-pane -D
+.It Li PPage
+copy-mode -u
+.It Li Up
+select-pane -U (repeatable)
+.It Li Down
+select-pane -D (repeatable)
+.It Li Left
+select-pane -L (repeatable)
+.It Li Right
+select-pane -R (repeatable)
+.It Li M-1
+select-layout even-horizontal
+.It Li M-2
+select-layout even-vertical
+.It Li M-3
+select-layout main-horizontal
+.It Li M-4
+select-layout main-vertical
+.It Li M-5
+select-layout tiled
+.It Li M-6
+select-layout main-horizontal-mirrored
+.It Li M-7
+select-layout main-vertical-mirrored
+.It Li M-n
+next-window -a
+.It Li M-o
+rotate-window -D
+.It Li M-p
+previous-window -a
+.It Li M-Up
+resize-pane -U 5 (repeatable)
+.It Li M-Down
+resize-pane -D 5 (repeatable)
+.It Li M-Left
+resize-pane -L 5 (repeatable)
+.It Li M-Right
+resize-pane -R 5 (repeatable)
+.It Li C-b
+send-prefix
+.It Li C-o
+rotate-window
+.It Li C-Up
+resize-pane -U (repeatable)
+.It Li C-Down
+resize-pane -D (repeatable)
+.It Li C-Left
+resize-pane -L (repeatable)
+.It Li C-Right
+resize-pane -R (repeatable)
+.El
+.Pp
+Copy mode has the
+.Li copy-mode
+(emacs) and
+.Li copy-mode-vi
+tables, chosen by the
+.Ic mode-keys
+option; list them with
+.Ic list-keys Fl T Ar table .
+The mouse (on by default) selects panes and windows, resizes panes by their
+borders, scrolls into copy mode and selects text; mouse actions cannot be
+bound.
+.Sh ENVIRONMENT
+.Bl -tag -width XDG_CONFIG_HOME
+.It Ev LIF_SOCKET
+Socket path used when neither
+.Fl S
+nor
+.Fl L
+is given.
+.It Ev XDG_RUNTIME_DIR
+If set, the default socket directory is
+.Pa $XDG_RUNTIME_DIR/lif .
+.It Ev TMPDIR
+Otherwise the socket directory is
+.Pa $TMPDIR/lif- Ns Ar uid
+.Pq Pa /tmp/lif- Ns Ar uid No without Ev TMPDIR .
+.It Ev LIF_CONFIG
+Configuration file to read instead of the default one.
+.It Ev XDG_CONFIG_HOME
+If set to an absolute path, the configuration file is
+.Pa $XDG_CONFIG_HOME/lif/config.toml .
+.It Ev HOME
+Used for
+.Pa ~/.config/lif/config.toml
+and
+.Pa ~/.tmux.conf .
+.It Ev SHELL
+The server's
+.Ev SHELL
+becomes the default for the
+.Ic default-shell
+option.
+.It Ev VISUAL , Ev EDITOR
+If the server's
+.Ev VISUAL
+(or else
+.Ev EDITOR )
+contains
+.Ql vi ,
+.Ic mode-keys
+defaults to
+.Ql vi .
+.It Ev LIF
+Set in every pane to
+.Ar socket , Ns Ar server-pid , Ns Ar session-id .
+.Nm
+refuses to attach while it is set and not empty.
+.It Ev LIF_PANE
+Set in every pane to its pane id, for example
+.Ql %3 .
+.El
+.Pp
+Programs in panes also get
+.Ev TERM Ns = Ns Li xterm-256color ,
+.Ev COLORTERM Ns = Ns Li truecolor ,
+.Ev TERM_PROGRAM Ns = Ns Li lif
+and
+.Ev TERM_PROGRAM_VERSION ;
+.Ev TMUX
+and variables starting with
+.Li TMUX ,
+.Li LIF
+or
+.Li ZELLIJ
+are not passed on from the client.
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa ~/.config/lif/config.toml
+The configuration file (TOML), unless
+.Ev LIF_CONFIG
+or
+.Ev XDG_CONFIG_HOME
+says otherwise.
+.It Pa $TMPDIR/lif- Ns Ar uid Ns Pa /default
+The default socket.
+The directory must be owned by the user with mode 0700.
+.It Pa <socket>.lock
+Lock file used while a server starts.
+.El
+.Sh EXIT STATUS
+.Ex -std
+In particular a command that fails (unknown target, invalid option,
+unsupported command) exits 1, and
+.Ic has-session
+exits 1 when the session does not exist.
+An attached client exits 0 when it is detached or its session ends.
+.Sh EXAMPLES
+Start a named session, split it, and detach:
+.Bd -literal -offset indent
+$ lif new -s work
+C-b %      (split side by side)
+C-b d      (detach)
+$ lif attach -t work
+.Ed
+.Pp
+Print the panes of every session:
+.Bd -literal -offset indent
+$ lif list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}'
+.Ed
+.Pp
+Convert a tmux configuration and check the result:
+.Bd -literal -offset indent
+$ lif migrate-tmux-conf > ~/.config/lif/config.toml
+$ lif check-config
+.Ed
+.Sh SEE ALSO
+.Xr tmux 1
+.Pp
+The documentation in the source tree:
+.Pa README.md ,
+.Pa docs/configuration.md ,
+.Pa docs/copy-mode.md ,
+.Pa docs/tmux-migration.md .
+.Sh CAVEATS
+The configuration file is TOML, not a list of tmux commands.
+Scrollback is limited by
+.Ic scrollback-bytes ,
+not
+.Ic history-limit ,
+which is not enforced.
+.Ic escape-time
+is ignored.
+.Nm
+does not run shell commands: there is no
+.Ic run-shell
+or
+.Ic if-shell ,
+.Li #()
+expands to nothing, and
+.Ic copy-pipe
+ignores its command.

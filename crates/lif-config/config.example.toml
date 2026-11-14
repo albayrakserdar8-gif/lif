@@ -46,13 +46,17 @@ wrap-search = true
 # "off", "external" (lif sets it, programs in panes may not) or "on".
 set-clipboard = "external"
 
-# Scrollback kept per pane, in bytes. Accepts sizes: "512KB", "32MB", "1GB"
-# (1 KB = 1024 bytes).  => set -g scrollback-bytes 10485760
+# Scrollback kept per pane: at most this many bytes and at most
+# history-limit lines (below); both hold, and changing either also applies to
+# existing panes. Accepts sizes: "512KB", "32MB", "1GB" (1 KB = 1024 bytes).
+# A line of history costs about 1.7 KB at 200 columns (less in narrower
+# panes) until the pane has been quiet for 2 s, when it is compressed.
+#   => set -g scrollback-bytes 10485760
 scrollback = "10MB"
 
-# tmux's scrollback limit in lines, kept for scripts that read it; lif
-# budgets scrollback in bytes (above).
-history-limit = 2000
+# Scrollback limit in lines (tmux's history-limit), applied as well as the
+# byte budget above. 0 keeps no scrollback.
+history-limit = 4000
 
 # The shell new panes run (an absolute path), and a command to run instead
 # of a login shell. Both default to what the server starts with.
@@ -65,8 +69,12 @@ display-time = 750
 # Milliseconds pane numbers stay up (display-panes, prefix q).
 display-panes-time = 1000
 
-# Accepted for tmux compatibility; lif never waits after Escape.
-escape-time = 10
+# Milliseconds a lone Escape waits for the rest of a key sequence (Alt+key,
+# arrows) when the terminal speaks the legacy keyboard encoding. 0 never
+# waits; an Alt+key split across reads then arrives as Escape and the key,
+# as in tmux. Terminals with the kitty keyboard protocol (which lif enables
+# when the terminal supports it) never wait.
+escape-time = 5
 
 # Stop the server when the last session closes.
 exit-empty = true

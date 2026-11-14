@@ -216,7 +216,7 @@ fn new_session_and_list_sessions() {
     let spec = &t.h.spawned[0];
     assert_eq!(spec.size, Size::new(80, 24));
     assert_eq!(spec.command, SpawnCommand::LoginShell { shell: "/bin/zsh".into() });
-    assert_eq!(spec.history_limit, 2000);
+    assert_eq!(spec.history_limit, 4000);
     assert_eq!(t.ok("display -p '#{session_id} #{window_id} #{pane_id} #{window_name}'"), "$0 @0 %0 zsh\n");
     // tmux 3.8: unnamed sessions are named after their id, skipping taken
     // names ("x.y:z" took $1; next are "2" and "3").
@@ -307,10 +307,10 @@ fn split_list_panes_and_zoom() {
     // tmux 3.8 defaults.
     assert_eq!(
         t.ok("lsp"),
-        "0: [40x24] [history 0/2000, 0 bytes] %0\n1: [39x24] [history 0/2000, 0 bytes] %1 (active)\n"
+        "0: [40x24] [history 0/4000, 0 bytes] %0\n1: [39x24] [history 0/4000, 0 bytes] %1 (active)\n"
     );
-    assert_eq!(t.ok("lsp -s").lines().next().unwrap(), "0.0: [40x24] [history 0/2000, 0 bytes] %0");
-    assert_eq!(t.ok("lsp -a").lines().next().unwrap(), "a:0.0: [40x24] [history 0/2000, 0 bytes] %0");
+    assert_eq!(t.ok("lsp -s").lines().next().unwrap(), "0.0: [40x24] [history 0/4000, 0 bytes] %0");
+    assert_eq!(t.ok("lsp -a").lines().next().unwrap(), "a:0.0: [40x24] [history 0/4000, 0 bytes] %0");
     assert_eq!(t.h.resized[&PaneId(0)], Size::new(40, 24));
     assert_eq!(t.h.spawned[1].size, Size::new(39, 24));
     t.ok("splitw -v -t 0");
@@ -517,7 +517,7 @@ fn options_set_and_show() {
     assert_eq!(t.ok("show -gv @where"), "a\n");
     assert!(t.ok("show -g").contains("prefix C-b\n"));
     assert!(t.ok("show -gw").contains("window-status-current-format \"#I:#W#{?window_flags,#{window_flags}, }\"\n"));
-    assert!(t.ok("show -s").contains("escape-time 10\n"));
+    assert!(t.ok("show -s").contains("escape-time 5\n"));
 }
 
 #[test]

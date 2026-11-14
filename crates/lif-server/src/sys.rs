@@ -115,6 +115,28 @@ fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Opens a client's terminal for the server's own use: by path, so the
+/// open file description (and its O_NONBLOCK) is the server's, not shared
+/// with the shell that gets the terminal back after detaching. It must be
+/// a terminal and the device the client named.
+pub(crate) fn open_tty(path: &str, dev: u64) -> io::Result<OwnedFd> {
+    let c = std::ffi::CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: c is a valid NUL-terminated path.
+    let fd = cvt(unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC) })?;
+    // SAFETY: open returned a fresh fd nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: stat is plain data; fstat fills it for a valid fd.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and stat pointer.
+    cvt(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    // SAFETY: isatty on a valid fd.
+    let tty = unsafe { libc::isatty(fd.as_raw_fd()) } == 1;
+    if !tty || st.st_mode & libc::S_IFMT != libc::S_IFCHR || st.st_rdev as u64 != dev {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not the client's terminal"));
+    }
+    Ok(fd)
+}
+
 /// Now, with the local UTC offset.
 pub(crate) fn wall_clock() -> WallClock {
     // SAFETY: time(NULL) and localtime_r with valid pointers.

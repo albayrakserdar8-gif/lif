@@ -1,7 +1,7 @@
 //! lifbench-driver: the timing-sensitive half of the lif benchmark harness.
 //!
 //! Subcommands:
-//!   hold [--cols N] [--rows N] [--capture FILE] [--no-answer] -- CMD...
+//!   hold [--cols N] [--rows N] [--capture FILE] [--no-answer] [--kitty] -- CMD...
 //!                                          client on a PTY, commands on stdin
 //!   attach-detach [--cols N] [--rows N] [--keys HEX] [--quiet-ms N] [--timeout-ms N] -- CMD...
 //!   rusage PID...                          JSON line per pid
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: lifbench-driver hold [--cols N] [--rows N] [--capture FILE] [--no-answer] -- CMD...\n\
+        "usage: lifbench-driver hold [--cols N] [--rows N] [--capture FILE] [--no-answer] [--kitty] -- CMD...\n\
          \x20      lifbench-driver attach-detach [--cols N] [--rows N] [--keys HEX] [--quiet-ms N] [--timeout-ms N] -- CMD...\n\
          \x20      lifbench-driver rusage PID...\n\
          \x20      lifbench-driver waitfile PATH [TIMEOUT_MS]\n\
@@ -35,12 +35,14 @@ struct Opts {
     timeout_ms: u64,
     capture: Option<String>,
     answer: bool,
+    /// The fake terminal speaks the kitty keyboard protocol.
+    kitty: bool,
     quiet_ms: u64,
     argv: Vec<String>,
 }
 
 fn parse_opts(args: &[String]) -> Option<Opts> {
-    let mut o = Opts { cols: 200, rows: 50, keys: Vec::new(), timeout_ms: 10_000, capture: None, answer: true, quiet_ms: 0, argv: Vec::new() };
+    let mut o = Opts { cols: 200, rows: 50, keys: Vec::new(), timeout_ms: 10_000, capture: None, answer: true, kitty: false, quiet_ms: 0, argv: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         let v = args.get(i + 1);
@@ -57,6 +59,11 @@ fn parse_opts(args: &[String]) -> Option<Opts> {
             "--capture" => o.capture = Some(v?.clone()),
             "--no-answer" => {
                 o.answer = false;
+                i += 1;
+                continue;
+            }
+            "--kitty" => {
+                o.kitty = true;
                 i += 1;
                 continue;
             }
@@ -117,8 +124,8 @@ fn attach_detach(o: &Opts) -> i32 {
                             let _ = p.write_all(&replies);
                             replies.clear();
                         }
-                        if first.is_none() && verbose {
-                            eprintln!("{:8.3} ms first output", t0.elapsed().as_secs_f64() * 1e3);
+                        if verbose {
+                            eprintln!("{:8.3} ms output {n} bytes", t0.elapsed().as_secs_f64() * 1e3);
                         }
                         first.get_or_insert_with(Instant::now);
                         last = Instant::now();
@@ -182,7 +189,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("hold") => match parse_opts(&args[1..]) {
-            Some(o) => session::hold(&o.argv, o.cols, o.rows, o.capture.as_deref(), o.answer),
+            Some(o) => session::hold(&o.argv, o.cols, o.rows, o.capture.as_deref(), o.answer, o.kitty),
             None => usage(),
         },
         Some("attach-detach") => match parse_opts(&args[1..]) {

@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use lif_core::{ClientId, Host, KeyDecision, PaneId};
-use lif_input::{InputEvent, TermResponse};
+use lif_input::{InputEvent, Pending, TermResponse};
 use lif_types::{Key, KeyAction, KeyEvent, MouseAction, MouseButton, MouseEvent, Mods, Pos};
 use lif_vt::{VtEngine, VtEvent};
 
@@ -22,10 +22,20 @@ pub(crate) const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration:
 
 impl Server {
     pub(crate) fn client_input(&mut self, id: ClientId, bytes: &[u8], now: Instant) {
+        let esc = self.rt.escape_time;
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
         let mut events = std::mem::take(&mut a.events);
         a.parser.feed(bytes, &mut events);
-        a.input_deadline = a.parser.pending_timeout().map(|t| now + t);
+        // A lone ESC (legacy keyboard only) waits escape-time for the rest
+        // of a sequence; 0 decides at once, as tmux does.
+        if esc.is_zero() && a.parser.pending() == Pending::Ambiguous {
+            a.parser.flush_pending(&mut events);
+        }
+        a.input_deadline = match a.parser.pending() {
+            Pending::None => None,
+            Pending::Ambiguous => Some(now + esc),
+            Pending::Incomplete => Some(now + lif_input::DEFAULT_INCOMPLETE_TIMEOUT),
+        };
         for ev in events.drain(..) {
             self.input_event(id, ev, now);
         }
@@ -176,7 +186,7 @@ impl Server {
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
         p.engine.encode_key(key, &mut b);
-        self.rt.write_pane(pane, &b);
+        self.rt.write_input(pane, &b);
         self.replies = b;
         self.block_if_full(client, pane);
     }
@@ -449,7 +459,7 @@ impl Server {
             let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
             let mut b = Vec::new();
             p.engine.encode_mouse(&local, &mut b);
-            self.rt.write_pane(pane, &b);
+            self.rt.write_input(pane, &b);
             if mouse_opt && m.action == MouseAction::Press && pane != active {
                 self.run_string(id, &format!("select-pane -t {pane}"));
             }
@@ -516,7 +526,7 @@ impl Server {
                     for _ in 0..WHEEL_LINES {
                         p.engine.encode_key(&k, &mut bytes);
                     }
-                    self.rt.write_pane(pane, &bytes);
+                    self.rt.write_input(pane, &bytes);
                     return;
                 }
                 if !up {
@@ -595,7 +605,7 @@ impl Server {
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
         p.engine.encode_paste_chunk(data, &mut b);
-        self.rt.write_pane(pane, &b);
+        self.rt.write_input(pane, &b);
         self.replies = b;
         self.block_if_full(id, pane);
     }
@@ -653,9 +663,12 @@ impl Server {
             a.renderer.set_caps(caps);
             a.renderer.invalidate();
             a.needs_frame = true;
+            // Usually right after the first frame of an attach: the repaint
+            // with the real capabilities is not output to coalesce, so it
+            // goes out at once instead of a pacing interval later.
+            a.last_frame = None;
         }
-        let em = crate::client::emergency_bytes(a);
-        crate::panic::set(std::os::fd::AsRawFd::as_raw_fd(&c.stream), em);
+        c.arm_panic();
         if !out.is_empty() {
             c.send_output(&out);
             self.rt.flush_client(id);

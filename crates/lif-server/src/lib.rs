@@ -33,11 +33,27 @@ use std::time::Duration;
 
 pub use mode::{ModeAction, ModeCtx, PaneMode};
 
-/// Shortest time between two frames sent to one client. A keypress echo is
-/// rendered in the same loop iteration as long as the previous frame is
-/// older than this; output arriving faster is coalesced. 8 ms (125 Hz) is
-/// above the refresh rate of nearly every display, so pacing never shows.
+/// Shortest time between two frames sent to one client for output nobody
+/// typed for: output arriving faster is coalesced (8 ms, 125 Hz, is above
+/// the refresh rate of nearly every display). Pacing never applies to the
+/// echo of input: see [`ECHO_WINDOW`].
 pub const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Interactive echo. The first output a pane produces after a client's
+/// input reached it is drawn in the same loop iteration, whatever the
+/// pacing, and only that pane is refreshed for it (a pane flooding output
+/// next to it keeps its paced frames and cannot delay the echo). Output in
+/// the following `ECHO_WINDOW` (a shell redrawing its line after the echo,
+/// a program answering the key in several writes) is drawn at most
+/// [`ECHO_INTERVAL`] apart, until [`ECHO_WINDOW_BYTES`] of output show
+/// that the key started a flood, which is then paced like any other.
+pub const ECHO_WINDOW: Duration = Duration::from_millis(20);
+
+/// Shortest time between two frames of a pane inside its [`ECHO_WINDOW`].
+pub const ECHO_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Output after a key beyond which the pane counts as flooding again.
+pub const ECHO_WINDOW_BYTES: usize = 64 * 1024;
 
 /// Bytes read from one PTY per loop iteration before other panes and the
 /// clients get their turn.

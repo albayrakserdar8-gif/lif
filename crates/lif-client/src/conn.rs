@@ -92,16 +92,18 @@ pub fn hello_from_env() -> Hello {
         Err(_) => Default::default(),
     };
     let var = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    let is_tty = sys::isatty(0) && sys::isatty(1);
     Hello {
         protocol: PROTOCOL_VERSION,
-        caps: Caps::NONE,
+        // On a terminal the server may take it over while attached.
+        caps: if is_tty { Caps::TTY } else { Caps::NONE },
         pid: std::process::id(),
         size,
         pixels,
         term: var("TERM").unwrap_or_default(),
         cwd: std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         env: ENV_ALLOW_LIST.iter().filter_map(|k| Some((k.to_string(), var(k)?))).collect(),
-        is_tty: sys::isatty(0) && sys::isatty(1),
+        is_tty,
     }
 }
 

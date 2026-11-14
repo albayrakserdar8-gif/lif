@@ -626,12 +626,16 @@ class LifAdapter(Adapter):
         return sh(self.base() + list(args), env=self.env(), check=check)
 
     def config_text(self):
+        if self.opts.get("escape_time") is not None:
+            return f"set-option -s escape-time {self.opts['escape_time']}"
+        if self.opts.get("kitty"):
+            return "built-in defaults; the driver's terminal answers the kitty keyboard query"
         if self.opts.get("history"):
             # Scrollback is a byte budget. Rows are stored at full width, so
             # 100k lines at 200 columns need ~170 MB; 1 GiB keeps them all.
             return (f"set-option -g scrollback-bytes {LIF_HISTORY_BYTES}; "
                     f"set-option -g history-limit {self.opts['history']} (then a fresh window)")
-        return "built-in defaults (scrollback-bytes 10485760, history-limit 2000, escape-time unused)"
+        return "built-in defaults"
 
     def start(self):
         self.lif("new-session", "-d", "-s", self.session, "-x", str(COLS), "-y", str(ROWS), check=True)
@@ -641,6 +645,8 @@ class LifAdapter(Adapter):
             # The first pane was created with the default budget; replace it.
             self.lif("new-window", "-t", self.session, check=True)
             self.lif("kill-window", "-t", f"{self.session}:0", check=True)
+        if self.opts.get("escape_time") is not None:
+            self.lif("set-option", "-s", "escape-time", str(self.opts["escape_time"]), check=True)
         self.server_pids()
 
     def client_argv(self):
@@ -693,7 +699,19 @@ class LifAdapter(Adapter):
 LIF_HISTORY_BYTES = 1 << 30
 
 
-ADAPTERS = {"none": NoneAdapter, "tmux": TmuxAdapter, "zellij": ZellijAdapter, "lif": LifAdapter}
+class LifBaseAdapter(LifAdapter):
+    """Another lif build (default: bench/tmp/ab/lif-head, a copy of an older
+    build, or $LIFBENCH_LIF_BASE), for before/after comparisons in one run."""
+
+    name = "lifbase"
+
+    @classmethod
+    def binary_name(cls):
+        return os.environ.get("LIFBENCH_LIF_BASE") or os.path.join(ROOT, "bench", "tmp", "ab", "lif-head")
+
+
+ADAPTERS = {"none": NoneAdapter, "tmux": TmuxAdapter, "zellij": ZellijAdapter, "lif": LifAdapter,
+            "lifbase": LifBaseAdapter}
 
 
 # --------------------------------------------------------------------------
@@ -701,8 +719,8 @@ ADAPTERS = {"none": NoneAdapter, "tmux": TmuxAdapter, "zellij": ZellijAdapter, "
 
 
 class Driver:
-    def __init__(self, argv, env):
-        self.p = subprocess.Popen([DRIVER, "hold", "--cols", str(COLS), "--rows", str(ROWS), "--"] + argv,
+    def __init__(self, argv, env, flags=()):
+        self.p = subprocess.Popen([DRIVER, "hold", "--cols", str(COLS), "--rows", str(ROWS), *flags, "--"] + argv,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True, bufsize=1)
         hello = json.loads(self.p.stdout.readline())
         self.client_pid = hello["pid"]
@@ -750,7 +768,9 @@ class Session:
         try:
             t0 = time.perf_counter()
             self.ad.start()
-            self.driver = Driver(self.ad.client_argv(), self.ad.env())
+            # --kitty: the fake terminal speaks the kitty keyboard protocol.
+            flags = ["--kitty"] if self.ad.opts.get("kitty") else []
+            self.driver = Driver(self.ad.client_argv(), self.ad.env(), flags)
             r = self.driver.cmd(f"ready {self.marker('ready')} 30000 {self.ready_retry_ms}")
             if not r.get("ok"):
                 raise RuntimeError(f"{self.ad.name}: session never became ready: {r}")
@@ -1037,8 +1057,13 @@ def m_latency(tools, n, rounds):
 def m_esc(tool, n):
     out = {}
     variants = [("esc_default", {})]
-    if tool == "tmux":
+    if tool in ("tmux", "lif", "lifbase"):
         variants.append(("esc_time_0", {"escape_time": 0}))
+    if tool in ("lif", "lifbase"):
+        # A terminal with the kitty keyboard protocol: lif turns it on and
+        # Escape arrives unambiguously (tmux 3.8 and zellij 0.46 do not
+        # push kitty flags, so for them this is the legacy case again).
+        variants.append(("esc_kitty", {"kitty": True}))
     for label, opts in variants:
         with Session(tool, opts) as s:
             mk = s.marker("probe")
@@ -1302,7 +1327,8 @@ def report(docs):
 
     header("Input latency (us: p50 / p95 / p99 / max)")
     for key, label in (("echo_idle", "key echo, idle"), ("echo_flood", "key echo, other pane runs `yes`"),
-                       ("esc_default", "bare ESC, default config"), ("esc_time_0", "bare ESC, escape-time 0")):
+                       ("esc_default", "bare ESC, default config"), ("esc_time_0", "bare ESC, escape-time 0"),
+                       ("esc_kitty", "bare ESC, terminal with kitty keyboard protocol")):
         vals = []
         for d in docs:
             l = get(d, "metrics", "latency", key)

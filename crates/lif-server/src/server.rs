@@ -15,8 +15,8 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::ServerOptions;
-use crate::client::{CLIENT_READ_BUDGET, ClientRt};
-use crate::host::{CLIENT_TOKEN, PANE_TOKEN, Rt};
+use crate::client::{CLIENT_READ_BUDGET, ClientRt, TermOut, Tty};
+use crate::host::{CLIENT_TOKEN, PANE_TOKEN, Rt, TTY_TOKEN};
 use crate::sys::{self, SignalPipe};
 
 const LISTENER: Token = Token(0);
@@ -29,6 +29,12 @@ const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Size of the PTY read buffer (one engine `feed`).
 const READ_BUF: usize = 64 * 1024;
+
+/// Bytes read from a client's terminal per loop iteration (one parser feed).
+const TTY_READ_BUF: usize = 16 * 1024;
+
+/// Optional protocol features this server implements.
+const SERVER_CAPS: Caps = Caps::TTY;
 
 /// About how long one step of a copy-mode search may take before the loop
 /// looks at its descriptors again.
@@ -46,13 +52,15 @@ pub(crate) struct Server {
     /// Loop iterations, for the idle-wakeup test and the stats log.
     pub(crate) iterations: u64,
     read_buf: Vec<u8>,
+    tty_buf: Vec<u8>,
     pub(crate) start: Instant,
     first_client_deadline: Option<Instant>,
     ready: Vec<(Token, bool, bool)>,
     sigs: Vec<libc::c_int>,
     pub(crate) vt_events: Vec<VtEvent>,
     pub(crate) replies: Vec<u8>,
-    pub(crate) due: Vec<ClientId>,
+    /// Clients drawn this tick: (client, full frame or echo only).
+    pub(crate) due: Vec<(ClientId, bool)>,
     pub(crate) refreshed: Vec<PaneId>,
     pub(crate) scene_scratch: Vec<ScenePane<'static>>,
     /// Reused id lists, so a loop iteration allocates nothing.
@@ -99,6 +107,7 @@ impl Server {
             next_client: 1,
             iterations: 0,
             read_buf: vec![0; READ_BUF],
+            tty_buf: Vec::new(),
             start: now,
             first_client_deadline: Some(now + FIRST_CLIENT_TIMEOUT),
             ready: Vec::new(),
@@ -206,6 +215,15 @@ impl Server {
             LISTENER => self.accept(),
             REAPER => self.reap(now),
             SIGNALS => self.handle_signals(),
+            Token(t) if t & TTY_TOKEN != 0 => {
+                let id = ClientId((t & 0xffff_ffff) as u32);
+                if writable {
+                    self.rt.flush_client(id);
+                }
+                if readable {
+                    self.read_tty(id, now);
+                }
+            }
             Token(t) if t & CLIENT_TOKEN != 0 && t & PANE_TOKEN == 0 => {
                 let id = ClientId((t & 0xffff_ffff) as u32);
                 if writable {
@@ -245,8 +263,7 @@ impl Server {
             if let Some(p) = c.blocked_on
                 && !self.rt.panes.get(&p).is_some_and(|p| p.pty.is_some())
             {
-                c.blocked_on = None;
-                c.read_more = true;
+                c.unblock();
             }
             if c.read_more && c.blocked_on.is_none() {
                 clients.push(c.id);
@@ -254,6 +271,11 @@ impl Server {
         }
         for &c in &clients {
             self.read_client(c, now);
+        }
+        clients.clear();
+        clients.extend(self.rt.clients.values().filter(|c| c.tty_read_more()).map(|c| c.id));
+        for &c in &clients {
+            self.read_tty(c, now);
         }
         self.scratch_clients = clients;
         self.timers(now);
@@ -306,7 +328,7 @@ impl Server {
             min(p.autoscroll_at);
         }
         for c in self.rt.clients.values() {
-            if c.read_more && c.blocked_on.is_none() {
+            if (c.read_more && c.blocked_on.is_none()) || c.tty_read_more() {
                 return Some(now);
             }
             if let Some(a) = c.att.as_ref() {
@@ -394,8 +416,7 @@ impl Server {
         if p.wq.len() <= crate::PANE_WRITE_HIGH / 2 {
             for c in self.rt.clients.values_mut() {
                 if c.blocked_on == Some(id) {
-                    c.blocked_on = None;
-                    c.read_more = true;
+                    c.unblock();
                 }
             }
         }
@@ -405,6 +426,7 @@ impl Server {
         let Some(p) = self.rt.panes.get_mut(&id) else { return };
         let r = p.read(&mut self.read_buf, budget);
         if r.bytes > 0 {
+            p.echo_bytes = p.echo_bytes.saturating_add(r.bytes);
             p.compact_at = Some(now + crate::COMPACT_AFTER);
             p.output_seen = true;
             if p.engine.modes().synchronized_output {
@@ -553,16 +575,108 @@ impl Server {
                     self.disconnect(id);
                     return;
                 }
+                ClientMsg::UseTty { path, dev } => self.use_tty(id, &path, dev),
                 ClientMsg::Unknown { .. } => {}
             }
         }
     }
 
+    /// The attached client's terminal is in raw mode and is `path`: open
+    /// it and use it directly (see `client::TermOut`), or relay if that
+    /// fails. Either way the terminal bytes held back so far go out now.
+    fn use_tty(&mut self, id: ClientId, path: &str, dev: u64) {
+        let Some(c) = self.rt.clients.get_mut(&id) else { return };
+        if !matches!(c.term_out, TermOut::Hold(_)) {
+            return;
+        }
+        let token = Token(TTY_TOKEN | id.0 as usize);
+        let mut tty = None;
+        if !path.is_empty() {
+            match sys::open_tty(path, dev) {
+                Ok(fd) => match self.rt.registry.register(&mut SourceFd(&fd.as_raw_fd()), token, Interest::READABLE) {
+                    Ok(()) => tty = Some(Tty::new(fd, token)),
+                    Err(e) => log!("client {id}: cannot poll {path}: {e}"),
+                },
+                Err(e) => log!("client {id}: cannot use {path}: {e}"),
+            }
+        }
+        let direct = tty.is_some();
+        let held = match std::mem::replace(&mut c.term_out, tty.map_or(TermOut::Relay, TermOut::Direct)) {
+            TermOut::Hold(h) => h,
+            _ => Vec::new(),
+        };
+        c.send(&ServerMsg::Tty { direct });
+        c.send_output(&held);
+        c.arm_panic();
+        if let Some(a) = c.att.as_mut() {
+            a.needs_frame = true;
+        }
+        log!("client {id}: terminal {}", if direct { path } else { "relayed" });
+        self.rt.flush_client(id);
+    }
+
+    /// Keys from a client's terminal the server reads itself: everything
+    /// it has, up to one buffer, as one parser feed.
+    fn read_tty(&mut self, id: ClientId, now: Instant) {
+        let mut buf = std::mem::take(&mut self.tty_buf);
+        buf.resize(TTY_READ_BUF, 0);
+        let mut n = 0;
+        let mut gone = false;
+        if let Some(c) = self.rt.clients.get_mut(&id) {
+            let paused = c.dead || c.blocked_on.is_some();
+            if let Some(t) = c.tty_mut()
+                && !t.dead
+                && !paused
+            {
+                t.read_more = false;
+                let fd = t.fd.as_raw_fd();
+                loop {
+                    if n == buf.len() {
+                        t.read_more = true;
+                        break;
+                    }
+                    // SAFETY: the slice is valid for its length; the fd is ours.
+                    let r = unsafe { libc::read(fd, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
+                    if r > 0 {
+                        n += r as usize;
+                        continue;
+                    }
+                    if r == 0 {
+                        gone = true;
+                        break;
+                    }
+                    match io::Error::last_os_error().kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => {}
+                        _ => {
+                            gone = true;
+                            break;
+                        }
+                    }
+                }
+                if gone {
+                    t.dead = true;
+                    t.read_more = false;
+                    let _ = self.rt.registry.deregister(&mut SourceFd(&fd));
+                }
+            }
+        }
+        if n > 0 {
+            self.client_input(id, &buf[..n], now);
+        }
+        self.tty_buf = buf;
+        if gone {
+            log!("client {id}: terminal hung up");
+            self.disconnect(id);
+        }
+    }
+
     fn hello(&mut self, id: ClientId, h: lif_proto::Hello) {
         let Some(c) = self.rt.clients.get_mut(&id) else { return };
+        c.caps = SERVER_CAPS.intersect(h.caps);
         c.send(&ServerMsg::Welcome {
             protocol: PROTOCOL_VERSION,
-            caps: Caps::NONE.intersect(h.caps),
+            caps: c.caps,
             server_version: env!("CARGO_PKG_VERSION").into(),
             server_pid: std::process::id(),
         });
@@ -628,12 +742,34 @@ impl Server {
             self.sync_mode_config(p);
         }
         let r = self.model.execute_list(list, &ctx, &mut self.rt);
-        // Options may have changed the styles views are drawn with.
+        // Options may have changed the styles views are drawn with, and
+        // the scrollback limits of existing panes.
         if list.commands().iter().any(|c| matches!(c.name(), "set-option" | "set-window-option" | "source-file")) {
             self.rt.views_stale = true;
+            self.apply_options();
         }
         self.after_model();
         r
+    }
+
+    /// Options the loop keeps in its own form: `escape-time`, and
+    /// `scrollback-bytes` / `history-limit` of each pane's session, applied
+    /// to panes whose limits differ (tmux applies `history-limit` only to
+    /// new panes; lif's engine can change them in place).
+    fn apply_options(&mut self) {
+        if let Some(ms) = self.model.option_text("escape-time", None, None).and_then(|v| v.parse::<u64>().ok()) {
+            self.rt.escape_time = Duration::from_millis(ms);
+        }
+        for p in self.rt.panes.values_mut() {
+            let Some(sid) = self.model.pane(p.id).and_then(|m| self.model.window(m.window())).map(|w| w.session()) else { continue };
+            let num = |name: &str| self.model.option_text(name, Some(sid), None).and_then(|v| v.parse::<usize>().ok());
+            let (Some(bytes), Some(lines)) = (num("scrollback-bytes"), num("history-limit")) else { continue };
+            let want = crate::pane::scrollback_limits(bytes, lines);
+            if want != p.scrollback {
+                p.scrollback = want;
+                p.engine.set_scrollback_limits(want.0, want.1);
+            }
+        }
     }
 
     /// After any model call: drop a respawn stash nobody took, forget
@@ -696,6 +832,8 @@ impl Server {
         }
         c.dead = true;
         log!("client {id} disconnected");
+        // What it showed may now be hidden (see Server::release_hidden_panes).
+        self.rt.views_stale = true;
         self.model.client_disconnect(id, &mut self.rt);
         self.after_model();
     }
@@ -707,13 +845,20 @@ impl Server {
         let dead: Vec<ClientId> = self.rt.clients.values().filter(|c| c.dead).map(|c| c.id).collect();
         for id in dead {
             if let Some(mut c) = self.rt.clients.remove(&id) {
-                crate::panic::remove(c.stream.as_raw_fd());
+                c.disarm_panic();
                 let _ = self.rt.registry.deregister(&mut c.stream);
+                if let Some(t) = c.tty()
+                    && !t.dead
+                {
+                    let _ = self.rt.registry.deregister(&mut SourceFd(&t.fd.as_raw_fd()));
+                }
                 if self.model.client(id).is_some() {
                     self.model.client_disconnect(id, &mut self.rt);
                 }
             }
         }
+        self.rt.views_stale = true;
+        self.sync_views();
     }
 
     /// Orderly exit: deliver what is pending to clients, hang up every

@@ -48,8 +48,12 @@ pub struct VtOptions {
     pub size: Size,
     /// Pixel size of the whole pane; zero if unknown.
     pub pixels: PixelSize,
-    /// Scrollback budget in bytes (not lines). 0 disables scrollback.
+    /// Scrollback budget in bytes. 0 disables scrollback.
     pub scrollback_bytes: usize,
+    /// Scrollback limit in lines (`None`: only the byte budget). Both
+    /// limits hold; the engine trims whole storage pages, so slightly more
+    /// lines than this may stay.
+    pub scrollback_lines: Option<usize>,
     /// The default colors the pane reports to programs that ask (OSC 10 /
     /// 11 / 12 queries, which vim and neovim use to pick a dark or light
     /// theme). The server passes the outer terminal's colors as the
@@ -68,6 +72,7 @@ impl Default for VtOptions {
             size: Size::new(80, 24),
             pixels: PixelSize::default(),
             scrollback_bytes: 10 * 1024 * 1024,
+            scrollback_lines: None,
             default_fg: None,
             default_bg: None,
             default_cursor: None,
@@ -316,8 +321,21 @@ pub trait VtEngine: Sized {
 
     fn memory(&self) -> VtMemory;
 
-    /// Opportunistically compress cold scrollback. The server calls this
-    /// when a pane has been quiet for a while. Must be cheap when there is
-    /// nothing to do.
-    fn compact(&mut self);
+    /// Opportunistically give memory back: compress cold scrollback, and
+    /// after a resize rebuild storage that the resize left larger than the
+    /// contents. The server calls this when a pane has been quiet for a
+    /// while (and after a resize). Each call does a bounded amount of work
+    /// (about a millisecond); returns true when more remains, and the caller
+    /// calls again soon (while the pane stays quiet). Must be cheap when
+    /// there is nothing to do.
+    fn compact(&mut self) -> bool;
+
+    /// Change the scrollback limits (see [`VtOptions::scrollback_bytes`]
+    /// and [`VtOptions::scrollback_lines`]). Lowering them drops history at
+    /// once.
+    fn set_scrollback_limits(&mut self, bytes: usize, lines: Option<usize>);
+
+    /// The pane is not shown to anyone: drop what the next `refresh` can
+    /// rebuild (render caches), which then rewrites the whole frame.
+    fn release_caches(&mut self) {}
 }

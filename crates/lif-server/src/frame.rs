@@ -1,24 +1,31 @@
 //! Views, deadlines and frames.
 //!
 //! Per frame tick, exactly as the `Renderer` docs prescribe: every pane
-//! visible to a client that gets a frame now is refreshed once into its
-//! single `PaneFrame`; every attached client showing a refreshed pane then
-//! either renders (it is due) or `skip`s (paced, its socket is full, or a
-//! pane it shows is inside a synchronized update); then the dirty flags of
-//! the refreshed frames are cleared.
+//! that changed and is visible to a client that gets a frame now is
+//! refreshed once into its single `PaneFrame`; every attached client
+//! showing a refreshed pane then either renders (it is due) or `skip`s
+//! (paced, or its socket is full); then the dirty flags of the refreshed
+//! frames are cleared.
+//!
+//! A client is due for a full frame when something it shows changed and
+//! its last full frame is at least `MIN_FRAME_INTERVAL` old, and for an
+//! echo frame at once when a pane it shows produced the echo of input (see
+//! `ECHO_WINDOW`). An echo frame refreshes only the echoing panes. Panes
+//! inside a synchronized update are left out of every frame until it ends
+//! or `SYNC_TIMEOUT` passes.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use lif_core::{ClientId, PaneId};
 use lif_render::{Message, Scene, ScenePane, StatusBar, StatusPosition, Theme, pane_cursor};
-use lif_types::{Cursor, Pos, Rect, Size, Style};
+use lif_types::{Cursor, PaneFrame, Pos, Rect, Size, Style};
 use lif_vt::VtEngine;
 
 use crate::client::ClientRt;
-use crate::pane::PaneRt;
+use crate::pane::{Echo, PaneRt};
 use crate::server::Server;
-use crate::{MIN_FRAME_INTERVAL, SYNC_TIMEOUT};
+use crate::MIN_FRAME_INTERVAL;
 
 /// Automatic window names are re-derived at most this often per window.
 const NAME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -82,6 +89,30 @@ impl Server {
             }
         }
         self.scratch_views = ids;
+        self.release_hidden_panes();
+    }
+
+    /// A pane no attached client shows keeps only its terminal: its frame
+    /// and the engine's render caches are rebuilt by the next refresh if a
+    /// client shows it again. With no client attached, that is every pane.
+    fn release_hidden_panes(&mut self) {
+        for p in self.rt.panes.values_mut() {
+            p.shown = false;
+        }
+        for c in self.rt.clients.values().filter(|c| !c.dead) {
+            let Some(view) = c.att.as_ref().and_then(|a| a.view.as_ref()) else { continue };
+            for (pid, _) in &view.panes {
+                if let Some(p) = self.rt.panes.get_mut(pid) {
+                    p.shown = true;
+                }
+            }
+        }
+        for p in self.rt.panes.values_mut() {
+            if !p.shown && p.frame.size != Size::default() {
+                p.engine.release_caches();
+                p.frame = PaneFrame::default();
+            }
+        }
     }
 
     /// The styles lif draws its own decorations in, from the options of
@@ -153,8 +184,9 @@ impl Server {
         let mut renamed = Vec::new();
         for p in self.rt.panes.values_mut() {
             if p.compact_at.is_some_and(|d| d <= now) {
-                p.compact_at = None;
-                p.engine.compact();
+                // More to do: again on the next turn of the loop (output
+                // arriving meanwhile pushes it back by COMPACT_AFTER).
+                p.compact_at = p.engine.compact().then_some(now);
             }
             if p.name_recheck.is_some_and(|d| d <= now) {
                 p.name_recheck = None;
@@ -178,59 +210,82 @@ impl Server {
                 let Some(a) = c.att.as_mut() else { continue };
                 a.frame_deadline = None;
                 let Some(view) = a.view.as_ref() else { continue };
-                let mut dirty = a.needs_frame;
-                let mut hold: Option<Instant> = None;
+                // `full`: something to draw at the paced rate; `echo`:
+                // a pane to draw now for the echo of input.
+                let mut full = a.needs_frame;
+                let mut echo = false;
+                let mut deadline: Option<Instant> = None;
+                let mut later = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
                 for (pid, _) in &view.panes {
-                    if let Some(p) = panes.get(pid) {
-                        dirty |= p.engine.is_dirty();
-                        if let Some(t) = p.sync_since {
-                            let until = t + SYNC_TIMEOUT;
-                            if now < until {
-                                hold = Some(hold.map_or(until, |h| h.min(until)));
+                    let Some(p) = panes.get(pid) else { continue };
+                    if !p.changed() {
+                        continue;
+                    }
+                    if let Some(until) = p.held(now) {
+                        later(until);
+                        continue;
+                    }
+                    match p.echo(now) {
+                        Echo::Now => echo = true,
+                        Echo::At(t) => {
+                            later(t);
+                            full = true;
+                        }
+                        Echo::No => full = true,
+                    }
+                }
+                if full {
+                    a.needs_frame = true;
+                }
+                if (full || echo) && !pending {
+                    let paced = a.last_frame.map(|l| l + MIN_FRAME_INTERVAL).filter(|&t| now < t);
+                    match paced {
+                        None if full => due.push((*id, true)),
+                        _ => {
+                            if echo {
+                                due.push((*id, false));
+                            }
+                            if full && let Some(t) = paced {
+                                later(t);
                             }
                         }
                     }
                 }
-                if !dirty {
-                    continue;
-                }
-                a.needs_frame = true;
-                if pending {
-                    // The socket is full: rendered when it drains.
-                    continue;
-                }
-                if let Some(h) = hold {
-                    a.frame_deadline = Some(h);
-                    continue;
-                }
-                if let Some(last) = a.last_frame
-                    && now < last + MIN_FRAME_INTERVAL
-                {
-                    a.frame_deadline = Some(last + MIN_FRAME_INTERVAL);
-                    continue;
-                }
-                due.push(*id);
+                // A client whose socket is full is drawn when it drains.
+                a.frame_deadline = if pending { None } else { deadline };
             }
         }
         if due.is_empty() {
             self.due = due;
             return;
         }
-        for &id in &due {
+        for &(id, _) in &due {
             self.prepare_chrome(id, now);
         }
         let mut refreshed = std::mem::take(&mut self.refreshed);
         refreshed.clear();
-        for &id in &due {
+        for &(id, full) in &due {
             let Some(view) = self.rt.clients.get(&id).and_then(|c| c.att.as_ref()).and_then(|a| a.view.as_ref()) else { continue };
             for (pid, _) in &view.panes {
-                if let Some(p) = self.rt.panes.get_mut(pid)
-                    && !p.refreshed
-                {
-                    p.engine.refresh(&mut p.frame);
-                    p.refreshed = true;
-                    refreshed.push(*pid);
+                let Some(p) = self.rt.panes.get_mut(pid) else { continue };
+                // A pane in a mode is refreshed with every full frame: the
+                // mode's own frame flags are cleared with the pane's.
+                if p.refreshed || !(p.changed() || (full && p.mode.is_some())) || p.held(now).is_some() {
+                    continue;
                 }
+                // An echo frame leaves every other pane as it was drawn
+                // last: an unrefreshed frame has no dirty rows, so the
+                // renderer keeps showing it, and the engine stays dirty for
+                // the next paced frame.
+                if !full && p.echo(now) != Echo::Now {
+                    continue;
+                }
+                p.engine.refresh(&mut p.frame);
+                p.refreshed = true;
+                p.frame_marked = false;
+                p.echo_credit = false;
+                p.last_refresh = Some(now);
+                refreshed.push(*pid);
             }
         }
         let mut scratch = std::mem::take(&mut self.scene_scratch);
@@ -238,19 +293,19 @@ impl Server {
         ids.clear();
         ids.extend(self.rt.clients.keys().copied());
         for &id in &ids {
-            let is_due = due.contains(&id);
+            let is_due = due.iter().find(|(c, _)| *c == id).map(|&(_, full)| full);
             let Some(c) = self.rt.clients.get_mut(&id) else { continue };
             let Some(a) = c.att.as_ref() else { continue };
             let Some(view) = a.view.as_ref() else { continue };
-            if !is_due && !view.panes.iter().any(|(p, _)| refreshed.contains(p)) {
+            if is_due.is_none() && !view.panes.iter().any(|(p, _)| refreshed.contains(p)) {
                 continue;
             }
-            draw_client(&self.rt.panes, c, is_due, &mut scratch);
-            if is_due && let Some(a) = c.att.as_mut() {
-                a.needs_frame = false;
-                a.last_frame = Some(now);
-            }
-            if is_due {
+            draw_client(&self.rt.panes, c, is_due.is_some(), &mut scratch);
+            if let Some(full) = is_due {
+                if full && let Some(a) = c.att.as_mut() {
+                    a.needs_frame = false;
+                    a.last_frame = Some(now);
+                }
                 self.rt.flush_client(id);
             }
         }
@@ -357,7 +412,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
         }
     }
     let start = if render { Some(c.begin_frame()) } else { None };
-    let ClientRt { att, out, .. } = c;
+    let (att, out) = c.frame_parts();
     let Some(a) = att.as_mut() else { return };
     let mut sp = recycle(scratch);
     let mut prompt_col = 0;

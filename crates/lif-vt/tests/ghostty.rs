@@ -898,3 +898,75 @@ fn row_scan_reads_the_same_rows_and_moves_the_viewport() {
     v.set_viewport_top(h);
     assert_eq!(v.viewport_offset(), 0);
 }
+
+/// Everything a program or user can observe of the primary and alternate
+/// screen, the modes, the strings and the query answers.
+fn observable(v: &mut GhosttyVt) -> String {
+    let f = frame(v);
+    let rows: Vec<String> = (0..f.rows.len()).map(|y| row_text(&f, y)).collect();
+    v.feed(b"\x1b[c\x1b]11;?\x1b\\\x1b[6n");
+    let r = String::from_utf8_lossy(&replies(v)).into_owned();
+    let up = enc_key(v, key(Key::Up, Mods::NONE));
+    format!(
+        "{:?}\n{:?}\n{}\n{}\n{:?}\n{:?}\n{}\n{r:?}\n{:?}",
+        v.modes(),
+        f.cursor,
+        v.title(),
+        v.pwd(),
+        rows,
+        v.scrollback_rows(),
+        v.capture(TextRange::All, TextOptions { styled: true, ..Default::default() }),
+        up,
+    )
+}
+
+/// After a resize, `compact` rebuilds a small terminal from a snapshot of
+/// itself to give back storage the resize left behind. Nothing observable
+/// may change, and the rebuilt terminal must keep working (replies, events,
+/// scrollback limits).
+#[test]
+fn compact_after_resize_keeps_every_observable() {
+    let mut v = GhosttyVt::new(&VtOptions { size: Size::new(60, 10), scrollback_bytes: 1 << 20, ..Default::default() }).unwrap();
+    for i in 0..30 {
+        v.feed(format!("line {i} \x1b[1;31mred\x1b[0m \x1b]8;;http://x/{i}\x1b\\link\x1b]8;;\x1b\\\r\n").as_bytes());
+    }
+    v.feed(b"\x1b]0;the title\x07\x1b]7;file://host/tmp\x07");
+    v.feed(b"\x1b[?1h\x1b[?2004h\x1b[?1002h\x1b[?1006h\x1b[>5u\x1b]11;rgb:12/34/56\x1b\\");
+    v.feed(b"\x1b[3;8r\x1b[5;7H\x1b[4 q\xc3\xa9\xe4\xb8\xad");
+    v.feed(b"\x1b[?1049h\x1b[2;2Halt screen text");
+    v.resize(Size::new(40, 8), PixelSize::default());
+    events(&mut v);
+    let before = observable(&mut v);
+    v.compact();
+    assert_eq!(v.repacks(), 1, "the resize was followed by a rebuild");
+    let after = observable(&mut v);
+    assert_eq!(before, after);
+    // Still alive: replies, events, output, back to the primary screen.
+    v.feed(b"\x07\x1b[?1049l");
+    assert_eq!(events(&mut v), vec![VtEvent::Bell]);
+    v.feed(b"\x1b[5n");
+    assert_eq!(replies(&mut v), b"\x1b[0n");
+    let f = frame(&mut v);
+    assert!(f.rows.iter().any(|r| r.cells.iter().any(|c| c.link != 0)), "hyperlinks survive");
+    // The byte limit still holds after the rebuild.
+    for i in 0..20_000 {
+        v.feed(format!("filler {i:06} {}\r\n", "x".repeat(30)).as_bytes());
+    }
+    v.compact();
+    assert!(v.memory().resident_bytes <= 2 << 20, "{:?}", v.memory());
+}
+
+/// A terminal in the middle of an escape sequence keeps its parser state
+/// (no rebuild then); the sequence completes as usual.
+#[test]
+fn compact_mid_sequence_is_harmless() {
+    let mut v = vt(30, 5);
+    v.resize(Size::new(20, 5), PixelSize::default());
+    v.feed(b"ab\x1b[3");
+    v.compact();
+    assert_eq!(v.repacks(), 0);
+    v.feed(b"1mred");
+    let f = frame(&mut v);
+    assert_eq!(row_text(&f, 0), "abred");
+    assert_eq!(f.rows[0].cells[2].style.fg, Color::Indexed(1));
+}
