@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 libc.workspace = true
+lif-types.workspace = true

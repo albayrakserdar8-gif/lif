@@ -35,8 +35,10 @@
 //!    changes.
 #![forbid(unsafe_code)]
 
+mod codec;
 mod msg;
 
+pub use codec::*;
 pub use msg::*;
 
 /// Version of the framing. See compatibility rule 5.

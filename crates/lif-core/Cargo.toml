@@ -1,0 +1,14 @@
+[package]
+name = "lif-core"
+description = "lif's session/window/pane model, layouts, command language and key bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lif-types.workspace = true

@@ -49,6 +49,12 @@ speed and a small footprint. Read this file before changing anything.
   PTY master. The kernel returns at most 1024 bytes per `read` from a PTY, so
   drain until `EAGAIN` on every wakeup (with a budget, so one pane cannot
   starve the others).
+- On macOS `TIOCSWINSZ` on a PTY master fails with ENOTTY until the slave has
+  been opened once; `lif-pty` sets the initial size on the slave.
+- A PTY's input queue takes about 1 KiB before `EAGAIN`: writes to a pane are
+  always partial-write aware and wait for writability.
+- `.cargo/config.toml` forces libghostty-vt to build optimized even in dev
+  builds (its Debug build is about 1000x slower at scrollback).
 - The libghostty-rs API lives in
   `~/.cargo/git/checkouts/libghostty-rs-*/cd4d497/crates/libghostty-vt/src`
   (`terminal.rs`, `render.rs`, `effect.rs`, `key.rs`, `mouse.rs`, `fmt.rs`).
@@ -62,4 +68,7 @@ speed and a small footprint. Read this file before changing anything.
 | `lif-vt` | `VtEngine` trait and the libghostty-vt backend |
 | `lif-pty` | PTY and child processes |
 | `lif-client` | Thin client: raw mode, byte relay |
+| `lif-core` | Sessions, windows, panes, layouts, command language, key bindings (pure, no I/O) |
+| `lif-input` | Parser for bytes arriving from the client's terminal |
+| `lif-render` | Compositor and diff renderer onto the client's terminal |
 | `bench/` | Benchmark harness comparing lif with tmux and zellij |

@@ -17,3 +17,11 @@ libghostty-vt = { workspace = true, optional = true }
 [features]
 default = ["ghostty"]
 ghostty = ["dep:libghostty-vt"]
+
+[[test]]
+name = "ghostty"
+required-features = ["ghostty"]
+
+[[test]]
+name = "bench"
+required-features = ["ghostty"]

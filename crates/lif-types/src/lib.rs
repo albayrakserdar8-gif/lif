@@ -6,10 +6,12 @@
 //! the program running in a pane.
 #![forbid(unsafe_code)]
 
+mod caps;
 mod frame;
 mod geom;
 mod input;
 
+pub use caps::*;
 pub use frame::*;
 pub use geom::*;
 pub use input::*;

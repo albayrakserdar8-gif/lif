@@ -1,0 +1,5 @@
+# libghostty-vt's build script compiles the Zig library in Debug mode for
+# dev-profile builds, which makes scrollback about 1000x slower (25 s per MB
+# past the cap). Always build it optimized.
+[env]
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

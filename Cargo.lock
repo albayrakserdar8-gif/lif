@@ -51,6 +51,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lif-core"
+version = "0.1.0"
+dependencies = [
+ "lif-types",
+]
+
+[[package]]
+name = "lif-input"
+version = "0.1.0"
+dependencies = [
+ "lif-types",
+]
+
+[[package]]
 name = "lif-proto"
 version = "0.1.0"
 dependencies = [
@@ -62,6 +76,15 @@ name = "lif-pty"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lif-types",
+]
+
+[[package]]
+name = "lif-render"
+version = "0.1.0"
+dependencies = [
+ "libghostty-vt",
+ "lif-types",
 ]
 
 [[package]]
