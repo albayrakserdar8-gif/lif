@@ -1,0 +1,16 @@
+[package]
+name = "lif-client"
+description = "The thin lif client: raw mode and byte relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lif-types.workspace = true
+lif-proto.workspace = true
+libc.workspace = true

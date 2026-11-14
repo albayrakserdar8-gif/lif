@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["spikes"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+lif-types = { path = "crates/lif-types" }
+lif-proto = { path = "crates/lif-proto" }
+lif-vt = { path = "crates/lif-vt" }
+lif-pty = { path = "crates/lif-pty" }
+lif-client = { path = "crates/lif-client" }
+libc = "0.2"
+mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
+# libghostty-vt 1.0.1 (needs Zig 0.17 on PATH at build time). The crates.io
+# release 0.2.2 is pinned to a pre-1.0 Ghostty commit that needs Zig 0.15.2,
+# so pin the upstream commit that moved to the vt-1.0.1 tag.
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", default-features = false }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1

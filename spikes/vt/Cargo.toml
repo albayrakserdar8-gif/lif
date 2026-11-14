@@ -1,0 +1,18 @@
+[package]
+name = "spike-vt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# libghostty-vt 1.0.1 (Zig 0.17). crates.io 0.2.2 is pinned to a pre-1.0 commit that needs Zig 0.15.2.
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
