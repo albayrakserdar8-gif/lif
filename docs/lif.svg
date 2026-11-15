@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="lif">
+  <title>lif</title>
+  <defs>
+    <linearGradient id="fiber" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f0cf86"/>
+      <stop offset="1" stop-color="#9ccc6e"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="44" fill="#14171c"/>
+  <g fill="none" stroke="url(#fiber)" stroke-linecap="butt">
+    <!-- the pane borders are a bundle of fibers; one bundle splits off to the right -->
+    <g stroke-width="5">
+      <path d="M130 12 C 122 70, 144 104, 132 128 S 124 196, 134 244"/>
+      <path d="M141 12 C 148 66, 128 108, 141 128 S 150 190, 141 244"/>
+      <path d="M152 12 C 142 76, 158 100, 150 128 S 138 198, 150 244"/>
+    </g>
+    <g stroke-width="4.5">
+      <path d="M138 121 C 170 112, 200 134, 244 120"/>
+      <path d="M144 129 C 178 138, 206 118, 244 131"/>
+      <path d="M140 138 C 172 146, 210 130, 244 142"/>
+    </g>
+  </g>
+  <g fill="none" stroke="#9ccc6e" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 98 L64 114 L44 130"/>
+    <path d="M76 134 H100"/>
+  </g>
+  <g stroke="#3a414c" stroke-width="7" stroke-linecap="round">
+    <path d="M174 62 H212"/>
+    <path d="M174 82 H198"/>
+    <path d="M174 182 H214"/>
+    <path d="M174 202 H190"/>
+  </g>
+</svg>

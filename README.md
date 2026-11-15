@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/lif.svg" width="128" alt="lif"></p>
+
 # lif
 
 lif is a terminal multiplexer for macOS (and, untested, Linux) that keeps tmux's
