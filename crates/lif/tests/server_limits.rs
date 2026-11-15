@@ -132,13 +132,25 @@ fn a_stopped_server_with_a_full_backlog_is_not_replaced() {
     let pid = env.server_pid();
     let ino = std::fs::symlink_metadata(&env.sock).unwrap().ino();
     kill(pid, libc::SIGSTOP);
+    // Linux queues as many connections as net.core.somaxconn says (4096):
+    // room for that many descriptors here, and connections that never
+    // wait for room in the queue.
+    // SAFETY: getrlimit and setrlimit with a valid struct.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < 16384 {
+            lim.rlim_cur = lim.rlim_max.min(16384);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
     let mut held = Vec::new();
     let mut refused = false;
-    for _ in 0..4000 {
-        match UnixStream::connect(&env.sock) {
+    for _ in 0..12000 {
+        match lif_client::connect_stream(&env.sock) {
             Ok(s) => held.push(s),
-            Err(_) => {
-                refused = true;
+            Err(e) => {
+                refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+                assert!(refused, "connecting failed otherwise after {} connections: {e}", held.len());
                 break;
             }
         }
@@ -326,7 +338,11 @@ fn a_pane_that_does_not_read_never_blocks_its_client() {
     t.write(b"\x02p");
     // A paste over the bound: dropped, and said so. (The queue is filled
     // most of the way with send-keys: a PTY takes typing 1 KiB at a time.)
-    env.ok(&["send-keys", "-t", "stuck:0", "-l", &"s".repeat(800 * 1024)]);
+    // (In pieces: Linux takes at most 128 KiB in one argument.)
+    let piece = "s".repeat(100 * 1024);
+    let mut fill = vec!["send-keys", "-t", "stuck:0", "-l"];
+    fill.extend(std::iter::repeat_n(piece.as_str(), 8));
+    env.ok(&fill);
     let mut big = b"\x1b[200~".to_vec();
     big.extend(std::iter::repeat_n(b'q', 100 * 1024));
     big.extend_from_slice(b"\x1b[201~");
@@ -357,12 +373,20 @@ fn terminal_replies_to_a_program_that_does_not_read_are_bounded() {
     let rss1 = rss_kib(pid);
     eprintln!("DSR flood: server rss {rss0} -> {rss1} KiB");
     assert!(rss1 < rss0 + 8 * 1024, "replies queued without bound: {rss0} -> {rss1} KiB");
-    // (Replies fill the queue to within a reply's length of the bound.)
-    let o = env.run(&["send-keys", "-t", "dsr", "-l", &"hello".repeat(1000)]);
+    // (Replies fill the queue to within a reply's length of the bound; how
+    // soon depends on how much the PTY takes first.)
+    let mut o = env.run(&["send-keys", "-t", "dsr", "-l", &"hello".repeat(1000)]);
+    let end = Instant::now() + Duration::from_secs(20);
+    while o.status.code() == Some(0) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+        o = env.run(&["send-keys", "-t", "dsr", "-l", &"hello".repeat(1000)]);
+    }
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("input queue full"), "{}", String::from_utf8_lossy(&o.stderr));
-    let big = "x".repeat(300 * 1024);
-    let o = env.run(&["set-buffer", &big]);
+    // (From a file: Linux takes at most 128 KiB in one argument.)
+    let big = env.dir.join("big");
+    std::fs::write(&big, "x".repeat(300 * 1024)).unwrap();
+    let o = env.run(&["load-buffer", big.to_str().unwrap()]);
     assert!(o.status.success());
     let o = env.run(&["paste-buffer", "-t", "dsr"]);
     assert_eq!(o.status.code(), Some(1), "paste-buffer into a full queue succeeded");

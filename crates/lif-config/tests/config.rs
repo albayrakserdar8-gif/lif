@@ -641,6 +641,7 @@ fn apply_reports_failures_at_their_setting() {
             Entry { command: "set-option -g mouse maybe".into(), line: 2, column: 9 },
             Entry { command: "bind-key -T prefix x kill-pane".into(), line: 3, column: 5 },
         ],
+        startup: vec![],
         diagnostics: vec![],
     };
     let mut m = Model::new("h");
@@ -675,6 +676,8 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -s exit-empty on",
         "set-option -s buffer-limit 50",
         "set-option -g detach-on-destroy on",
+        "set-option -g destroy-unattached off",
+        "set-option -s focus-events on",
         "set-option -g base-index 0",
         "set-option -g pane-base-index 0",
         "set-option -g renumber-windows off",
@@ -688,8 +691,14 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g visual-bell off",
         "set-option -g monitor-bell on",
         "set-option -g monitor-activity off",
+        "set-option -g activity-action other",
+        "set-option -g visual-activity off",
+        "set-option -g monitor-silence 0",
+        "set-option -g silence-action other",
+        "set-option -g visual-silence off",
         "set-option -g default-size 80x24",
         "set-option -g window-size latest",
+        "set-option -g aggressive-resize off",
         "set-option -g main-pane-width 80",
         "set-option -g main-pane-height 24",
         "set-option -g other-pane-width 0",
@@ -697,6 +706,8 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g tiled-layout-max-columns 0",
         "set-option -g pane-border-status off",
         "set-option -g pane-border-format \"#{?pane_active,#[reverse],}#{pane_index}#[default] \\\"#{pane_title}\\\"\"",
+        "set-option -g popup-border-lines single",
+        "set-option -g menu-border-lines single",
         "set-option -g set-titles off",
         "set-option -g set-titles-string \"#S:#I:#W - \\\"#T\\\"\"",
         "set-option -g allow-passthrough off",
@@ -728,6 +739,11 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g copy-mode-current-match-style bg=magenta,fg=black",
         "set-option -g window-style default",
         "set-option -g window-active-style default",
+        "set-option -g popup-style default",
+        "set-option -g popup-border-style default",
+        "set-option -g menu-style default",
+        "set-option -g menu-selected-style bg=yellow,fg=black",
+        "set-option -g menu-border-style default",
         "bind-key -T prefix C-b send-prefix",
         "bind-key -T prefix \\\" split-window",
         "bind-key -T prefix \\% \"split-window -h\"",
@@ -1071,6 +1087,11 @@ q = "send -X cancel"
 
 [keys.copy-mode-vi]
 v = "send -X begin-selection"
+
+[startup]
+run = [
+    "set-option -g @plugin tmux-plugins/tpm",
+]
 "##;
     assert_eq!(m.toml, expected_toml);
     let un: Vec<(usize, &str)> = m.untranslated.iter().map(|u| (u.line, u.reason.as_str())).collect();
@@ -1079,15 +1100,17 @@ v = "send -X begin-selection"
         [
             (15, "lif has no option default-terminal"),
             (16, "set-option -a has no config.toml equivalent"),
-            (23, "user options (@name) have no config.toml equivalent"),
             (
                 37,
                 "source-file of a tmux configuration file: lif reloads its own config.toml (source-file ~/.config/lif/config.toml)",
             ),
             (41, "key table mytable is not supported (config.toml has prefix, root, copy-mode, copy-mode-vi)"),
             (42, "unbind-key -a has no config.toml equivalent"),
-            (43, "if-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])"),
-            (44, "run-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])"),
+            (43, "it runs source-file on a tmux file: translate that file as well and add what it gives to this file"),
+            (
+                44,
+                "run-shell runs something written for tmux, which would talk to tmux and not to lif: add it to run in [startup] yourself if it works without tmux",
+            ),
             (47, "no value given for automatic-rename"),
             (48, "only global options (set -g) can be translated"),
         ]
@@ -1097,6 +1120,7 @@ v = "send -X begin-selection"
     // The translation loads and means what the .tmux.conf meant.
     let c = Config::parse(&m.toml);
     assert!(!c.has_errors(), "{}", c.report());
+    assert_eq!(c.startup.iter().map(|e| (e.command.as_str(), e.line)).collect::<Vec<_>>(), [("set-option -g @plugin tmux-plugins/tpm", 48)]);
     let mut model = Model::new("h");
     assert!(c.apply(&mut model, &mut TestHost::default()).is_empty());
     assert_eq!(opt(&model, "prefix"), "C-a");
@@ -1166,10 +1190,21 @@ fn tmux_conf_copy_pipe_and_mouse() {
     assert_eq!(m.untranslated.len(), 1);
     assert!(m.untranslated[0].reason.contains("copy-command = \"pbcopy\""), "{}", m.untranslated[0].reason);
     assert!(Config::parse(&m.toml).diagnostics.is_empty());
-    // Other mouse bindings say why they are left out.
-    let m = migrate_tmux_conf("bind -n MouseDown3Pane display-menu\nbind -T copy-mode-vi MouseDragEnd1Pane send -X select-word\n");
-    assert!(m.untranslated[0].reason.contains("mouse actions are built in"), "{}", m.untranslated[0].reason);
-    assert!(m.untranslated[1].reason.contains("mouse-drag-end is"), "{}", m.untranslated[1].reason);
+    // Mouse keys of the root table are bindings like any other.
+    let m = migrate_tmux_conf(
+        "bind -n MouseDown3Pane display-menu -t = -x M -y M Split s 'split-window -h'\nbind -n C-MouseDown1Status kill-window -t =\nunbind -n MouseDown2Pane\n",
+    );
+    assert!(m.untranslated.is_empty(), "{:?}", m.untranslated.iter().map(|u| &u.reason).collect::<Vec<_>>());
+    assert!(m.toml.contains("[keys.root]\nMouseDown3Pane = 'display-menu -t = -x M -y M Split s \"split-window -h\"'\nC-MouseDown1Status = \"kill-window -t =\"\nMouseDown2Pane = false\n"), "{}", m.toml);
+    assert!(Config::parse(&m.toml).diagnostics.is_empty());
+    // Those lif does not have, and the mouse inside copy mode, say why
+    // they are left out.
+    let m = migrate_tmux_conf(
+        "bind -n MouseDown1ScrollbarUp copy-mode -u\nbind -T copy-mode-vi WheelUpPane send -X -N 2 scroll-up\nbind -T copy-mode-vi MouseDragEnd1Pane send -X select-word\n",
+    );
+    assert_eq!(m.untranslated[0].reason, "unknown key: MouseDown1ScrollbarUp");
+    assert!(m.untranslated[1].reason.contains("mouse actions inside copy mode are built in"), "{}", m.untranslated[1].reason);
+    assert!(m.untranslated[2].reason.contains("mouse-drag-end is"), "{}", m.untranslated[2].reason);
 }
 
 // ------------------------------------------------------------- robustness --
@@ -1325,4 +1360,54 @@ fn tmux_conf_hooks_and_environment_are_translated() {
     );
     let c = Config::parse(&m.toml);
     assert!(c.diagnostics.is_empty(), "{}", c.report());
+}
+
+/// `[startup]`: commands the server runs once when it starts. They are
+/// not among the settings, and are checked without being run.
+#[test]
+fn startup_commands() {
+    let c = Config::parse("mouse = false\n[startup]\nrun = [\n  \"new-session -d -s main\",\n  \"run-shell 'touch /nonexistent/x'\",\n]\n");
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
+    assert_eq!(c.command_strings(), ["set-option -g mouse off"]);
+    assert_eq!(
+        c.startup,
+        [
+            Entry { command: "new-session -d -s main".into(), line: 4, column: 3 },
+            Entry { command: "run-shell 'touch /nonexistent/x'".into(), line: 5, column: 3 },
+        ]
+    );
+    // Applying the settings runs none of them.
+    let mut m = Model::new("h");
+    assert!(c.apply(&mut m, &mut TestHost::default()).is_empty());
+    assert_eq!(m.sessions().count(), 0);
+    // One command needs no list.
+    assert_eq!(Config::parse("[startup]\nrun = \"display-message hi\"\n").startup.len(), 1);
+    for (text, want) in [
+        ("[startup]\nrun = [\"splt-window\"]\n", "2:8: error: run in [startup]: unknown command `splt-window`, did you mean `split-window`?"),
+        ("[startup]\nrun = [5]\n", "2:8: error: run in [startup]: expected a command string, found integer 5"),
+        ("[startup]\nrun = true\n", "2:7: error: run in [startup]: expected a command string or a list of them, found boolean true"),
+        ("[startup]\nran = \"x\"\n", "2:1: error: unknown key `ran` in [startup], did you mean `run`? (it has one key: run)"),
+        ("startup = 3\n", "1:1: error: `startup` must be a table ([startup] with run = [...]), found integer 3"),
+        ("[startup]\nrun = [\"customize-mode\"]\n", "2:8: error: run in [startup]: unsupported command: customize-mode"),
+    ] {
+        let c = Config::parse(text);
+        assert_eq!(c.diagnostics.iter().map(|d| d.to_string()).collect::<Vec<_>>(), [want], "{text}");
+        assert!(c.startup.is_empty(), "{text}");
+    }
+    // From a .tmux.conf: commands that are not settings, with their
+    // comments; not what would read a tmux file or talk to tmux.
+    let m = migrate_tmux_conf(
+        "set -g @theme 'dark blue'\n# a session to start with\nnew-session -d -s main\nif-shell 'test -n \"$SSH_TTY\"' 'set -g status-style bg=red'\nrun 'date > /dev/null'\nrun '~/.tmux/plugins/tpm/tpm'\nsource-file ~/.tmux/theme.conf\nif-shell true 'source ~/x.conf'\n",
+    );
+    assert_eq!(
+        m.toml,
+        "# lif config.toml, translated from .tmux.conf.\n\n[startup]\nrun = [\n    'set-option -g @theme \"dark blue\"',\n    # a session to start with\n    \"new-session -d -s main\",\n    'if-shell \"test -n \\\"\\$SSH_TTY\\\"\" \"set -g status-style bg=red\"',\n    'run-shell \"date > /dev/null\"',\n]\n"
+    );
+    assert_eq!(m.untranslated.iter().map(|u| u.line).collect::<Vec<_>>(), [6, 7, 8]);
+    assert!(m.untranslated[0].reason.starts_with("run-shell runs something written for tmux"), "{}", m.untranslated[0].reason);
+    assert!(m.untranslated[1].reason.starts_with("source-file names a tmux file"), "{}", m.untranslated[1].reason);
+    assert!(m.untranslated[2].reason.starts_with("it runs source-file on a tmux file"), "{}", m.untranslated[2].reason);
+    let c = Config::parse(&m.toml);
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
+    assert_eq!(c.startup.len(), 4);
 }

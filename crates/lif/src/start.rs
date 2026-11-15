@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -115,7 +115,7 @@ pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) 
     let lock = open_lock(&lock_path, true)?;
     let deadline = Instant::now() + LOCKED_WAIT;
     while !try_lock(&lock)? {
-        if UnixStream::connect(socket).is_ok() {
+        if lif_client::connect_stream(socket).is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {

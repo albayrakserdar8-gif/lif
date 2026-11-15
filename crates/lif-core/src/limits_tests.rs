@@ -334,15 +334,39 @@ fn source_file_nesting_is_limited() {
     let mut t = M::new();
     t.h.configs.insert(
         "/self.toml".into(),
-        ConfigFile { commands: vec![("source-file /self.toml".into(), "/self.toml:1:1".into())], diagnostics: Vec::new() },
+        ConfigFile { commands: vec![("source-file /self.toml".into(), "/self.toml:1:1".into())], diagnostics: Vec::new(), ..Default::default() },
     );
     let e = t.err("source-file /self.toml");
     assert!(e.contains("too many nested files"), "{e}");
     // Nesting below the limit still works.
-    t.h.configs.insert("/leaf.toml".into(), ConfigFile { commands: vec![("set -g @leaf 1".into(), "/leaf.toml:1:1".into())], diagnostics: Vec::new() });
-    t.h.configs.insert("/mid.toml".into(), ConfigFile { commands: vec![("source-file /leaf.toml".into(), "/mid.toml:1:1".into())], diagnostics: Vec::new() });
+    t.h.configs.insert("/leaf.toml".into(), ConfigFile { commands: vec![("set -g @leaf 1".into(), "/leaf.toml:1:1".into())], diagnostics: Vec::new(), ..Default::default() });
+    t.h.configs.insert("/mid.toml".into(), ConfigFile { commands: vec![("source-file /leaf.toml".into(), "/mid.toml:1:1".into())], diagnostics: Vec::new(), ..Default::default() });
     t.ok("source-file /mid.toml");
     assert_eq!(t.display("#{@leaf}"), "1");
+}
+
+/// `[startup]` commands are kept only while the server asks for them, and
+/// at most [`MAX_STARTUP_COMMANDS`] of them.
+#[test]
+fn startup_commands_are_bounded_and_only_kept_at_start() {
+    let mut t = M::new();
+    let many: Vec<(String, String)> = (0..200).map(|i| (format!("set -g @s{i} 1"), format!("/s.toml:{}:1", i + 2))).collect();
+    t.h.configs.insert("/s.toml".into(), ConfigFile { startup: many, ..Default::default() });
+    // An ordinary source-file keeps none.
+    t.ok("source-file /s.toml");
+    assert!(t.m.take_startup().is_empty());
+    // At start-up they are kept, in order, up to the limit.
+    t.m.collect_startup(true);
+    t.ok("source-file /s.toml ; source-file /s.toml");
+    t.m.collect_startup(false);
+    let kept = t.m.take_startup();
+    assert_eq!(kept.len(), MAX_STARTUP_COMMANDS);
+    assert_eq!(kept[0], ("set -g @s0 1".to_string(), "/s.toml:2:1".to_string()));
+    assert_eq!(kept[200].0, "set -g @s0 1");
+    assert!(t.m.messages().any(|m| m == "/s.toml: more than 256 start-up commands, the rest are not run"));
+    assert!(t.m.take_startup().is_empty());
+    // They are handed over, not run by source-file.
+    assert_eq!(t.display("#{@s0}"), "");
 }
 
 // ----- C6: repeat counts -------------------------------------------------------

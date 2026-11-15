@@ -124,8 +124,13 @@ pub(crate) struct Attached {
     /// A left button press on a pane not in a mode: a drag from it starts
     /// copy mode with a selection (tmux's MouseDrag1Pane: copy-mode -M).
     pub(crate) mouse_press: Option<(PaneId, lif_types::Rect, lif_types::MouseEvent)>,
-    /// The last left click on a pane not in a mode: (pane, cell, time in
-    /// ms, clicks so far), for double and triple clicks.
+    /// A button that is down with no built-in drag following it: (place,
+    /// button 0-2, the drag has started, where the press was). Its motion
+    /// and release are mouse keys.
+    pub(crate) custom_drag: Option<(u8, u8, bool, lif_core::MouseAt)>,
+    /// The last press on a pane not in a mode: (pane, cell, time in ms,
+    /// button 0-2 times 4 plus its clicks so far), for double and triple
+    /// clicks.
     pub(crate) clicks: Option<(PaneId, lif_types::Pos, u64, u8)>,
     /// Pane border lines (`pane-border-status`): x, y, width, text.
     pub(crate) labels: Vec<(u16, u16, u16, StyledLine)>,

@@ -70,6 +70,9 @@ after-split-window = "select-layout tiled"
 
 [env]                   # environment of new panes and shell commands
 EDITOR = "nvim"
+
+[startup]               # commands run once when the server starts
+run = ["new-session -d -s main"]
 ```
 
 Keys not mentioned keep their defaults. Names are lower case with dashes, the
@@ -116,6 +119,8 @@ Value types used below:
 | `clock-mode-colour` | string | `"blue"` | Color of the clock of `clock-mode`. | `clock-mode-colour` |
 | `clock-mode-style` | choice: `"12"`, `"24"` | `"24"` | 12- or 24-hour clock. | `clock-mode-style` |
 | `detach-on-destroy` | choice: `"off"`, `"on"`, `"no-detached"`, `"previous"`, `"next"` | `"on"` | What attached clients do when their session is destroyed: detach, or switch to another session. | `detach-on-destroy` |
+| `destroy-unattached` | choice: `"off"`, `"on"`, `"keep-last"`, `"keep-group"` | `"off"` | `"on"` destroys a session as soon as nobody is attached to it. The other two are tmux's values for session groups and keep every session. | `destroy-unattached` |
+| `focus-events` | bool | `true` | Pass the terminal's focus changes to programs that ask for them. tmux's default is off. | `focus-events` |
 | `base-index` | integer | `0` | Number of the first window. | `base-index` |
 | `pane-base-index` | integer (0-65535) | `0` | Number of the first pane. | `pane-base-index` |
 | `renumber-windows` | bool | `false` | Close gaps in window numbers when a window closes. | `renumber-windows` |
@@ -127,8 +132,14 @@ Value types used below:
 | `visual-bell` | choice: `"off"`, `"on"`, `"both"` | `"off"` | Show a bell as a message instead of (`on`) or as well as (`both`) ringing. | `visual-bell` |
 | `monitor-bell` | bool | `true` | Flag windows that rang the bell. | `monitor-bell` |
 | `monitor-activity` | bool | `false` | Flag windows with new output. | `monitor-activity` |
+| `activity-action` | choice: `"none"`, `"any"`, `"current"`, `"other"` | `"other"` | Which windows' activity (with `monitor-activity`) is passed on to the session's clients. | `activity-action` |
+| `visual-activity` | choice: `"off"`, `"on"`, `"both"` | `"off"` | Pass it on as a bell (`off`), a message (`on`) or both. | `visual-activity` |
+| `monitor-silence` | integer (seconds) | `0` | Flag a window that has printed nothing for this long; 0 does not watch. | `monitor-silence` |
+| `silence-action` | choice: `"none"`, `"any"`, `"current"`, `"other"` | `"other"` | Which windows' silence is passed on. | `silence-action` |
+| `visual-silence` | choice: `"off"`, `"on"`, `"both"` | `"off"` | Pass it on as a bell (`off`), a message (`on`) or both. | `visual-silence` |
 | `default-size` | string `"WxH"` | `"80x24"` | Size of sessions created without a client (`new-session -d`). | `default-size` |
 | `window-size` | choice: `"largest"`, `"smallest"`, `"manual"`, `"latest"` | `"latest"` | How a window shown by clients of different sizes is sized. | `window-size` |
+| `aggressive-resize` | bool | `false` | Size a window only for the clients showing it: one that is not current keeps its size until it is selected. | `aggressive-resize` |
 | `main-pane-width` | size | `80` | Main pane width for `main-vertical`. | `main-pane-width` |
 | `main-pane-height` | size | `24` | Main pane height for `main-horizontal`. | `main-pane-height` |
 | `other-pane-width` | size | `0` | Width of the other panes in `main-vertical` (0: what is left). | `other-pane-width` |
@@ -136,6 +147,8 @@ Value types used below:
 | `tiled-layout-max-columns` | integer | `0` | Most columns the `tiled` layout uses (0: no limit). | `tiled-layout-max-columns` |
 | `pane-border-status` | choice: `"off"`, `"top"`, `"bottom"` | `"off"` | A line with each pane's `pane-border-format` on the border above or below it; the window gives up one row for it. | `pane-border-status` |
 | `pane-border-format` | string | `'#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'` | What that line shows (a format; `#[...]` styles work). | `pane-border-format` |
+| `popup-border-lines` | choice: `"single"`, `"rounded"`, `"double"`, `"heavy"`, `"simple"`, `"padded"`, `"none"` | `"single"` | The lines a popup's border is drawn with (`display-popup -b`). | `popup-border-lines` |
+| `menu-border-lines` | the same choices | `"single"` | The same for menus (`display-menu -b`). | `menu-border-lines` |
 | `set-titles` | bool | `false` | Set the outer terminal's title. | `set-titles` |
 | `set-titles-string` | string | `'#S:#I:#W - "#T"'` | The title, a format. | `set-titles-string` |
 | `allow-passthrough` | choice: `"off"`, `"on"`, `"all"` | `"off"` | Unwrap tmux's passthrough escape (`ESC P tmux; ... ESC \`) from programs; the wrapped clipboard writes and notifications then reach the outer terminal. | `allow-passthrough` |
@@ -196,6 +209,11 @@ interface, one key per element.
 | `current-match` | `"bg=magenta,fg=black"` | The match under the cursor | `copy-mode-current-match-style` |
 | `pane` | `"default"` | Default colors of pane contents (only `fg` and `bg` are used) | `window-style` |
 | `active-pane` | `"default"` | The same for the active pane, when not `"default"` | `window-active-style` |
+| `popup` | `"default"` | Popups (`display-popup -s`) | `popup-style` |
+| `popup-border` | `"default"` | Their borders (`-S`) | `popup-border-style` |
+| `menu` | `"default"` | Menus (`display-menu -s`) | `menu-style` |
+| `menu-selected` | `"bg=yellow,fg=black"` | A menu's selected line (`-H`) | `menu-selected-style` |
+| `menu-border` | `"default"` | Menu borders (`-S`) | `menu-border-style` |
 
 A style is either a table or a tmux style string; both are equivalent:
 
@@ -264,7 +282,18 @@ v = "send-keys -X begin-selection"
 y = "send-keys -X copy-selection-and-cancel"
 ```
 
-Mouse events cannot be bound; see [copy-mode.md](copy-mode.md#mouse).
+`[keys.root]` also takes tmux's mouse keys (`MouseDown3Pane`,
+`WheelUpStatus`, `C-MouseDown1Status`, ...): a command string replaces
+what the mouse does there and `false` removes it. In their commands `-t =`
+is the pane or window under the mouse. See the
+[migration guide](tmux-migration.md#mouse) for the names and defaults.
+
+```toml
+[keys.root]
+MouseDown3Pane = false                        # no menu on the right button
+"C-MouseDown1Status" = "kill-window -t ="
+MouseDown2Pane = "select-pane -t = ; paste-buffer -p"
+```
 
 ### Key names
 
@@ -325,6 +354,38 @@ SSH_ASKPASS = false
 
 Variables set for one session (`lif set-environment -t work NAME value`)
 and `-e NAME=value` of the commands that create panes come on top of these.
+
+## Start-up commands
+
+`[startup]` has one key, `run`: a lif command string, or a list of them,
+that the server runs once when it starts, after every setting of the file
+and before the command that started the server. It is where a
+`.tmux.conf`'s commands that are not settings go: a session to begin
+with, a user option, `run-shell`, `if-shell`.
+
+```toml
+[startup]
+run = [
+    "new-session -d -s main -n editor",
+    "set -g @theme dark",
+    "if-shell 'test -n \"$SSH_TTY\"' 'set -g status-style bg=red'",
+    "run-shell '~/bin/lif-start'",
+]
+```
+
+- The commands are checked when the file is loaded, like bindings: one
+  that does not parse or names a command lif lacks is an error
+  (`lif check-config` reports it and runs nothing).
+- Each entry is a command list of its own, started in order. One that
+  waits (`run-shell` for its command, `wait-for`) does not hold up the
+  next entry; put commands that must follow each other in one entry,
+  separated by `;`.
+- A command that fails is reported in `lif show-messages` with its line
+  and column; the others still run.
+- They run only when the server starts. `source-file` applies the file's
+  settings again and leaves `[startup]` alone.
+- At most 256 start-up commands are kept (over all the files read at
+  start-up).
 
 ## Diagnostics
 

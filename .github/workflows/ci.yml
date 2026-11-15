@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.17.1
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple Silicon, and Linux on arm64 and x86_64.
+        os: [macos-15, ubuntu-24.04-arm, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The job-control tests run a client under zsh.
+      - name: Packages (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      # libghostty-vt is built from source by its build script, with zig.
+      - name: Zig
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64) target=aarch64-macos ;;
+            Linux-aarch64) target=aarch64-linux ;;
+            Linux-x86_64) target=x86_64-linux ;;
+            *) echo "no zig for $(uname -sm)"; exit 1 ;;
+          esac
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${target}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig" && tar -xJf zig.tar.xz -C "$HOME/zig" --strip-components=1 && rm zig.tar.xz
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version && cargo clippy --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --no-fail-fast
+
+      # Pane shells the tests left behind would be a bug (issues/0001).
+      - name: Leaked pane shells
+        if: always()
+        run: |
+          if ps -Ao pid,ppid,etime,args | grep -- ' -sh$'; then
+            echo "pane shells outlived their servers"; exit 1
+          fi

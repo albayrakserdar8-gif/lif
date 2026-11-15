@@ -9,7 +9,7 @@
 //! menu's layout and the exit statuses are tmux 3.8's, read off its screen.
 
 use crate::cmd::{Arg, Args, CmdError};
-use crate::host::{Host, JobStatus, SpawnCommand};
+use crate::host::{MouseAt, Host, JobStatus, SpawnCommand};
 use crate::ids::{ClientId, PaneId, SessionId, WindowId};
 use crate::keys::KeyCode;
 use crate::layout::SizeSpec;
@@ -176,6 +176,9 @@ pub struct MenuState {
     pub border_style: String,
     /// The pane its commands run for.
     pub pane: Option<PaneId>,
+    /// Opened with a mouse button held, without `-O`: letting the button
+    /// go chooses the item under the mouse or closes the menu, as in tmux.
+    pub release_chooses: bool,
 }
 
 fn width(s: &str) -> usize {
@@ -261,6 +264,20 @@ impl MenuState {
         MenuOutcome::Redraw
     }
 
+    /// The button that opened the menu was let go at (`x`, `y`): on an
+    /// item that is chosen; anywhere else the menu closes.
+    pub fn mouse_release(&self, x: u16, y: u16) -> MenuOutcome {
+        let r = self.rect;
+        let inside = x > r.x && x + 1 < r.right() && y > r.y && y + 1 < r.bottom();
+        if !inside {
+            return MenuOutcome::Close;
+        }
+        match self.choose((y - r.y - 1) as usize) {
+            MenuOutcome::None => MenuOutcome::Close,
+            o => o,
+        }
+    }
+
     /// The text of each line between the borders: ` name   (key) `;
     /// `None` for a separator.
     pub fn lines(&self) -> Vec<Option<String>> {
@@ -330,24 +347,40 @@ fn strip_styles(s: &str) -> String {
 /// `x` and `y` are tmux's position arguments (`C` centre, `R` right
 /// edge, `P` by the pane, `S` by the status line, a number: the left
 /// column, and for `y` the row below the bottom). It is moved to fit.
-fn place(screen: Size, w: u32, h: u32, x: Option<&str>, y: Option<&str>, pane: Rect, status_row: Option<u16>) -> Result<Rect, CmdError> {
+#[allow(clippy::too_many_arguments)]
+fn place(
+    screen: Size,
+    w: u32,
+    h: u32,
+    x: Option<&str>,
+    y: Option<&str>,
+    pane: Rect,
+    status_row: Option<u16>,
+    mouse: Option<MouseAt>,
+) -> Result<Rect, CmdError> {
     let (sx, sy) = (screen.cols as i64, screen.rows as i64);
     let (w, h) = (w as i64, h as i64);
     // tmux's centre is one cell up and left of the middle.
     let centre_x = sx / 2 - w / 2 - 1;
     let centre_bottom = sy / 2 + h / 2 - 1;
     let left = match x.unwrap_or("C") {
+        // Centred on the mouse, when a mouse key opened it; from where
+        // the window's entry in the status line starts.
+        "M" if mouse.is_some() => mouse.map_or(0, |m| m.screen.0 as i64) - w / 2,
+        "W" if mouse.is_some_and(|m| m.status_x.is_some()) => mouse.and_then(|m| m.status_x).unwrap_or(0) as i64,
         "C" | "M" | "W" => centre_x,
         "R" => sx - w,
         "P" => pane.x as i64,
         n => n.parse::<i64>().map_err(|_| CmdError(format!("invalid position: {n}")))?,
     };
     let bottom = match y.unwrap_or("C") {
-        "C" | "M" | "W" => centre_bottom,
+        "M" if mouse.is_some() => mouse.map_or(0, |m| m.screen.1 as i64) + h,
+        "C" | "M" => centre_bottom,
+        "W" if mouse.is_none() => centre_bottom,
         "P" => pane.bottom() as i64,
         // Next to the status line: above it at the bottom, below it at
         // the top.
-        "S" => match status_row {
+        "S" | "W" => match status_row {
             Some(0) => 1 + h,
             Some(r) => r as i64,
             None => sy,
@@ -402,11 +435,15 @@ impl Model {
             return Ok(CmdOutput::default());
         }
         let (screen, pane_rect, status_row) = self.overlay_anchor(client, &f);
+        // -b, -s and -S, or the popup-* options of the target's window.
+        let option = |name: &str| self.option_text(name, Some(f.s), f.w).unwrap_or_default();
         let border = match (a.has('B'), a.get('b')) {
             (true, _) => BorderLines::None,
             (false, Some(b)) => BorderLines::parse(b)?,
-            (false, None) => BorderLines::Single,
+            (false, None) => BorderLines::parse(&option("popup-border-lines"))?,
         };
+        let style = a.get('s').map(str::to_string).unwrap_or_else(|| option("popup-style"));
+        let border_style = a.get('S').map(str::to_string).unwrap_or_else(|| option("popup-border-style"));
         let edge = if border == BorderLines::None { 0 } else { 2 };
         let dim = |flag: char, of: u16, what: &str| -> Result<u32, CmdError> {
             let n = match a.get(flag) {
@@ -427,7 +464,7 @@ impl Model {
         };
         let h = dim('h', screen.rows, "height")?;
         let w = dim('w', screen.cols, "width")?;
-        let rect = place(screen, w, h, a.get('x'), a.get('y'), pane_rect, status_row)?;
+        let rect = place(screen, w, h, a.get('x'), a.get('y'), pane_rect, status_row, self.mouse)?;
         self.check_park()?;
         let found = &f;
         let expand = |s: &str| self.expand_found(found, ctx, &*host, s);
@@ -444,8 +481,8 @@ impl Model {
             rect,
             border,
             title,
-            style: a.get('s').unwrap_or("").to_string(),
-            border_style: a.get('S').unwrap_or("").to_string(),
+            style,
+            border_style,
             command: self.spawn_command(f.s, &a.strings(0)),
             cwd,
             env,
@@ -520,9 +557,11 @@ impl Model {
         if items.is_empty() {
             return Ok(CmdOutput::default());
         }
+        // -b, -s, -H and -S, or the menu-* options of the target's window.
+        let option = |name: &str| self.option_text(name, Some(f.s), f.w).unwrap_or_default();
         let border = match a.get('b') {
             Some(b) => BorderLines::parse(b)?,
-            None => BorderLines::Single,
+            None => BorderLines::parse(&option("menu-border-lines"))?,
         };
         let mut menu = MenuState {
             rect: Rect::default(),
@@ -530,16 +569,17 @@ impl Model {
             items,
             selected: None,
             border,
-            style: a.get('s').unwrap_or("").to_string(),
-            selected_style: a.get('H').unwrap_or("").to_string(),
-            border_style: a.get('S').unwrap_or("").to_string(),
+            style: a.get('s').map(str::to_string).unwrap_or_else(|| option("menu-style")),
+            selected_style: a.get('H').map(str::to_string).unwrap_or_else(|| option("menu-selected-style")),
+            border_style: a.get('S').map(str::to_string).unwrap_or_else(|| option("menu-border-style")),
             pane: f.p,
+            release_chooses: self.mouse.is_some() && !a.has('O'),
         };
         // Opened by a key: the first item is selected (`-C` picks another;
         // `-C -` or `-M`, as for a menu opened with the mouse, none).
         match a.get('C') {
             Some("-") => {}
-            None if a.has('M') => {}
+            None if a.has('M') || self.mouse.is_some() => {}
             Some(n) => {
                 let i: usize = n.parse().map_err(|_| CmdError(format!("starting choice invalid: {n}")))?;
                 if matches!(menu.items.get(i), Some(MenuItem::Entry { enabled: true, .. })) {
@@ -555,7 +595,7 @@ impl Model {
         if w > screen.cols as u32 || h > screen.rows as u32 {
             return Err(CmdError::new("menu too large for the terminal"));
         }
-        menu.rect = place(screen, w, h, a.get('x'), a.get('y'), pane_rect, status_row)?;
+        menu.rect = place(screen, w, h, a.get('x'), a.get('y'), pane_rect, status_row, self.mouse)?;
         host.menu(client, menu).map_err(CmdError)?;
         Ok(CmdOutput::default())
     }

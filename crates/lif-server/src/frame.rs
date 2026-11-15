@@ -227,7 +227,13 @@ impl Server {
             self.mode_action(None, id, act);
         }
         let mut renamed = Vec::new();
+        let mut quiet = Vec::new();
         for p in self.rt.panes.values_mut() {
+            if p.silence_at.is_some_and(|d| d <= now) {
+                // Once: the next output starts the count again.
+                p.silence_at = None;
+                quiet.push(p.id);
+            }
             if p.compact_at.is_some_and(|d| d <= now) {
                 // More to do: again on the next turn of the loop (output
                 // arriving meanwhile pushes it back by COMPACT_AFTER).
@@ -242,6 +248,9 @@ impl Server {
         }
         for p in renamed {
             self.model.pane_changed(p, &mut self.rt);
+        }
+        for p in quiet {
+            self.model.pane_silence(p, &mut self.rt);
         }
     }
 

@@ -16,7 +16,7 @@ fn out(o: &std::process::Output) -> (i32, String, String) {
 
 fn session(env: &Env) {
     env.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
-    env.wait_capture("s", "$");
+    env.wait_capture("s:", "$");
 }
 
 #[test]
@@ -67,10 +67,10 @@ fn if_shell_picks_a_branch() {
     assert_eq!(out(&env.run(&["if-shell", "true", "nosuchcmd"])), (1, String::new(), "unknown command: nosuchcmd\n".into()));
     // In a key binding: the branch runs for the client that pressed it.
     env.ok(&["bind-key", "y", "if-shell 'true' 'rename-window viakey'"]);
-    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("$");
     t.write(b"\x02y");
-    assert!(env.wait(secs(10), || env.ok(&["display-message", "-p", "-t", "s", "#{window_name}"]) == "viakey\n"));
+    assert!(env.wait(secs(10), || env.ok(&["display-message", "-p", "-t", "s:", "#{window_name}"]) == "viakey\n"));
     // Output of a command run from a key shows up as a message.
     env.ok(&["bind-key", "u", "run-shell 'echo from-the-shell'"]);
     t.write(b"\x02u");
@@ -106,7 +106,7 @@ fn wait_for_blocks_until_signalled() {
     gone.wait().unwrap();
     env.ok(&["wait-for", "-S", "dead"]);
     // The usual use: a script waits for a pane's command to finish.
-    env.ok(&["send-keys", "-t", "s", &format!("sleep 0.3; {BIN} wait-for -S done"), "Enter"]);
+    env.ok(&["send-keys", "-t", "s:", &format!("sleep 0.3; {BIN} wait-for -S done"), "Enter"]);
     let t = Instant::now();
     env.ok(&["wait-for", "done"]);
     assert!(t.elapsed() >= Duration::from_millis(200), "{:?}", t.elapsed());
@@ -120,7 +120,7 @@ fn status_line_shows_shell_command_output() {
     env.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
     env.ok(&["set-option", "-g", "status-interval", "1"]);
     env.ok(&["set-option", "-g", "status-right", &format!("<#(cat {})>", file.display())]);
-    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("<one>");
     // It is run again every status-interval.
     std::fs::write(&file, "ignored line\ntwo\n").unwrap();
@@ -145,7 +145,7 @@ fn hooks_run_commands_when_things_happen() {
     // it parsed it.
     env.ok(&["set-hook", "-g", "after-new-window", "display -p 'hooked #{hook} #{hook_pane}'"]);
     assert_eq!(env.ok(&["show-hooks", "-g", "after-new-window"]), "after-new-window[0] display-message -p \"hooked #{hook} #{hook_pane}\"\n");
-    assert_eq!(env.ok(&["new-window", "-d", "-t", "s"]), "hooked after-new-window %1\n");
+    assert_eq!(env.ok(&["new-window", "-d", "-t", "s:"]), "hooked after-new-window %1\n");
     // When a pane's program exits: nobody ran a command, the server runs it.
     env.ok(&["set-hook", "-g", "pane-exited", &format!("run-shell 'echo exited #{{hook_pane}} >> {}'", log.display())]);
     env.ok(&["set-hook", "-g", "session-closed", &format!("run-shell 'echo closed #{{hook_session_name}} >> {}'", log.display())]);
@@ -156,11 +156,11 @@ fn hooks_run_commands_when_things_happen() {
     assert!(env.wait(secs(10), || std::fs::read_to_string(&log).is_ok_and(|l| l.ends_with("closed doomed\n"))), "{:?}", std::fs::read_to_string(&log));
     // A client attaching.
     env.ok(&["set-hook", "-g", "client-attached", "rename-window -t s:0 attached"]);
-    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("attached");
     assert_eq!(out(&env.run(&["set-hook", "-g", "no-such-hook", "display x"])), (1, String::new(), "invalid option: no-such-hook\n".into()));
     env.ok(&["set-hook", "-gu", "after-new-window"]);
-    assert_eq!(env.ok(&["new-window", "-d", "-t", "s"]), "");
+    assert_eq!(env.ok(&["new-window", "-d", "-t", "s:"]), "");
 }
 
 #[test]
@@ -190,14 +190,14 @@ fn environment_commands_reach_new_panes() {
     let env = Env::new();
     session(&env);
     env.ok(&["set-environment", "-g", "GV", "global"]);
-    env.ok(&["set-environment", "-t", "s", "SV", "of session"]);
-    assert_eq!(env.ok(&["show-environment", "-t", "s"]), "SV=of session\n");
-    assert_eq!(env.ok(&["show-environment", "-t", "s", "-s", "SV"]), "SV=\"of session\"; export SV;\n");
-    assert_eq!(out(&env.run(&["show-environment", "-t", "s", "NOPE"])), (1, String::new(), "unknown variable: NOPE\n".into()));
-    env.ok(&["new-window", "-t", "s", "-e", "EV=flag", "-e", "GV=overridden"]);
-    env.wait_capture("s", "$");
-    env.ok(&["send-keys", "-t", "s", "echo \"[$GV][$SV][$EV]\"", "Enter"]);
-    env.wait_capture("s", "[overridden][of session][flag]");
+    env.ok(&["set-environment", "-t", "s:", "SV", "of session"]);
+    assert_eq!(env.ok(&["show-environment", "-t", "s:"]), "SV=of session\n");
+    assert_eq!(env.ok(&["show-environment", "-t", "s:", "-s", "SV"]), "SV=\"of session\"; export SV;\n");
+    assert_eq!(out(&env.run(&["show-environment", "-t", "s:", "NOPE"])), (1, String::new(), "unknown variable: NOPE\n".into()));
+    env.ok(&["new-window", "-t", "s:", "-e", "EV=flag", "-e", "GV=overridden"]);
+    env.wait_capture("s:", "$");
+    env.ok(&["send-keys", "-t", "s:", "echo \"[$GV][$SV][$EV]\"", "Enter"]);
+    env.wait_capture("s:", "[overridden][of session][flag]");
     // A session made later has the global ones only; the pane before the
     // change keeps what it started with.
     env.ok(&["new-session", "-d", "-s", "other"]);
@@ -215,17 +215,17 @@ fn environment_commands_reach_new_panes() {
 fn clear_history_join_pane_and_synchronized_typing() {
     let env = Env::new();
     session(&env);
-    env.ok(&["send-keys", "-t", "s", "seq 1 300", "Enter"]);
-    env.wait_capture("s", "300");
-    assert!(env.wait(secs(10), || env.ok(&["display-message", "-p", "-t", "s", "#{history_size}"]).trim().parse::<u32>().is_ok_and(|n| n > 200)));
-    env.ok(&["clear-history", "-t", "s"]);
-    assert_eq!(env.ok(&["display-message", "-p", "-t", "s", "#{history_size}"]), "0\n");
-    assert!(env.wait_capture("s", "300").contains("299"), "the screen stays");
+    env.ok(&["send-keys", "-t", "s:", "seq 1 300", "Enter"]);
+    env.wait_capture("s:", "300");
+    assert!(env.wait(secs(10), || env.ok(&["display-message", "-p", "-t", "s:", "#{history_size}"]).trim().parse::<u32>().is_ok_and(|n| n > 200)));
+    env.ok(&["clear-history", "-t", "s:"]);
+    assert_eq!(env.ok(&["display-message", "-p", "-t", "s:", "#{history_size}"]), "0\n");
+    assert!(env.wait_capture("s:", "300").contains("299"), "the screen stays");
     // join-pane: sizes as tmux gives them.
-    env.ok(&["new-window", "-d", "-t", "s"]);
+    env.ok(&["new-window", "-d", "-t", "s:"]);
     env.ok(&["split-window", "-d", "-t", "s:0"]);
     env.ok(&["join-pane", "-h", "-s", "s:0.1", "-t", "s:1.0"]);
-    let panes = ["list-panes", "-s", "-t", "s", "-F", "#{window_index}.#{pane_index} #{pane_id} #{pane_width}x#{pane_height} #{pane_active}"];
+    let panes = ["list-panes", "-s", "-t", "s:", "-F", "#{window_index}.#{pane_index} #{pane_id} #{pane_width}x#{pane_height} #{pane_active}"];
     assert_eq!(env.ok(&panes), "0.0 %0 80x24 1\n1.0 %1 40x24 0\n1.1 %2 39x24 1\n");
     assert_eq!(out(&env.run(&["join-pane", "-s", "s:1.1", "-t", "s:1.1"])), (1, String::new(), "source and target panes must be different\n".into()));
     // The pane that moved is the same process, still running.
@@ -233,7 +233,7 @@ fn clear_history_join_pane_and_synchronized_typing() {
     env.wait_capture("%2", "moved");
     // What is typed goes to every synchronized pane, not to others.
     env.ok(&["set-option", "-w", "-t", "s:1", "synchronize-panes", "on"]);
-    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("$");
     t.type_str("echo sy''nc$((40+2))\r");
     env.wait_capture("%1", "sync42");
@@ -250,9 +250,9 @@ fn new_window_from_a_shell_in_a_pane() {
     // `lif new-window` typed in a pane used to fail with "index 0 in use".
     let env = Env::new();
     session(&env);
-    env.ok(&["send-keys", "-t", "s", &format!("{BIN} new-window -d; echo rc=$?"), "Enter"]);
+    env.ok(&["send-keys", "-t", "s:", &format!("{BIN} new-window -d; echo rc=$?"), "Enter"]);
     env.wait_capture("s:0", "rc=0");
-    assert_eq!(env.ok(&["list-windows", "-t", "s", "-F", "#{window_index}"]), "0\n1\n");
+    assert_eq!(env.ok(&["list-windows", "-t", "s:", "-F", "#{window_index}"]), "0\n1\n");
 }
 
 #[test]

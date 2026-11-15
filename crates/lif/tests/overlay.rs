@@ -10,13 +10,13 @@ use lif_types::Size;
 
 fn attach(env: &Env) -> Term {
     env.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
-    let mut t = Term::spawn(env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("$");
     t
 }
 
 fn show(env: &Env, fmt: &str) -> String {
-    env.ok(&["display-message", "-p", "-t", "s", fmt]).trim_end().to_string()
+    env.ok(&["display-message", "-p", "-t", "s:", fmt]).trim_end().to_string()
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn popup_runs_a_program_over_the_panes() {
     assert!(l[0].contains("underneath") || l[1].contains("underneath"), "the pane shows around the popup");
     t.type_str("in the popup\r");
     t.wait_for("the echo inside the box", secs(10), |t| t.lines().iter().any(|l| l.contains("│in the popup")));
-    assert!(!String::from_utf8_lossy(&env.run(&["capture-pane", "-p", "-t", "s"]).stdout).contains("in the popup"));
+    assert!(!String::from_utf8_lossy(&env.run(&["capture-pane", "-p", "-t", "s:"]).stdout).contains("in the popup"));
     assert_eq!(show(&env, "#{window_panes}"), "1", "the popup is not a pane of the window");
     // The command that opened it waits; the program's end (C-d) closes it.
     std::thread::sleep(Duration::from_millis(200));
@@ -102,7 +102,7 @@ fn popup_ends_with_its_client() {
     assert!(waiter.wait().unwrap().success(), "the waiting command is released");
     assert!(env.wait(secs(10), || !pid_alive(pid)), "the popup's program outlived its client");
     // A popup still up when the server stops goes with it.
-    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(80, 24));
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
     t.wait_text("$");
     let _ = std::fs::remove_file(&pidfile);
     let mut waiter = env.command().args(["display-popup", "-E", &format!("echo $$ > {}; exec sleep 300", pidfile.display())]).spawn().unwrap();
@@ -146,7 +146,7 @@ fn menu_chooses_with_keys_and_mouse() {
     t.wait_for("the menu gone", secs(10), |t| !t.screen().contains("Title"));
     assert_eq!(show(&env, "#{window_name}"), "first");
     // The default pane menu (C-b >): z zooms.
-    env.ok(&["split-window", "-d", "-t", "s"]);
+    env.ok(&["split-window", "-d", "-t", "s:"]);
     t.write(b"\x02>");
     t.wait_text("Horizontal Split (h)");
     t.write(b"z");

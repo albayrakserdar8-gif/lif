@@ -82,6 +82,9 @@ impl Server {
     }
 
     pub(crate) fn focus_pane(&mut self, pane: PaneId, focused: bool) {
+        if self.model.option_text("focus-events", None, None).as_deref() == Some("off") {
+            return;
+        }
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let mut b = Vec::new();
         p.engine.encode_focus(focused, &mut b);
@@ -169,12 +172,20 @@ impl Server {
         match a.overlay.as_mut() {
             None => false,
             Some(Overlay::Menu(menu)) => {
-                let click = m.action == MouseAction::Press && m.button == Some(MouseButton::Left);
                 let moved = m.action == MouseAction::Motion;
-                if click || moved {
-                    let outcome = menu.state.mouse(m.cell.x, m.cell.y, click);
-                    self.menu_outcome(id, outcome);
-                }
+                let outcome = if menu.state.release_chooses {
+                    // Opened with a button held (tmux without -O): moving
+                    // selects, letting go chooses or closes.
+                    match m.action {
+                        MouseAction::Release => menu.state.mouse_release(m.cell.x, m.cell.y),
+                        MouseAction::Motion => menu.state.mouse(m.cell.x, m.cell.y, false),
+                        _ => lif_core::MenuOutcome::None,
+                    }
+                } else {
+                    let click = m.action == MouseAction::Press && m.button == Some(MouseButton::Left);
+                    if click || moved { menu.state.mouse(m.cell.x, m.cell.y, click) } else { lif_core::MenuOutcome::None }
+                };
+                self.menu_outcome(id, outcome);
                 true
             }
             Some(Overlay::Popup(p)) => {
@@ -684,7 +695,147 @@ impl Server {
 
     // ----- mouse ---------------------------------------------------------
 
+    /// What the mouse did at `place`, as a key, with the modifiers held.
+    fn mouse_key(m: &MouseEvent, event: u8, place: u8) -> lif_core::KeyCode {
+        let mut mods = Mods::NONE;
+        for k in [Mods::CTRL, Mods::ALT, Mods::SHIFT] {
+            if m.mods.contains(k) {
+                mods = mods.union(k);
+            }
+        }
+        lif_core::KeyCode::mouse(event, place, mods)
+    }
+
+    /// The root table's say about a mouse key: true if the caller should
+    /// do what lif does by itself (the key has its default, built-in
+    /// binding). Otherwise the key's commands ran, if it has any, with the
+    /// mouse at `at`.
+    fn mouse_gate(&mut self, id: ClientId, m: &MouseEvent, key: lif_core::KeyCode, at: lif_core::MouseAt, now_ms: u64) -> bool {
+        use lif_core::MouseBinding;
+        let list = match self.model.bindings().mouse_binding(&key) {
+            MouseBinding::BuiltIn => return true,
+            MouseBinding::Unbound => return false,
+            MouseBinding::Default(l) | MouseBinding::Custom(l) => l.clone(),
+        };
+        self.run_mouse_binding(id, m, &list, at, now_ms);
+        false
+    }
+
+    /// Run a mouse key's commands: `-t =` and the `mouse_*` formats
+    /// describe `at` while they run, and what they ask to be done with
+    /// the event (`send-keys -M`, `copy-mode -M`, `resize-pane -M`) is
+    /// done afterwards.
+    fn run_mouse_binding(&mut self, id: ClientId, m: &MouseEvent, list: &lif_core::CommandList, at: lif_core::MouseAt, now_ms: u64) {
+        self.model.set_mouse(Some(at));
+        self.rt.mouse_live = true;
+        self.rt.mouse_todo.clear();
+        if let Err(e) = self.run_commands(Some(id), list).map(|o| self.show_output(id, &o.stdout)) {
+            let d = self.display_time();
+            self.rt.show_message(id, &e.to_string(), d);
+        }
+        self.rt.mouse_live = false;
+        self.model.set_mouse(None);
+        for todo in std::mem::take(&mut self.rt.mouse_todo) {
+            match todo {
+                crate::host::MouseTodo::Forward(pane) => self.forward_mouse(id, pane, m, now_ms),
+                crate::host::MouseTodo::CopyDrag(pane) => {
+                    let Some(rect) = self.pane_rect(id, pane) else { continue };
+                    let local = MouseEvent { cell: Pos { x: m.cell.x.saturating_sub(rect.x), y: m.cell.y.saturating_sub(rect.y) }, ..*m };
+                    self.start_copy_drag(id, pane, rect, local, local, now_ms);
+                }
+                crate::host::MouseTodo::ResizeBorder => {
+                    if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut())
+                        && let Some(view) = a.view.as_ref()
+                    {
+                        a.drag = border_drag(view, m.cell.x, m.cell.y);
+                    }
+                }
+            }
+        }
+        self.sync_views();
+    }
+
+    /// After a press of `button` (0, 1, 2) at `place` that no built-in
+    /// drag follows: its MouseDrag, MouseDragEnd and MouseUp keys are
+    /// what the motion and the release are.
+    fn track_button(&mut self, id: ClientId, place: u8, button: Option<u8>, at: lif_core::MouseAt) {
+        if let Some(b) = button
+            && let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut())
+        {
+            a.custom_drag = Some((place, b, false, at));
+        }
+    }
+
+    fn pane_rect(&self, id: ClientId, pane: PaneId) -> Option<lif_types::Rect> {
+        let view = self.rt.clients.get(&id)?.att.as_ref()?.view.as_ref()?;
+        view.panes.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r)
+    }
+
+    /// `send-keys -M`: the event goes to `pane`'s mode, or to its program
+    /// if that asked for the mouse.
+    fn forward_mouse(&mut self, id: ClientId, pane: PaneId, m: &MouseEvent, now_ms: u64) {
+        let Some(rect) = self.pane_rect(id, pane) else { return };
+        if !rect.contains(m.cell.x, m.cell.y) {
+            return;
+        }
+        let local = MouseEvent { cell: Pos { x: m.cell.x - rect.x, y: m.cell.y - rect.y }, ..*m };
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+        if p.mode.is_some() {
+            self.sync_mode_config(pane);
+            let act = self.with_mode(pane, |md, ctx| md.mouse(&local, now_ms, ctx));
+            self.mode_action(Some(id), pane, act);
+        } else if p.engine.modes().mouse_tracking {
+            let mut b = Vec::new();
+            p.engine.encode_mouse(&local, &mut b);
+            self.rt.write_input(pane, &b);
+        }
+    }
+
+    /// tmux's `copy-mode -M`: copy mode in `pane`, selecting from where
+    /// the button went down (`press`) to where the mouse is (`now`).
+    fn start_copy_drag(&mut self, id: ClientId, pane: PaneId, rect: lif_types::Rect, press: MouseEvent, cur: MouseEvent, now_ms: u64) {
+        self.sync_mode_config(pane);
+        let opts = lif_core::CopyModeOptions { mouse_drag: true, ..Default::default() };
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+        crate::host::enter_copy(p, opts, &self.rt.copy_cfg.cfg);
+        p.mode_cfg = Some(self.rt.copy_cfg.key.clone());
+        self.model.pane_changed(pane, &mut self.rt);
+        if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+            a.mode_drag = Some((pane, rect));
+        }
+        // The mode sees a press and then the drag, as from the mouse.
+        let down = MouseEvent { action: MouseAction::Press, ..press };
+        let act = self.with_mode(pane, |md, ctx| {
+            md.mouse(&down, now_ms, ctx);
+            md.mouse(&cur, now_ms, ctx)
+        });
+        self.mode_action(Some(id), pane, act);
+    }
+
+    /// Which part of the status line column `x` is on, and for a window's
+    /// entry the window and the column the entry starts at.
+    fn status_place(&self, id: ClientId, x: u16) -> (u8, Option<lif_core::WindowId>, Option<u16>) {
+        use lif_core::keys::mouse;
+        let none = (mouse::STATUS_DEFAULT, None, None);
+        let Some(c) = self.rt.clients.get(&id) else { return none };
+        let Some(a) = c.att.as_ref() else { return none };
+        let width = c.hello.as_ref().map(|h| h.size.cols).unwrap_or(80);
+        let (r, windows) = self.model.status_ranges(a.session, width, crate::sys::wall_clock(), &self.rt);
+        let x = x as usize;
+        if let Some(i) = r.windows.iter().position(|w| x >= w.0 && x < w.1) {
+            return (mouse::STATUS, windows.get(i).copied(), Some(r.windows[i].0 as u16));
+        }
+        if x >= r.left.0 && x < r.left.1 {
+            return (mouse::STATUS_LEFT, None, None);
+        }
+        if x >= r.right.0 && x < r.right.1 {
+            return (mouse::STATUS_RIGHT, None, None);
+        }
+        none
+    }
+
     fn mouse(&mut self, id: ClientId, m: &MouseEvent, now: std::time::Instant) {
+        use lif_core::keys::mouse as mk;
         if self.overlay_mouse(id, m) {
             return;
         }
@@ -706,6 +857,29 @@ impl Server {
             let act = self.with_mode(pane, |md, ctx| md.mouse(&local, now_ms, ctx));
             self.mode_action(Some(id), pane, act);
             return;
+        }
+        // A button that went down where no built-in drag took over: the
+        // first motion is its MouseDrag key, the release MouseDragEnd (or
+        // MouseUp if the mouse never moved).
+        if let Some((place, button, started, at)) = a.custom_drag {
+            match m.action {
+                MouseAction::Motion if !started => {
+                    a.custom_drag = Some((place, button, true, at));
+                    let key = Self::mouse_key(m, mk::DRAG + button, place);
+                    self.mouse_gate(id, m, key, at, now_ms);
+                    return;
+                }
+                MouseAction::Motion => return,
+                MouseAction::Release => {
+                    a.custom_drag = None;
+                    let key = Self::mouse_key(m, if started { mk::DRAG_END } else { mk::UP } + button, place);
+                    self.mouse_gate(id, m, key, at, now_ms);
+                    return;
+                }
+                // Another press: the release was lost (outside the
+                // terminal, say).
+                MouseAction::Press => a.custom_drag = None,
+            }
         }
         let Some(view) = a.view.as_ref() else { return };
         if let Some(drag) = a.drag {
@@ -729,29 +903,80 @@ impl Server {
             return;
         }
         let mouse_opt = a.mouse_opt;
+        // The button of a press as an event index: MouseDown1..3, or the
+        // wheel.
+        let pressed = match (m.action, m.button) {
+            (MouseAction::Press, Some(MouseButton::Left)) => Some(mk::DOWN),
+            (MouseAction::Press, Some(MouseButton::Middle)) => Some(mk::DOWN + 1),
+            (MouseAction::Press, Some(MouseButton::Right)) => Some(mk::DOWN + 2),
+            (MouseAction::Press, Some(MouseButton::WheelUp)) => Some(mk::WHEEL_UP),
+            (MouseAction::Press, Some(MouseButton::WheelDown)) => Some(mk::WHEEL_DOWN),
+            _ => None,
+        };
+        let left = pressed == Some(mk::DOWN);
+        // 0, 1, 2 for a press of the left, middle or right button.
+        let button = pressed.filter(|e| *e < mk::DOWN + 3).map(|e| e - mk::DOWN);
         if view.status_row == Some(y) {
-            if mouse_opt && m.action == MouseAction::Press && m.button == Some(MouseButton::Left) {
-                let sid = view.session;
-                let target = self.status_window_at(id, x);
-                if let Some(idx) = target {
-                    let cmd = format!("select-window -t {}:{idx}", sid);
-                    self.run_string(id, &cmd);
+            let sid = view.session;
+            if mouse_opt && let Some(event) = pressed {
+                let (place, window, status_x) = self.status_place(id, x);
+                let at = lif_core::MouseAt { pane: None, window, screen: (x, y), cell: (x, y), status_x };
+                let key = Self::mouse_key(m, event, place);
+                // Built in: a click on a window selects it.
+                if self.mouse_gate(id, m, key, at, now_ms)
+                    && let Some(idx) = self.status_window_at(id, x)
+                {
+                    self.run_string(id, &format!("select-window -t {}:{idx}", sid));
                 }
+                self.track_button(id, place, button, at);
             }
             return;
         }
         let hit = view.panes.iter().find(|(_, r)| r.contains(x, y)).map(|(p, r)| (*p, *r));
         let Some((pane, rect)) = hit else {
-            if mouse_opt && m.action == MouseAction::Press && m.button == Some(MouseButton::Left) {
-                a.drag = border_drag(view, x, y);
+            // On a border.
+            if mouse_opt && let Some(event) = pressed {
+                let at = lif_core::MouseAt { pane: None, window: Some(view.window), screen: (x, y), cell: (x, y), status_x: None };
+                let key = Self::mouse_key(m, event, mk::BORDER);
+                self.mouse_gate(id, m, key, at, now_ms);
+                if left {
+                    // Built in: dragging it resizes. Rebound: the drag is
+                    // the key's.
+                    let drag = Self::mouse_key(m, mk::DRAG, mk::BORDER);
+                    let binding = self.model.bindings().mouse_binding(&drag);
+                    let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
+                    match binding {
+                        lif_core::MouseBinding::BuiltIn => a.drag = a.view.as_ref().and_then(|v| border_drag(v, x, y)),
+                        _ => a.custom_drag = Some((mk::BORDER, 0, false, at)),
+                    }
+                } else {
+                    self.track_button(id, mk::BORDER, button, at);
+                }
             }
             return;
         };
         let active = view.active_pane;
+        let window = view.window;
+        let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
+        let at = lif_core::MouseAt { pane: Some(pane), window: Some(window), screen: (x, y), cell: (local.cell.x, local.cell.y), status_x: None };
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let modes = p.engine.modes();
         if modes.mouse_tracking && p.mode.is_none() {
-            let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
+            // The program takes the mouse. A key the user rebound runs
+            // instead; everything else goes to the program, as tmux
+            // forwards mouse keys nothing is bound to.
+            if mouse_opt
+                && let Some(event) = pressed
+                && let lif_core::MouseBinding::Custom(list) = self.model.bindings().mouse_binding(&Self::mouse_key(m, event, mk::PANE))
+            {
+                let list = list.clone();
+                self.run_mouse_binding(id, m, &list, at, now_ms);
+                // The rest of this press is the key's too, not the
+                // program's.
+                self.track_button(id, mk::PANE, button, at);
+                return;
+            }
+            let Some(p) = self.rt.panes.get_mut(&pane) else { return };
             let mut b = Vec::new();
             p.engine.encode_mouse(&local, &mut b);
             self.rt.write_input(pane, &b);
@@ -763,7 +988,6 @@ impl Server {
         if !mouse_opt {
             return;
         }
-        let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
         let wheel = matches!(m.button, Some(MouseButton::WheelUp | MouseButton::WheelDown));
         if p.mode.is_some() {
             if m.action == MouseAction::Press && pane != active && !wheel {
@@ -781,52 +1005,95 @@ impl Server {
             return;
         }
         let click_ms = self.rt.copy_cfg.cfg.mouse.click_ms;
-        let press = match self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
-            Some(a) if m.action == MouseAction::Press && m.button == Some(MouseButton::Left) => {
-                let n = match a.clicks {
-                    Some((p, at, t, n)) if p == pane && at == local.cell && now_ms.saturating_sub(t) <= click_ms => n % 3 + 1,
-                    _ => 1,
-                };
-                a.clicks = Some((pane, local.cell, now_ms, n));
-                if n > 1 {
-                    a.mouse_press = None;
+        let mut press = None;
+        if let Some(b) = button {
+            let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
+            // Presses of one button on one cell within the click time
+            // count up to three; the count is kept with the button.
+            let n = match a.clicks {
+                Some((p, at, t, k)) if p == pane && at == local.cell && k / 4 == b && now_ms.saturating_sub(t) <= click_ms => (k % 4) % 3 + 1,
+                _ => 1,
+            };
+            a.clicks = Some((pane, local.cell, now_ms, b * 4 + n));
+            a.mouse_press = None;
+            if n == 2 {
+                // tmux's key for the second press itself; nothing is
+                // bound to it by default.
+                let key = Self::mouse_key(m, mk::SECOND + b, mk::PANE);
+                self.mouse_gate(id, m, key, at, now_ms);
+            }
+            let event = match n {
+                1 => mk::DOWN,
+                2 => mk::DOUBLE,
+                _ => mk::TRIPLE,
+            };
+            // A double or triple click nothing is bound to is one more
+            // press (two quick middle clicks paste twice).
+            let (n, event) = match self.model.bindings().mouse_binding(&Self::mouse_key(m, event + b, mk::PANE)) {
+                lif_core::MouseBinding::Unbound => (1, mk::DOWN),
+                _ => (n, event),
+            };
+            let built_in = self.mouse_gate(id, m, Self::mouse_key(m, event + b, mk::PANE), at, now_ms);
+            if b != 0 {
+                // Nothing is built in for the other buttons: what follows
+                // the press is their MouseDrag or MouseUp key.
+                self.track_button(id, mk::PANE, button, at);
+                return;
+            }
+            if n > 1 {
+                if built_in {
                     if pane != active {
                         self.run_string(id, &format!("select-pane -t {pane}"));
                     }
                     self.click_select(id, pane, &local, n, now_ms);
-                    return;
                 }
-                a.mouse_press = Some((pane, rect, local));
-                None
+                return;
             }
-            Some(a) => a.mouse_press.take(),
-            None => None,
-        };
+            // What a drag from here does: lif's selection, or the key's
+            // commands.
+            let drag = self.model.bindings().mouse_binding(&Self::mouse_key(m, mk::DRAG, mk::PANE));
+            if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                match drag {
+                    lif_core::MouseBinding::BuiltIn => a.mouse_press = Some((pane, rect, local)),
+                    _ => a.custom_drag = Some((mk::PANE, 0, false, at)),
+                }
+            }
+            if !built_in {
+                return;
+            }
+        } else if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+            press = a.mouse_press.take();
+        }
         match (m.action, m.button) {
             (MouseAction::Press, Some(MouseButton::Left)) if pane != active => {
                 self.run_string(id, &format!("select-pane -t {pane}"));
+            }
+            (MouseAction::Release, Some(MouseButton::Left)) if press.is_some() => {
+                // The button came up where it went down.
+                self.mouse_gate(id, m, Self::mouse_key(m, mk::UP, mk::PANE), at, now_ms);
             }
             (MouseAction::Motion, Some(MouseButton::Left)) if !modes.alt_screen => {
                 // tmux's MouseDrag1Pane: a drag starts copy mode, selecting
                 // from where the button went down.
                 let Some((pp, prect, pev)) = press.filter(|(p, _, _)| *p == pane) else { return };
-                self.sync_mode_config(pp);
-                let opts = lif_core::CopyModeOptions { mouse_drag: true, ..Default::default() };
-                let Some(p) = self.rt.panes.get_mut(&pp) else { return };
-                crate::host::enter_copy(p, opts, &self.rt.copy_cfg.cfg);
-                p.mode_cfg = Some(self.rt.copy_cfg.key.clone());
-                self.model.pane_changed(pp, &mut self.rt);
-                if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
-                    a.mode_drag = Some((pp, prect));
-                }
-                let act = self.with_mode(pp, |md, ctx| {
-                    md.mouse(&pev, now_ms, ctx);
-                    md.mouse(&local, now_ms, ctx)
-                });
-                self.mode_action(Some(id), pp, act);
+                self.start_copy_drag(id, pp, prect, pev, local, now_ms);
             }
             (MouseAction::Press, Some(b @ (MouseButton::WheelUp | MouseButton::WheelDown))) => {
                 let up = b == MouseButton::WheelUp;
+                // WheelUpPane is built in; WheelDownPane has no default
+                // binding, and what lif does then stays unless it is bound.
+                let key = Self::mouse_key(m, if up { mk::WHEEL_UP } else { mk::WHEEL_DOWN }, mk::PANE);
+                match self.model.bindings().mouse_binding(&key) {
+                    lif_core::MouseBinding::BuiltIn => {}
+                    lif_core::MouseBinding::Unbound if !up => {}
+                    lif_core::MouseBinding::Unbound => return,
+                    lif_core::MouseBinding::Default(l) | lif_core::MouseBinding::Custom(l) => {
+                        let list = l.clone();
+                        self.run_mouse_binding(id, m, &list, at, now_ms);
+                        return;
+                    }
+                }
+                let Some(p) = self.rt.panes.get_mut(&pane) else { return };
                 if modes.alt_screen {
                     // A full-screen program without mouse support: arrow
                     // keys, as terminals do in alternate-scroll mode.

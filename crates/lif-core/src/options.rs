@@ -73,12 +73,22 @@ use Scope::*;
 ///   change behavior (passthrough wrapping, fewer colors).
 /// - Window options can also be set per pane (`set -p`), as in tmux; the
 ///   pane value wins over the window's.
+/// - `focus-events` is on by default (tmux: off): a program that asks
+///   for focus reports gets them without configuration.
+/// - The popup and menu styles default to the terminal's colors and a
+///   yellow selected line; tmux's defaults are theme colors, which lif
+///   does not have.
+/// - `destroy-unattached` takes tmux's `keep-last` and `keep-group`,
+///   which are about session groups: without groups they keep every
+///   session, as in tmux.
 /// - `mouse-drag-end` (lif's own) is what tmux's `MouseDragEnd1Pane`
 ///   binding sets, since lif's mouse actions are built in rather than
 ///   bound: copy and leave copy mode (tmux's default), copy and stay with
 ///   the selection shown, or only select. It applies to double- and
 ///   triple-click selections too.
 pub(crate) static DEFS: &[Def] = &[
+    d("activity-action", Session, Choice(&["none", "any", "current", "other"]), "other"),
+    d("aggressive-resize", Window, Flag, "off"),
     d("allow-passthrough", Window, Choice(&["off", "on", "all"]), "off"),
     d("automatic-rename", Window, Flag, "on"),
     d("automatic-rename-format", Window, Str, "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"),
@@ -93,19 +103,26 @@ pub(crate) static DEFS: &[Def] = &[
     d("default-command", Session, Str, ""),
     d("default-shell", Session, Str, "/bin/sh"),
     d("default-size", Session, DimStr, "80x24"),
+    d("destroy-unattached", Session, Choice(&["off", "on", "keep-last", "keep-group"]), "off"),
     d("detach-on-destroy", Session, Choice(&["off", "on", "no-detached", "previous", "next"]), "on"),
     d("display-panes-time", Window, Number(1, MAXI), "1000"),
     d("display-time", Session, Number(0, MAXI), "750"),
     d("escape-time", Server, Number(0, MAXI), "5"),
     d("exit-empty", Server, Flag, "on"),
+    d("focus-events", Server, Flag, "on"),
     d("history-limit", Session, Number(0, MAXI), "4000"),
     d("main-pane-height", Window, SizeStr, "24"),
     d("main-pane-width", Window, SizeStr, "80"),
+    d("menu-border-lines", Window, Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"]), "single"),
+    d("menu-border-style", Window, Str, "default"),
+    d("menu-selected-style", Window, Str, "bg=yellow,fg=black"),
+    d("menu-style", Window, Str, "default"),
     d("message-style", Session, Str, "bg=yellow,fg=black"),
     d("mode-keys", Window, Choice(&["emacs", "vi"]), "emacs"),
     d("mode-style", Window, Str, "bg=yellow,fg=black"),
     d("monitor-activity", Window, Flag, "off"),
     d("monitor-bell", Window, Flag, "on"),
+    d("monitor-silence", Window, Number(0, MAXI), "0"),
     d("mouse", Session, Flag, "on"),
     d("mouse-drag-end", Session, Choice(&["copy-pipe-and-cancel", "copy-pipe-no-clear", "none"]), "copy-pipe-and-cancel"),
     d("other-pane-height", Window, SizeStr, "0"),
@@ -115,6 +132,9 @@ pub(crate) static DEFS: &[Def] = &[
     d("pane-border-format", Window, Str, "#{?pane_active,#[reverse],}#{pane_index}#[default] \"#{pane_title}\""),
     d("pane-border-status", Window, Choice(&["off", "top", "bottom"]), "off"),
     d("pane-border-style", Window, Str, "default"),
+    d("popup-border-lines", Window, Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"]), "single"),
+    d("popup-border-style", Window, Str, "default"),
+    d("popup-style", Window, Str, "default"),
     d("prefix", Session, Key, "C-b"),
     d("prefix2", Session, Key, "None"),
     d("remain-on-exit", Window, Choice(&["off", "on", "failed"]), "off"),
@@ -124,6 +144,7 @@ pub(crate) static DEFS: &[Def] = &[
     d("set-clipboard", Server, Choice(&["off", "external", "on"]), "external"),
     d("set-titles", Session, Flag, "off"),
     d("set-titles-string", Session, Str, "#S:#I:#W - \"#T\""),
+    d("silence-action", Session, Choice(&["none", "any", "current", "other"]), "other"),
     d("status", Session, Choice(&["off", "on"]), "on"),
     d("status-interval", Session, Number(0, MAXI), "15"),
     d("status-justify", Session, Choice(&["left", "centre", "right", "absolute-centre"]), "left"),
@@ -143,7 +164,9 @@ pub(crate) static DEFS: &[Def] = &[
     d("synchronize-panes", Window, Flag, "off"),
     d("tiled-layout-max-columns", Window, Number(0, MAXI), "0"),
     d("tmux-compat", Server, Flag, "off"),
+    d("visual-activity", Session, Choice(&["off", "on", "both"]), "off"),
     d("visual-bell", Session, Choice(&["off", "on", "both"]), "off"),
+    d("visual-silence", Session, Choice(&["off", "on", "both"]), "off"),
     d("window-active-style", Window, Str, "default"),
     d("window-size", Window, Choice(&["largest", "smallest", "manual", "latest"]), "latest"),
     d("window-status-activity-style", Window, Str, "reverse"),

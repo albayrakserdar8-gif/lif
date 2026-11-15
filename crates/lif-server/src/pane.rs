@@ -72,6 +72,10 @@ pub(crate) struct PaneRt {
     pub(crate) read_more: bool,
     pub(crate) eof: bool,
     pub(crate) compact_at: Option<Instant>,
+    /// When the pane will have been quiet for its window's
+    /// `monitor-silence`; `None` while that is off, and after it fired
+    /// until the pane prints again.
+    pub(crate) silence_at: Option<Instant>,
     /// When the program's open synchronized update was first seen.
     pub(crate) sync_since: Option<Instant>,
     pub(crate) current_command: String,
@@ -162,6 +166,7 @@ impl PaneRt {
             read_more: false,
             eof: false,
             compact_at: None,
+            silence_at: None,
             sync_since: None,
             current_command: String::new(),
             current_path: String::new(),

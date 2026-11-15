@@ -65,7 +65,7 @@ source = "git+https://github.com/uzaaft/libghostty-rs?rev=cd4d497e8c698b27054a67
 
 [[package]]
 name = "lif"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "lif-client",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "lif-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "lif-input",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "lif-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "lif-core",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "lif-copy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lif-core",
  "lif-types",
@@ -109,28 +109,28 @@ dependencies = [
 
 [[package]]
 name = "lif-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lif-types",
 ]
 
 [[package]]
 name = "lif-input"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lif-types",
 ]
 
 [[package]]
 name = "lif-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lif-types",
 ]
 
 [[package]]
 name = "lif-pty"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "lif-types",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "lif-render"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libghostty-vt",
  "lif-types",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "lif-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "lif-config",
@@ -163,11 +163,11 @@ dependencies = [
 
 [[package]]
 name = "lif-types"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "lif-vt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "libghostty-vt",

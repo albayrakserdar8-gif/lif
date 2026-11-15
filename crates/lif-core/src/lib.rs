@@ -42,15 +42,17 @@ mod overlay;
 pub mod options;
 mod queue;
 pub(crate) mod status;
+pub use status::StatusRanges;
 mod target;
 pub mod time;
 
-pub use bindings::{Binding, KeyBindings, KeyDecision, KeyState};
+pub use bindings::{Binding, KeyBindings, KeyDecision, KeyState, MouseBinding};
 pub use cmd::{Arg, Args, CmdError, Command, CommandList, escape_arg, parse, parse_list, parse_string};
 pub use exec::expand_prompt_template;
+pub use exec::MAX_STARTUP_COMMANDS;
 pub use host::{
-    CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, JobSpec, JobStatus, LinePos, PaneInfo,
-    PaneInput, Prompt, Redraw, SpawnCommand, SpawnSpec,
+    CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, JobSpec, JobStatus, LinePos, MouseAt,
+    MouseRequest, PaneInfo, PaneInput, Prompt, Redraw, SpawnCommand, SpawnSpec,
 };
 pub use choose::{ChooseItem, ChooseKind, ChooseLine, ChooseOutcome, ChooseScreen, ChooseSpec, ChooseState, MAX_CHOOSE_ITEMS, Preview};
 pub use hooks::hook_names;

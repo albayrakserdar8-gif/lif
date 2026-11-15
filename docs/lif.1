@@ -128,6 +128,14 @@ panes
 .Li "{last} ! {next} + {previous} - {top} {bottom} {left} {right}"
 and
 .Li {up-of} {down-of} {left-of} {right-of} .
+.Li {marked}
+or
+.Li ~
+is the marked pane (the current one if nothing is marked), and
+.Li {mouse}
+or
+.Li =
+what is under the mouse while a mouse key's commands run.
 Inside a pane,
 .Nm
 commands without
@@ -262,7 +270,9 @@ expand and collapse; t tags, T untags all, C-t tags all; C-s searches and n
 and N repeat; f asks for a filter and c clears it; O changes the sort
 order and r reverses it; v toggles the preview; H returns to the starting
 item; x kills the selected item and X the tagged ones after a y; : runs a
-command for each tagged item; q leaves.
+command for each tagged item; m marks the selected item's pane and M
+clears the mark; S-Up and S-Down swap the selected window with the one
+before or after it; C-h or F1 shows the keys; q leaves.
 The command needs an attached client.
 .It Xo
 .Ic clear-history Pq Ic clearhist
@@ -316,6 +326,7 @@ The command that asks never waits for the answer, so -b changes nothing.
 .Xc
 Enter copy mode. -u scrolls one page up, -d one page down, -e leaves at the
 bottom, -H hides the position, -q leaves any mode.
+-M, in a mouse key's commands, starts a selection where the mouse is.
 .It Xo
 .Ic delete-buffer Pq Ic deleteb
 .Op Fl b Ar buffer-name
@@ -354,7 +365,10 @@ and
 An empty name is a separator; a name starting with - cannot be chosen.
 Up and Down move, Enter or the item's key runs its command for the target
 pane, q or Escape closes the menu; the mouse selects and chooses too.
-Positions are as for display-popup.
+Positions are as for display-popup; in a mouse key's commands M is also the
+mouse and W the window's entry in the status line.
+A menu opened by a mouse key closes when the button is let go, choosing
+the item under the mouse, unless -O is given.
 .It Xo
 .Ic display-message Pq Ic display
 .Op Fl lp
@@ -660,13 +674,14 @@ Rename a session.
 Rename a window (this turns automatic-rename off for it).
 .It Xo
 .Ic resize-pane Pq Ic resizep
-.Op Fl DLRUZ
+.Op Fl DLMRUZ
 .Op Fl t Ar target-pane
 .Op Fl x Ar width
 .Op Fl y Ar height
 .Xc
 Resize a pane by adjustment cells in a direction, to -x/-y cells or a
 percentage, or toggle zoom with -Z.
+-M, in the commands of a mouse key on a border, makes the drag resize.
 .It Xo
 .Ic resize-window Pq Ic resizew
 .Op Fl aADLRU
@@ -750,7 +765,7 @@ layout string. -E spreads panes evenly, -n and -p step through presets, -o
 undoes the last layout change.
 .It Xo
 .Ic select-pane Pq Ic selectp
-.Op Fl DdeLlRUZ
+.Op Fl DdeLlMmRUZ
 .Op Fl T Ar title
 .Op Fl t Ar target-pane
 .Xc
@@ -758,6 +773,13 @@ Make a pane active, or the pane in a direction with -L, -R, -U, -D; -l
 selects the last pane. -T sets the pane's title and selects nothing; a
 title the program sets later replaces it. -d turns the pane's input off
 (what clients type and paste there is dropped) and -e on again.
+-m marks the pane, or clears the mark if the pane has it, and -M clears it;
+neither selects anything.
+The marked pane is the default
+.Ar src-pane
+of join-pane and swap-pane and the default
+.Ar src-window
+of swap-window.
 .It Xo
 .Ic select-window Pq Ic selectw
 .Op Fl lnpT
@@ -767,7 +789,7 @@ Select a window; -l last, -n next, -p previous, -T toggles to the last
 window if already current.
 .It Xo
 .Ic send-keys Pq Ic send
-.Op Fl FHlRX
+.Op Fl FHlMRX
 .Op Fl N Ar repeat-count
 .Op Fl t Ar target-pane
 .Oo Ar key Ar ... Oc
@@ -777,6 +799,8 @@ repeats, -R resets the terminal, -X runs a copy-mode command, -F expands
 formats.
 Keys sent to a pane in copy mode go through the copy-mode key table, as if
 typed.
+-M, in a mouse key's commands, passes the mouse event to the pane's mode or
+to its program if that asked for the mouse.
 .It Xo
 .Ic send-prefix
 .Op Fl 2
@@ -1054,6 +1078,8 @@ list-keys
 select-layout -E
 .It Li L
 switch-client -l
+.It Li M
+select-pane -M
 .It Li T
 command-prompt -I "#T" { select-pane -T "%%" }
 .It Li \&[
@@ -1068,6 +1094,8 @@ detach-client
 display-message
 .It Li l
 last-window
+.It Li m
+select-pane -m
 .It Li n
 next-window
 .It Li o
@@ -1150,7 +1178,14 @@ option; list them with
 .Ic list-keys Fl T Ar table .
 The mouse (on by default) selects panes and windows, resizes panes by their
 borders, scrolls into copy mode and selects text (drag, or double and triple
-click for a word and a line); mouse actions cannot be bound.
+click for a word and a line); the middle button pastes and the right one
+opens a menu.
+These are tmux's mouse keys in the root table
+.Po Li MouseDown1Pane , WheelUpStatus , C-MouseDown3Border
+and so on; list them with
+.Ic list-keys Fl T Ar root Pc ,
+and they are bound and unbound like other keys.
+Once a pane is in copy mode the mouse there is not bound.
 What the end of a selection does is the
 .Ic mouse-drag-end
 option: copy and leave copy mode (the default, as tmux), copy and stay, or
@@ -1249,6 +1284,11 @@ The configuration file (TOML), unless
 or
 .Ev XDG_CONFIG_HOME
 says otherwise.
+Its settings are applied when the server starts and again by
+.Ic source-file ;
+the commands of its
+.Li [startup]
+section run once, when the server starts.
 .It Pa $TMPDIR/lif- Ns Ar uid Ns Pa /default
 The default socket.
 The directory must be owned by the user with mode 0700.

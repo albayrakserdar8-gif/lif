@@ -57,6 +57,9 @@ struct TestHost {
     menus: Vec<(ClientId, MenuState)>,
     overlay_up: bool,
     overlays_closed: u32,
+    /// Panes whose program wants the mouse, and what mouse keys asked for.
+    mouse_panes: Vec<PaneId>,
+    mouse_requests: Vec<MouseRequest>,
     /// Panes put into clock mode.
     clocks: Vec<PaneId>,
     history: Vec<String>,
@@ -88,6 +91,9 @@ impl Host for TestHost {
     }
     fn clock_mode(&mut self, pane: PaneId) {
         self.clocks.push(pane);
+    }
+    fn mouse_request(&mut self, what: MouseRequest) {
+        self.mouse_requests.push(what);
     }
     fn popup(&mut self, client: ClientId, spec: PopupSpec) -> Result<(), String> {
         self.popups.push((client, spec));
@@ -146,6 +152,8 @@ impl Host for TestHost {
             history_bytes: 0,
             in_mode: self.in_mode.contains(&pane),
             pipe: self.pipes.contains_key(&pane),
+            mouse_any: self.mouse_panes.contains(&pane),
+            alternate: false,
         }
     }
     fn capture_pane(&self, pane: PaneId, range: CaptureRange) -> String {
@@ -904,10 +912,16 @@ fn keys_bindings_and_prompts() {
     assert_eq!(t.ok("list-keys -T prefix C-b"), "bind-key  -T prefix C-b send-prefix\n");
     t.ok("bind -n M-h select-pane -L");
     t.ok("bind -r -T prefix h 'select-pane -L ; display -p hi'");
-    assert_eq!(t.ok("lsk -T root"), "bind-key  -T root M-h select-pane -L\n");
+    assert_eq!(t.ok("lsk -T root M-h"), "bind-key  -T root M-h select-pane -L\n");
+    // The mouse keys' defaults come first, as in tmux.
+    assert!(t.ok("lsk -T root").starts_with("bind-key  -T root MouseDown1Pane       select-pane -t = \\; send-keys -M\n"));
+    assert!(t.ok("lsk -T root").ends_with("bind-key  -T root M-h                  select-pane -L\n"));
     assert_eq!(t.ok("lsk -T prefix h"), "bind-key -r -T prefix h select-pane -L \\; display-message -p hi\n");
     assert!(matches!(t.m.handle_key(c, &key("M-h"), 0, &mut t.h), KeyDecision::Run(_)));
     t.ok("unbind -n M-h");
+    assert!(!t.ok("lsk -T root").contains("M-h"));
+    // Without the mouse keys' defaults the table is gone, as in tmux.
+    t.ok("unbind -a -T root");
     assert_eq!(t.err("lsk -T root"), "table root doesn't exist");
     t.ok("set -g prefix C-a");
     assert_eq!(t.m.handle_key(c, &key("C-b"), 0, &mut t.h), KeyDecision::SendToPane);
@@ -1375,6 +1389,7 @@ fn source_file_runs_commands_and_reports_problems() {
                 (false, "/c.toml:4:1: warning: something odd".into()),
                 (true, "/c.toml:5:1: error: something wrong".into()),
             ],
+            ..Default::default()
         },
     );
     let e = t.err("source-file /c.toml");
@@ -1756,7 +1771,7 @@ fn waiting_inside_source_file_does_not_hold_it_up() {
     let mut t = T::with_session();
     let file = ConfigFile {
         commands: vec![("run-shell 'echo slow' ; set -g @after-run 1".into(), "f:1:1".into()), ("set -g @next 1".into(), "f:2:1".into())],
-        diagnostics: Vec::new(),
+        ..Default::default()
     };
     t.h.configs.insert("/f".into(), file);
     assert_eq!(t.ok("source-file /f ; display -p '#{@next}#{@after-run}'"), "1\n", "the file's other lines ran, the list goes on");
@@ -2414,7 +2429,246 @@ fn display_menu_items_keys_and_mouse() {
     t.m.execute_list(&list, &t.ctx, &mut t.h).unwrap();
     let m = t.h.menus.pop().unwrap().1;
     assert_eq!(m.title, "0:zsh");
-    assert_eq!(m.lines()[0].as_deref(), Some(" Swap Left      "), "one window: nothing to swap with, so no key");
+    assert_eq!(m.lines()[0].as_deref(), Some(" Swap Left       "), "one window: nothing to swap with, so no key");
     assert!(matches!(&m.items[0], MenuItem::Entry { enabled: false, .. }));
-    assert_eq!(m.lines()[3].as_deref(), Some(" Kill       (X) "));
+    assert_eq!(m.lines()[2].as_deref(), Some(" Swap Marked     "), "nothing is marked");
+    assert_eq!(m.lines()[4].as_deref(), Some(" Kill        (X) "));
+    assert_eq!(m.lines()[6].as_deref(), Some(" Mark        (m) "));
+}
+
+/// The marked pane, line for line what tmux 3.8 prints for the same
+/// commands.
+#[test]
+fn marked_pane() {
+    let mut t = T::with_session();
+    t.ok("split-window -t a ; split-window -t a ; new-window -t a");
+    let f = "list-panes -s -t a -F '#{window_index}.#{pane_index} #{pane_id} m=#{pane_marked} set=#{pane_marked_set} wf=#{window_marked_flag} flags=#{window_flags}'";
+    t.ok("select-pane -t a:0.1 -m");
+    assert_eq!(t.ok(f), "0.0 %0 m=0 set=1 wf=1 flags=-M\n0.1 %1 m=1 set=1 wf=1 flags=-M\n0.2 %2 m=0 set=1 wf=1 flags=-M\n1.0 %3 m=0 set=1 wf=0 flags=*\n");
+    assert_eq!(t.ok("display -p -t '~' '#{pane_id}' ; display -p -t '{marked}' '#{pane_id}'"), "%1\n%1\n");
+    // It is the default source of swap-pane, swap-window and join-pane.
+    t.ok("swap-pane -t a:0.0");
+    assert_eq!(t.ok(f), "0.0 %1 m=1 set=1 wf=1 flags=-M\n0.1 %0 m=0 set=1 wf=1 flags=-M\n0.2 %2 m=0 set=1 wf=1 flags=-M\n1.0 %3 m=0 set=1 wf=0 flags=*\n");
+    t.ok("swap-window -t a:1");
+    assert_eq!(t.ok(f), "0.0 %3 m=0 set=1 wf=0 flags=-\n1.0 %1 m=1 set=1 wf=1 flags=*M\n1.1 %0 m=0 set=1 wf=1 flags=*M\n1.2 %2 m=0 set=1 wf=1 flags=*M\n");
+    // A marked pane that is moved is no longer marked.
+    t.ok("join-pane -t a:0.0");
+    assert_eq!(t.ok(f), "0.0 %3 m=0 set=0 wf=0 flags=*\n0.1 %1 m=0 set=0 wf=0 flags=*\n1.0 %0 m=0 set=0 wf=0 flags=-\n1.1 %2 m=0 set=0 wf=0 flags=-\n");
+    // -m on the marked pane clears the mark, as -M does anywhere.
+    t.ok("select-pane -t a:0.0 -m");
+    assert_eq!(t.ok("display -p -t a:0.0 '#{pane_marked}#{pane_marked_set}'"), "11\n");
+    t.ok("select-pane -t a:0.0 -m");
+    assert_eq!(t.ok("display -p -t a:0.0 '#{pane_marked}#{pane_marked_set}'"), "00\n");
+    t.ok("select-pane -t a:0.0 -m ; select-pane -M");
+    assert_eq!(t.ok("display -p -t a:0.0 '#{pane_marked}#{pane_marked_set}'"), "00\n");
+    // Nothing marked: ~ is the current pane, and the commands are what
+    // they were.
+    assert_eq!(t.ok("display -p -t '~' '#{pane_id}'"), t.ok("display -p '#{pane_id}'"));
+    t.ok("swap-pane -t a:0.0");
+    assert_eq!(t.err("join-pane -t a:0.1"), "source and target panes must be different");
+    // A marked pane that is killed takes the mark with it.
+    t.ok("select-pane -t a:1.1 -m ; kill-pane -t a:1.1");
+    assert_eq!(t.ok("display -p '#{pane_marked_set}'"), "0\n");
+    // -m selects nothing.
+    let active = t.ok("display -p -t a:0 '#{pane_id}'");
+    t.ok("select-pane -t a:0.0 -m");
+    assert_eq!(t.ok("display -p -t a:0 '#{pane_id}'"), active);
+    assert_eq!(t.ok("list-keys -T prefix m"), "bind-key  -T prefix m select-pane -m\n");
+    assert_eq!(t.ok("list-keys -T prefix M"), "bind-key  -T prefix M select-pane -M\n");
+}
+
+/// Mouse keys: tmux's names, the target `=` and the `mouse_*` formats.
+#[test]
+fn mouse_keys_and_the_mouse_target() {
+    use crate::keys::mouse;
+    for name in ["MouseDown1Pane", "MouseUp3Border", "MouseDrag2Status", "MouseDragEnd1StatusLeft", "DoubleClick1Pane", "TripleClick3StatusRight", "WheelUpStatusDefault", "WheelDownPane", "C-MouseDown1Pane", "M-S-WheelUpPane"] {
+        let k = KeyCode::parse(name).unwrap_or_else(|| panic!("{name}"));
+        assert!(k.is_mouse(), "{name}");
+        assert_eq!(k.to_string(), name);
+    }
+    for name in ["MouseDown4Pane", "MouseDown1", "WheelUp1Pane", "MouseDown1Nowhere", "Pane"] {
+        assert!(KeyCode::parse(name).is_none(), "{name}");
+    }
+    assert_eq!(KeyCode::mouse(mouse::DOWN + 2, mouse::STATUS, lif_types::Mods::NONE), KeyCode::parse("MouseDown3Status").unwrap());
+    assert!(!KeyCode::parse("a").unwrap().is_mouse());
+
+    let mut t = T::with_session();
+    t.ok("split-window -h -t a");
+    assert_eq!(t.err("display -p -t = x"), "no mouse target");
+    let pane = t.m.window(t.m.sessions().next().unwrap().current_window()).unwrap().panes()[0];
+    let window = t.m.pane(pane).unwrap().window();
+    t.m.set_mouse(Some(MouseAt { pane: Some(pane), window: Some(window), screen: (3, 5), cell: (3, 5), status_x: None }));
+    assert_eq!(t.ok("display -p -t = '#{pane_index} #{mouse_x},#{mouse_y}'"), "0 3,5\n");
+    assert_eq!(t.ok("display -p -t '{mouse}' '#{pane_index}'"), "0\n");
+    assert_eq!(t.ok("display -p '#{pane_index}'"), "1\n", "the active pane is another one");
+    t.ok("select-pane -t =");
+    assert_eq!(t.ok("display -p '#{pane_index}'"), "0\n");
+    // What a binding asks to be done with the event goes to the host.
+    t.ok("send-keys -M ; resize-pane -M");
+    assert_eq!(t.h.mouse_requests, vec![MouseRequest::Forward(pane), MouseRequest::ResizeBorder]);
+    // On a border or beside the windows in the status line: the window's
+    // active pane, the current window.
+    t.m.set_mouse(Some(MouseAt { pane: None, window: Some(window), screen: (40, 5), cell: (40, 5), status_x: None }));
+    assert_eq!(t.ok("display -p -t = '#{pane_index}'"), "0\n");
+    t.m.set_mouse(Some(MouseAt { pane: None, window: None, screen: (0, 24), cell: (0, 24), status_x: None }));
+    assert_eq!(t.ok("display -p -t = '#{window_index}'"), "0\n");
+    t.m.set_mouse(None);
+    assert_eq!(t.err("select-pane -t ="), "no mouse target");
+}
+
+/// Alerts for activity and silence, as tmux's: a flag on the window, and
+/// what the `*-action` and `visual-*` options say for the clients.
+#[test]
+fn activity_and_silence_alerts() {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach ; new-window -d ; new-window -d");
+    let pane = |t: &mut T, w: u32| PaneId::parse(t.ok(&format!("display -p -t a:{w} '#{{pane_id}}'")).trim()).unwrap();
+    let (p0, p1, p2) = (pane(&mut t, 0), pane(&mut t, 1), pane(&mut t, 2));
+    let flags = |t: &mut T| t.ok("lsw -F '#I#{window_flags} #{window_silence_flag}#{window_activity_flag}'");
+    // Not watched: nothing.
+    assert_eq!(t.m.silence_secs(p1), 0);
+    t.m.pane_silence(p1, &mut t.h);
+    t.m.pane_activity(p1, &mut t.h);
+    assert_eq!(flags(&mut t), "0* 00\n1 00\n2 00\n");
+    // Silence in another window: the flag and, by default, a bell.
+    t.ok("setw -g monitor-silence 30");
+    assert_eq!(t.m.silence_secs(p1), 30);
+    t.m.pane_silence(p1, &mut t.h);
+    assert_eq!(flags(&mut t), "0* 00\n1~ 10\n2 00\n");
+    assert_eq!((t.h.bells.len(), t.h.messages.len()), (1, 0));
+    // Once per flag; never for the current window.
+    t.m.pane_silence(p1, &mut t.h);
+    t.m.pane_silence(p0, &mut t.h);
+    assert_eq!(t.h.bells.len(), 1);
+    // visual-silence: a message instead of the bell, or both.
+    t.ok("set -g visual-silence on");
+    t.m.pane_silence(p2, &mut t.h);
+    assert_eq!(t.h.bells.len(), 1);
+    assert_eq!(t.h.messages.last().unwrap().1, "Silence in window 2");
+    assert_eq!(t.ok("display -p '#{session_alerts}'"), "1~,2~\n");
+    // Selecting the window clears its flag; next-window -a goes to one.
+    t.ok("next-window -a");
+    assert_eq!(flags(&mut t), "0- 00\n1* 00\n2~ 10\n");
+    t.ok("select-window -t a:0 ; select-window -t a:2 ; select-window -t a:0");
+    // silence-action none: the flag only.
+    t.ok("set -g silence-action none");
+    let before = t.h.messages.len();
+    t.m.pane_silence(p1, &mut t.h);
+    assert_eq!(flags(&mut t), "0* 00\n1~ 10\n2- 00\n");
+    assert_eq!(t.h.messages.len(), before);
+    // Activity: activity-action other (the default) rings once per flag,
+    // visual-activity both adds the message.
+    t.ok("setw -g monitor-silence 0 ; setw -g monitor-activity on ; set -g visual-activity both ; select-window -t a:1 ; select-window -t a:0");
+    let bells = t.h.bells.len();
+    t.m.pane_activity(p2, &mut t.h);
+    t.m.pane_activity(p2, &mut t.h);
+    assert_eq!(t.h.bells.len(), bells + 1);
+    assert_eq!(t.h.messages.last().unwrap().1, "Activity in window 2");
+    // A bell in the current window with visual-bell on is a message.
+    t.ok("set -g visual-bell on");
+    t.m.pane_bell(p0, &mut t.h);
+    assert_eq!(t.h.bells.len(), bells + 1);
+    assert_eq!(t.h.messages.last().unwrap().1, "Bell in current window");
+}
+
+/// `destroy-unattached`: a session nobody is attached to goes when the
+/// server next looks, as in tmux.
+#[test]
+fn destroy_unattached_sessions() {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach ; new-session -d -s b ; new-session -d -s keep");
+    let names = |t: &mut T| t.ok("ls -F '#S'");
+    t.m.check_unattached(&mut t.h);
+    assert_eq!(names(&mut t), "a\nb\nkeep\n", "off by default");
+    // Turned on for a session without clients: it goes.
+    t.ok("set -t b destroy-unattached on");
+    t.m.check_unattached(&mut t.h);
+    assert_eq!(names(&mut t), "a\nkeep\n");
+    // On for the attached one: it stays until its client leaves.
+    t.ok("set -t a destroy-unattached on");
+    t.m.check_unattached(&mut t.h);
+    assert_eq!(names(&mut t), "a\nkeep\n");
+    // tmux's values for session groups keep every session without groups.
+    t.ok("set -t keep destroy-unattached keep-last");
+    t.ok("detach-client");
+    t.m.check_unattached(&mut t.h);
+    assert_eq!(names(&mut t), "keep\n");
+    assert_eq!(t.err("set -g destroy-unattached maybe"), "unknown value: maybe");
+    // A session made detached while it is on for all does not live.
+    t.ok("set -g destroy-unattached on ; new-session -d -s gone");
+    t.m.check_unattached(&mut t.h);
+    assert_eq!(names(&mut t), "keep\n");
+}
+
+/// `aggressive-resize`: a window is sized for the clients showing it, so
+/// one that is not current keeps its size until it is selected.
+#[test]
+fn aggressive_resize_sizes_a_window_when_it_is_shown() {
+    let mut t = T::with_session();
+    t.ok("new-window -d ; setw -t a:1 aggressive-resize on");
+    let c = t.attach_client(1, 120, 41);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach");
+    let sizes = |t: &mut T| t.ok("lsw -F '#I #{window_width}x#{window_height}'");
+    assert_eq!(sizes(&mut t), "0 120x40\n1 80x24\n");
+    t.ok("select-window -t a:1");
+    assert_eq!(sizes(&mut t), "0 120x40\n1 120x40\n");
+    // Left behind, it keeps the size it had.
+    t.ok("select-window -t a:0");
+    t.m.client_resized(c, Size::new(100, 31), &mut t.h);
+    assert_eq!(sizes(&mut t), "0 100x30\n1 120x40\n");
+}
+
+/// The popup-* and menu-* options are what -b, -s, -S and -H default to.
+#[test]
+fn popup_and_menu_options() {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach");
+    t.ok("display-menu A a ''");
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!((m.border, m.style.as_str(), m.selected_style.as_str(), m.border_style.as_str()), (BorderLines::Single, "default", "bg=yellow,fg=black", "default"));
+    t.ok("setw -g menu-border-lines rounded ; setw -g menu-style bg=blue ; setw -g menu-selected-style reverse ; setw -g menu-border-style fg=red");
+    t.ok("display-menu A a ''");
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!((m.border, m.style.as_str(), m.selected_style.as_str(), m.border_style.as_str()), (BorderLines::Rounded, "bg=blue", "reverse", "fg=red"));
+    // The flags win.
+    t.ok("display-menu -b double -s bg=green -H bold -S fg=cyan A a ''");
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!((m.border, m.style.as_str(), m.selected_style.as_str(), m.border_style.as_str()), (BorderLines::Double, "bg=green", "bold", "fg=cyan"));
+    t.ok("setw -g popup-border-lines heavy ; setw -g popup-style bg=black ; setw -g popup-border-style fg=yellow");
+    t.ok("display-popup true");
+    let p = t.h.popups.pop().unwrap().1;
+    assert_eq!((p.border, p.style.as_str(), p.border_style.as_str()), (BorderLines::Heavy, "bg=black", "fg=yellow"));
+    t.h.overlay_up = false;
+    t.ok("display-popup -B -s default true");
+    let p = t.h.popups.pop().unwrap().1;
+    assert_eq!((p.border, p.style.as_str()), (BorderLines::None, "default"));
+    assert_eq!(t.err("setw -g popup-border-lines wavy"), "unknown value: wavy");
+}
+
+/// `split-window -f -b` and `join-pane -f`, with tmux 3.8's sizes and
+/// pane order (issues/0005: the new pane of -f -b got the smaller half).
+#[test]
+fn full_size_splits_before_and_join_pane_f() {
+    let f = "list-panes -t a:0 -F '#{pane_index} #{pane_left},#{pane_top} #{pane_width}x#{pane_height} #{pane_active}'";
+    let mut t = T::with_session();
+    t.ok("split-window -h -t a ; split-window -f -b -t a");
+    assert_eq!(t.ok(f), "0 0,0 80x12 1\n1 0,13 40x11 0\n2 41,13 39x11 0\n");
+    let mut t = T::with_session();
+    t.ok("split-window -f -t a ; split-window -f -h -b -t a");
+    assert_eq!(t.ok(f), "0 0,0 40x24 1\n1 41,0 39x12 0\n2 41,13 39x11 0\n");
+    // join-pane -f: beside the whole window; in the pane order the pane
+    // still comes next to the target.
+    let mut t = T::with_session();
+    t.ok("split-window -t a ; split-window -t a ; new-window -t a ; new-window -t a");
+    t.ok("join-pane -f -h -s a:1.0 -t a:0.1");
+    assert_eq!(t.ok(f), "0 0,0 40x12 0\n1 0,13 40x5 0\n2 41,0 39x24 1\n3 0,19 40x5 0\n");
+    t.ok("join-pane -f -b -d -s a:2.0 -t a:0.0");
+    assert_eq!(t.ok(f), "0 0,0 80x12 0\n1 0,13 40x5 0\n2 0,19 40x2 0\n3 41,13 39x11 1\n4 0,22 40x2 0\n");
 }

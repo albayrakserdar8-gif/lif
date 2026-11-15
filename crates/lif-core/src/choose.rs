@@ -186,6 +186,9 @@ pub struct ChooseScreen {
     pub title: Option<String>,
     /// What is inside the box.
     pub preview: Preview,
+    /// The key help (`C-h`, `F1`), drawn in a box over everything
+    /// else: keys and what they do.
+    pub help: Option<Vec<(&'static str, &'static str)>>,
 }
 
 /// A chooser mode in a pane.
@@ -206,6 +209,8 @@ pub struct ChooseState {
     asking: Option<Asking>,
     /// Rows of the list when it was last drawn, for paging.
     page: usize,
+    /// The key help is up; the next key takes it down.
+    help: bool,
 }
 
 fn key_is(key: &KeyEvent, name: &str) -> bool {
@@ -247,6 +252,7 @@ impl ChooseState {
             search: String::new(),
             asking: None,
             page: 10,
+            help: false,
         };
         // The start item, or the nearest line above it that is shown.
         let vis = s.visible();
@@ -389,13 +395,97 @@ impl ChooseState {
         ChooseOutcome::None
     }
 
+    /// The keys of this mode, as tmux's help lists them (those lif has).
+    fn help_lines(&self) -> Vec<(&'static str, &'static str)> {
+        // The texts are fixed per kind, so they are picked, not built.
+        let pick = |tree: &'static str, buffers: &'static str, clients: &'static str| match self.spec.kind {
+            ChooseKind::Tree => tree,
+            ChooseKind::Buffers => buffers,
+            ChooseKind::Clients => clients,
+        };
+        let mut v = vec![
+            ("Up, k", "Move cursor up"),
+            ("Down, j", "Move cursor down"),
+            ("g", "Go to top"),
+            ("G", "Go to bottom"),
+            ("PPage, C-b", "Page up"),
+            ("NPage, C-f", "Page down"),
+            ("Left, h", pick("Collapse item", "Collapse buffer", "Collapse client")),
+            ("Right, l", pick("Expand item", "Expand buffer", "Expand client")),
+            ("M--", pick("Collapse all items", "Collapse all buffers", "Collapse all clients")),
+            ("M-+", pick("Expand all items", "Expand all buffers", "Expand all clients")),
+            ("t", pick("Toggle item tag", "Toggle buffer tag", "Toggle client tag")),
+            ("T", pick("Untag all items", "Untag all buffers", "Untag all clients")),
+            ("C-t", pick("Tag all items", "Tag all buffers", "Tag all clients")),
+            ("C-s", "Search forward"),
+            ("n", "Repeat search forward"),
+            ("N", "Repeat search backward"),
+            ("f", pick("Filter items", "Filter buffers", "Filter clients")),
+            ("c", "Clear the filter"),
+            ("O", "Change sort order"),
+            ("r", "Reverse sort order"),
+            ("v", "Toggle preview"),
+            ("Enter", pick("Choose selected item", "Paste selected buffer", "Choose selected client")),
+        ];
+        match self.spec.kind {
+            ChooseKind::Tree => v.extend([
+                ("S-Up", "Swap current and previous window"),
+                ("S-Down", "Swap current and next window"),
+                ("x", "Kill selected item"),
+                ("X", "Kill tagged items"),
+                ("m", "Set the marked pane"),
+                ("M", "Clear the marked pane"),
+                (":", "Run a command for each tagged item"),
+                ("H", "Jump to the starting pane"),
+            ]),
+            ChooseKind::Buffers => v.extend([
+                ("p", "Paste selected buffer"),
+                ("P", "Paste tagged buffers"),
+                ("d", "Delete selected buffer"),
+                ("D", "Delete tagged buffers"),
+                (":", "Run a command for each tagged buffer"),
+            ]),
+            ChooseKind::Clients => v.extend([
+                ("d", "Detach selected client"),
+                ("D", "Detach tagged clients"),
+                ("x", "Detach selected client"),
+                ("X", "Detach tagged clients"),
+                ("z", "Suspend selected client"),
+                ("Z", "Suspend tagged clients"),
+                (":", "Run a command for each tagged client"),
+            ]),
+        }
+        v.push(("q, Escape", "Exit mode"));
+        v
+    }
+
+    /// The window item `by` places from item `cur` among its session's
+    /// windows, if `cur` is a window and there is one.
+    fn sibling_window(&self, cur: usize, forward: bool) -> Option<usize> {
+        if self.items[cur].depth != 1 {
+            return None;
+        }
+        let same = |j: &usize| self.items[*j].depth <= 1;
+        let j = if forward { (cur + 1..self.items.len()).find(same)? } else { (0..cur).rev().find(same)? };
+        (self.items[j].depth == 1).then_some(j)
+    }
+
     /// A key for the mode.
     pub fn key(&mut self, key: &KeyEvent) -> ChooseOutcome {
         let Some(cur) = self.current_index() else {
             return ChooseOutcome::Exit;
         };
+        if self.help {
+            // Any key takes the help down, and does nothing else.
+            self.help = false;
+            return ChooseOutcome::Redraw;
+        }
         let plain = |c: char| key.key == Key::Char(c) && key.mods == Mods::NONE;
         let is = |name: &str| key_is(key, name);
+        if is("C-h") || is("F1") {
+            self.help = true;
+            return ChooseOutcome::Redraw;
+        }
         // Shortcuts first: the digits and M-letters shown on the lines.
         let vis = self.visible();
         if let Some(code) = KeyCode::from_event(key) {
@@ -534,6 +624,28 @@ impl ChooseState {
         let all = |s: &ChooseState, template: &str| -> Vec<String> { s.tagged_or_current().iter().map(|i| s.command_for(template, *i)).collect() };
         match kind {
             ChooseKind::Tree => {
+                if plain('m') {
+                    // Set, not toggle: the item's pane is the marked one
+                    // afterwards whatever was marked.
+                    return ChooseOutcome::Run(vec!["select-pane -M".to_string(), self.command_for("select-pane -m -t '%%'", cur)]);
+                }
+                if plain('M') {
+                    return ChooseOutcome::Run(vec!["select-pane -M".to_string()]);
+                }
+                if is("S-Up") || is("S-Down") {
+                    // The windows trade places; the selection stays on
+                    // the window that moved, and a current window stays
+                    // current (it may be the one showing this list).
+                    return match self.sibling_window(cur, is("S-Down")) {
+                        Some(j) => {
+                            let (a, b) = (&self.items[cur].id, &self.items[j].id);
+                            ChooseOutcome::Run(vec![format!(
+                                "if-shell -F -t {a} '#{{window_active}}' {{ swap-window -d -s {a} -t {b} }} {{ if-shell -F -t {b} '#{{window_active}}' {{ swap-window -d -s {b} -t {a} }} {{ swap-window -s {a} -t {b} }} }}"
+                            )])
+                        }
+                        None => ChooseOutcome::None,
+                    };
+                }
                 if plain('x')
                     && let Some((question, command)) = self.items[cur].kill.clone()
                 {
@@ -676,7 +788,8 @@ impl ChooseState {
             (Some(_), Some(i)) => self.items[i].preview.clone(),
             _ => Preview::None,
         };
-        ChooseScreen { lines, list_rows: height as u16, title, preview }
+        let help = self.help.then(|| self.help_lines());
+        ChooseScreen { lines, list_rows: height as u16, title, preview, help }
     }
 
     /// `(key) tree name: text` for line number `line` showing item `i`.

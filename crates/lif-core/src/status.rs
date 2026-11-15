@@ -250,8 +250,25 @@ pub(crate) struct StatusParts {
     pub justify: usize,
 }
 
+/// Where the parts of a status line came out, as columns: for the mouse.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatusRanges {
+    /// `status-left`: start and end (exclusive).
+    pub left: (usize, usize),
+    /// `status-right`.
+    pub right: (usize, usize),
+    /// The visible part of each window's entry, in window order; empty
+    /// ranges for windows scrolled out.
+    pub windows: Vec<(usize, usize)>,
+}
+
 /// Lay the status line out, exactly `width` cells wide.
 pub(crate) fn render(p: &StatusParts) -> StyledLine {
+    render_with(p, None)
+}
+
+/// [`render`], also saying where everything went.
+pub(crate) fn render_with(p: &StatusParts, mut ranges: Option<&mut StatusRanges>) -> StyledLine {
     let mut left_full = Vec::new();
     styled_spans(&p.left, p.left_style, p.base, &mut left_full);
     let mut left = Vec::new();
@@ -279,6 +296,10 @@ pub(crate) fn render(p: &StatusParts) -> StyledLine {
         }
         let start = spans_width(&list);
         styled_spans(&w.text, w.style, p.base, &mut list);
+        if let Some(r) = ranges.as_deref_mut() {
+            // In the list for now; moved to the line below.
+            r.windows.push((start, spans_width(&list)));
+        }
         if w.current {
             (cur_start, cur_end) = (start, spans_width(&list));
         }
@@ -288,6 +309,8 @@ pub(crate) fn render(p: &StatusParts) -> StyledLine {
 
     let mut line = left;
     let mut placed = Vec::new();
+    // The list's first visible column, and the column of the line it is at.
+    let mut shown_from = 0;
     let (pad_before, used) = if list_w <= avail {
         crop(&list, 0, list_w, &mut placed);
         let pad = match p.justify {
@@ -313,6 +336,7 @@ pub(crate) fn render(p: &StatusParts) -> StyledLine {
         let cut_left = markers && offset > 0;
         let cut_right = markers && offset + avail < list_w;
         let inner_start = offset + cut_left as usize;
+        shown_from = offset;
         let inner_len = avail - cut_left as usize - cut_right as usize;
         if cut_left {
             push(&mut placed, "<", p.base);
@@ -325,6 +349,15 @@ pub(crate) fn render(p: &StatusParts) -> StyledLine {
     } else {
         (0, 0)
     };
+    if let Some(r) = ranges {
+        r.left = (0, lw);
+        r.right = (p.width - rw, p.width);
+        let (first, end) = (lw + pad_before, lw + pad_before + used);
+        for w in &mut r.windows {
+            let at = |c: usize| (first + c.saturating_sub(shown_from)).min(end);
+            *w = (at(w.0), at(w.1));
+        }
+    }
     if pad_before > 0 {
         push(&mut line, &" ".repeat(pad_before), p.base);
     }

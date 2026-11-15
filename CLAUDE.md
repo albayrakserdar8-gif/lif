@@ -13,9 +13,9 @@ A terminal multiplexer that keeps tmux's commands, flags, targets, formats,
 default key bindings (prefix `C-b`) and error messages, with a TOML config
 instead of `.tmux.conf`. Its reason to exist is speed and a small footprint:
 one server thread, one mio event loop, libghostty-vt as the terminal engine,
-a diff renderer that skips frames instead of queueing output. Version 0.3.0,
-tested on macOS / Apple Silicon only (Linux builds by cross compiling, see
-below, but has never been run).
+a diff renderer that skips frames instead of queueing output. Version 0.4.0,
+developed on macOS / Apple Silicon; the tests also pass on Linux (arm64, in
+a VM, see below).
 
 tmux 3.8 is the behavioral reference. When unsure how something should
 behave, check what tmux does (`tmux -L scratch -f /dev/null ...` on a private
@@ -145,11 +145,13 @@ The libghostty-rs API source is under
 - Optimizations need before/after numbers (hyperfine, `bench/run.sh --only ...`,
   or the crate `bench.rs` tests) in the report.
 
-## Linux (cross-check only)
+## Linux
 
-Nothing on this machine runs Linux, so Linux is checked by cross compiling.
-Homebrew's rustc has only the host target; use the rustup toolchain, which
-has `aarch64-unknown-linux-gnu` installed, and its own build directory:
+Two checks, a quick one by cross compiling and the real one in a VM.
+
+Cross-check (seconds; no Linux needed). Homebrew's rustc has only the host
+target; use the rustup toolchain, which has `aarch64-unknown-linux-gnu`
+installed, and its own build directory:
 
 ```sh
 export PATH=$(dirname $(rustup which rustc --toolchain stable)):/opt/homebrew/bin:$PATH
@@ -161,9 +163,41 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$PWD/tools/zigcc-aarch64-linux.sh 
 ```
 
 That toolchain's clippy is newer than Homebrew's and has more lints; code
-must pass both. A change to `cfg(target_os)` code is not done until this
-check passes. Running the tests on Linux needs a VM or container, which is
-not installed.
+must pass both.
+
+Running the tests on Linux: a Lima VM named `lif` (Ubuntu LTS, arm64, vz;
+`brew install lima`), kept on the SSD with `LIMA_HOME=/Volumes/extssd/lima`.
+It has no mounts: the tree is copied in, and builds stay inside the VM.
+
+```sh
+export LIMA_HOME=/Volumes/extssd/lima
+limactl start lif          # limactl stop lif when done; it takes 6 CPUs and 6 GiB
+git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -cf - \
+  | limactl shell --workdir / lif bash -lc 'mkdir -p ~/lif && cd ~/lif && tar -xf - 2>/dev/null'
+limactl shell --workdir / lif bash -lc 'cd ~/lif && cargo test --workspace --no-fail-fast'
+```
+
+The VM has rustup's stable toolchain, zig 0.17.1 in `~/zig` and zsh (the
+job-control tests run a client under it). To make it again: `limactl start
+--name=lif --tty=false --vm-type=vz --cpus=6 --memory=6 --disk=30
+--mount-none --containerd=none template://ubuntu-lts`, then install
+build-essential, zsh, rustup and zig inside.
+
+What differs on Linux, learned the hard way:
+
+- `/bin/sh` is dash and shows as `sh` (on macOS it shows as `bash`), so a
+  window is named `sh` and a target like `-t s` means that window before
+  it means a session called `s`, as in tmux. Tests write `-t s:`.
+- One argument is at most 128 KiB; the listen queue holds 4096
+  connections and a blocking `connect` waits for room in it
+  (`lif_client::connect_stream` never does).
+- A signal interrupts `poll` in whichever test thread it lands on.
+- `$XDG_RUNTIME_DIR` is set and comes before `$TMPDIR` for the socket.
+- `echo_is_not_paced_next_to_a_flood` is ignored there (issues/0006).
+
+A change to `cfg(target_os)` code is not done until the cross-check
+passes, and should be run in the VM. `.github/workflows/ci.yml` runs
+build, clippy and the tests on macOS arm64 and on Linux arm64 and x86_64.
 
 ## Benchmarks
 

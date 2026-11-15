@@ -11,6 +11,83 @@ use std::fmt;
 
 const MASK: u8 = Mods::SHIFT.0 | Mods::ALT.0 | Mods::CTRL.0;
 
+/// Mouse keys (`MouseDown1Pane`, `WheelUpStatus`, ...) are key codes too,
+/// so that every command and table that takes a key takes them: their
+/// `Key::Char` is a codepoint of a private-use plane no keyboard sends,
+/// `MOUSE_BASE + event * 8 + place`. Events from a terminal with such a
+/// character never match a binding ([`KeyCode::from_event`]).
+const MOUSE_BASE: u32 = 0xF_0000;
+
+/// What the mouse did, as tmux names it; buttons 1 to 3 follow each other.
+const MOUSE_EVENTS: [&str; 23] = [
+    "MouseDown1",
+    "MouseDown2",
+    "MouseDown3",
+    "MouseUp1",
+    "MouseUp2",
+    "MouseUp3",
+    "MouseDrag1",
+    "MouseDrag2",
+    "MouseDrag3",
+    "MouseDragEnd1",
+    "MouseDragEnd2",
+    "MouseDragEnd3",
+    "SecondClick1",
+    "SecondClick2",
+    "SecondClick3",
+    "DoubleClick1",
+    "DoubleClick2",
+    "DoubleClick3",
+    "TripleClick1",
+    "TripleClick2",
+    "TripleClick3",
+    "WheelUp",
+    "WheelDown",
+];
+
+/// Where it did it.
+const MOUSE_PLACES: [&str; 6] = ["Pane", "Border", "Status", "StatusLeft", "StatusRight", "StatusDefault"];
+
+/// Indexes of mouse events and places, for [`KeyCode::mouse`]. Add the
+/// button (0 for the first) to the events that have one.
+pub mod mouse {
+    /// `MouseDown1`; +1 and +2 for buttons 2 and 3.
+    pub const DOWN: u8 = 0;
+    /// `MouseUp1`.
+    pub const UP: u8 = 3;
+    /// `MouseDrag1`: the first motion with the button held.
+    pub const DRAG: u8 = 6;
+    /// `MouseDragEnd1`: the release that ends a drag.
+    pub const DRAG_END: u8 = 9;
+    /// `SecondClick1`: the second press of a double click.
+    pub const SECOND: u8 = 12;
+    /// `DoubleClick1`.
+    pub const DOUBLE: u8 = 15;
+    /// `TripleClick1`.
+    pub const TRIPLE: u8 = 18;
+    /// `WheelUp`.
+    pub const WHEEL_UP: u8 = 21;
+    /// `WheelDown`.
+    pub const WHEEL_DOWN: u8 = 22;
+    /// On a pane.
+    pub const PANE: u8 = 0;
+    /// On a border between panes.
+    pub const BORDER: u8 = 1;
+    /// On a window in the status line.
+    pub const STATUS: u8 = 2;
+    /// On the left part of the status line.
+    pub const STATUS_LEFT: u8 = 3;
+    /// On its right part.
+    pub const STATUS_RIGHT: u8 = 4;
+    /// Elsewhere on it.
+    pub const STATUS_DEFAULT: u8 = 5;
+}
+
+fn mouse_name(c: char) -> Option<(&'static str, &'static str)> {
+    let i = (c as u32).checked_sub(MOUSE_BASE)?;
+    Some((MOUSE_EVENTS.get((i / 8) as usize)?, MOUSE_PLACES.get((i % 8) as usize)?))
+}
+
 /// A normalized key with modifiers, as stored in key tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyCode {
@@ -27,6 +104,18 @@ impl KeyCode {
         normalize(key, mods)
     }
 
+    /// The key of a mouse event: `event` and `place` are indexes from
+    /// [`mouse`] (`mouse::DOWN + 1` at `mouse::PANE` is `MouseDown2Pane`).
+    pub fn mouse(event: u8, place: u8, mods: Mods) -> KeyCode {
+        let c = char::from_u32(MOUSE_BASE + event as u32 * 8 + place as u32).unwrap_or('\u{F0000}');
+        KeyCode { key: Key::Char(c), mods: Mods(mods.0 & MASK) }
+    }
+
+    /// Whether this is a mouse key.
+    pub fn is_mouse(self) -> bool {
+        matches!(self.key, Key::Char(c) if mouse_name(c).is_some())
+    }
+
     /// The binding key for an input event, or `None` for events that can never
     /// match a binding (key releases, Super/Hyper chords, and the kitty-only
     /// media and lone modifier keys, which tmux has no names for).
@@ -35,6 +124,11 @@ impl KeyCode {
             return None;
         }
         if ev.mods.contains(Mods::SUPER) || ev.mods.contains(Mods::HYPER) {
+            return None;
+        }
+        // A typed character from the plane the mouse keys live in is not a
+        // mouse key.
+        if matches!(ev.key, Key::Char(c) if mouse_name(c).is_some()) {
             return None;
         }
         let mut mods = Mods(ev.mods.0 & MASK);
@@ -108,6 +202,14 @@ impl KeyCode {
                 return None;
             }
             return Some(normalize(Key::Char(first), mods));
+        }
+        // MouseDown1Pane and the like: event and place, modifiers as they are.
+        for (e, ev) in MOUSE_EVENTS.iter().enumerate() {
+            if let Some(place) = s.strip_prefix(ev)
+                && let Some(p) = MOUSE_PLACES.iter().position(|x| *x == place)
+            {
+                return Some(KeyCode::mouse(e as u8, p as u8, mods));
+            }
         }
         let (key, extra) = lookup_name(s)?;
         Some(normalize(key, mods.union(extra)))
@@ -334,7 +436,12 @@ impl fmt::Display for KeyCode {
         }
         let name = match self.key {
             Key::Char(' ') => "Space",
-            Key::Char(c) => return write!(f, "{c}"),
+            Key::Char(c) => {
+                return match mouse_name(c) {
+                    Some((event, place)) => write!(f, "{event}{place}"),
+                    None => write!(f, "{c}"),
+                };
+            }
             Key::Tab if btab => "BTab",
             Key::Tab => "Tab",
             Key::Enter => "Enter",

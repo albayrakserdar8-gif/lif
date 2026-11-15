@@ -199,3 +199,45 @@ fn capture_pane_keeps_spaces_and_escapes_on_request() {
     assert!(line.contains("\x1b[") && (line.contains("31") || line.contains("38;5;1")), "{line:?}");
     assert!(!plain.contains('\x1b'));
 }
+
+/// `[startup]`: commands run once when the server starts, after the
+/// settings; a reload does not run them again.
+#[test]
+fn startup_commands_run_once_when_the_server_starts() {
+    let env = Env::new();
+    let marker = env.dir.join("started");
+    let cfg = write_config(
+        &env,
+        "s.toml",
+        &format!(
+            "base-index = 3\n[startup]\nrun = [\n  \"new-session -d -s main -n work\",\n  \"run-shell 'echo ran >> {m}'\",\n  \"if-shell 'true' 'set -g @yes 1' 'set -g @yes 0'\",\n  \"select-window -t nowhere:9\",\n  \"set -g @last 1\",\n]\n",
+            m = marker.display()
+        ),
+    );
+    let path = cfg.to_str().unwrap();
+    env.ok(&["-f", path, "new-session", "-d", "-s", "other"]);
+    // They ran before the command that started the server, with the
+    // settings in place.
+    assert_eq!(env.ok(&["list-sessions", "-F", "#{session_name} #{window_index}:#{window_name}"]).lines().next(), Some("main 3:work"));
+    assert!(env.ok(&["has-session", "-t", "other"]).is_empty());
+    assert!(env.wait(secs(10), || std::fs::read_to_string(&marker).is_ok_and(|s| s == "ran\n")), "run-shell did not run");
+    assert!(env.wait(secs(10), || env.ok(&["show", "-gv", "@yes"]) == "1\n"));
+    // One that fails is reported with its place in the file; the rest run.
+    assert_eq!(env.ok(&["show", "-gv", "@last"]), "1\n");
+    assert_eq!(env.ok(&["show-messages"]).lines().collect::<Vec<_>>(), [format!("{path}:7:3: can't find session: nowhere")]);
+    // Reading the file again applies its settings, not its start-up
+    // commands.
+    env.ok(&["kill-session", "-t", "main"]);
+    env.ok(&["source-file", path]);
+    env.ok(&["run-shell", "true"]);
+    assert_eq!(env.ok(&["list-sessions", "-F", "#{session_name}"]), "other\n");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+    // check-config checks them without running them.
+    let bad = write_config(&env, "bad.toml", "[startup]\nrun = [\"splt-window\"]\n");
+    let o = env.run(&["check-config", bad.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("2:8: error: run in [startup]: unknown command `splt-window`, did you mean `split-window`?"), "{said}");
+    assert!(env.run(&["check-config", path]).status.success());
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+}

@@ -107,6 +107,9 @@ pub struct Config {
     pub path: Option<PathBuf>,
     /// Commands in the order they must run.
     pub commands: Vec<Entry>,
+    /// `[startup]`'s commands, in file order: the server runs them once
+    /// when it starts, after `commands`; `source-file` later does not.
+    pub startup: Vec<Entry>,
     /// Problems, in file order.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -114,8 +117,8 @@ pub struct Config {
 impl Config {
     /// Translate the text of a config file.
     pub fn parse(text: &str) -> Config {
-        let (commands, diagnostics) = schema::translate(text);
-        Config { path: None, commands, diagnostics }
+        let (commands, startup, diagnostics) = schema::translate(text);
+        Config { path: None, commands, startup, diagnostics }
     }
 
     /// Read and translate `path`. A missing file gives an empty config

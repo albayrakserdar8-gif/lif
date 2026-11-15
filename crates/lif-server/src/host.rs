@@ -111,6 +111,10 @@ pub(crate) struct Rt {
     /// change (the next minute): set only while one shows a clock.
     pub(crate) clock_panes: Vec<PaneId>,
     pub(crate) clock_deadline: Option<std::time::Instant>,
+    /// A mouse key's commands are running, and what they asked to be done
+    /// with the mouse event once they are done.
+    pub(crate) mouse_live: bool,
+    pub(crate) mouse_todo: Vec<MouseTodo>,
     /// Popups: their hidden pane, client and waiting job. A popup whose
     /// client lost it (detached, closed it) is ended in `sweep_popups`.
     pub(crate) popups: Vec<(PaneId, ClientId, u64)>,
@@ -124,6 +128,14 @@ pub(crate) struct Rt {
     pub(crate) job_timers: Vec<(std::time::Instant, u64)>,
     /// The RLIMIT_NOFILE soft limit (0: unknown).
     pub(crate) fd_limit: usize,
+}
+
+/// What the commands of a mouse key asked for (see `Rt::mouse_todo`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MouseTodo {
+    Forward(PaneId),
+    CopyDrag(PaneId),
+    ResizeBorder,
 }
 
 /// The style of a menu's selected line: `-H`, or tmux's default look
@@ -185,6 +197,8 @@ impl Rt {
             job_timers: Vec::new(),
             clock_panes: Vec::new(),
             clock_deadline: None,
+            mouse_live: false,
+            mouse_todo: Vec::new(),
             popups: Vec::new(),
             next_popup: 0,
             popups_done: Vec::new(),
@@ -594,6 +608,7 @@ impl Rt {
             msg_style: crate::prompt::message_style(),
             mode_drag: None,
             mouse_press: None,
+            custom_drag: None,
             clicks: None,
             labels: Vec::new(),
             labels_stale: true,
@@ -834,6 +849,15 @@ impl Host for Rt {
         Ok(())
     }
 
+    fn mouse_request(&mut self, what: lif_core::MouseRequest) {
+        if self.mouse_live {
+            self.mouse_todo.push(match what {
+                lif_core::MouseRequest::Forward(p) => MouseTodo::Forward(p),
+                lif_core::MouseRequest::ResizeBorder => MouseTodo::ResizeBorder,
+            });
+        }
+    }
+
     fn has_overlay(&self, client: ClientId) -> bool {
         self.clients.get(&client).and_then(|c| c.att.as_ref()).is_some_and(|a| a.overlay.is_some())
     }
@@ -1051,6 +1075,8 @@ impl Host for Rt {
             history_bytes: p.engine.memory().resident_bytes,
             in_mode: p.mode.is_some(),
             pipe: p.pipe.is_some(),
+            mouse_any: p.engine.modes().mouse_tracking,
+            alternate: p.engine.modes().alt_screen,
         }
     }
 
@@ -1162,6 +1188,12 @@ impl Host for Rt {
     }
 
     fn enter_copy_mode(&mut self, client: Option<ClientId>, pane: PaneId, opts: CopyModeOptions) {
+        // copy-mode -M from a mouse key: the drag starts once the key's
+        // commands are done, from the mouse event itself.
+        if opts.mouse_drag && self.mouse_live && !opts.cancel {
+            self.mouse_todo.push(MouseTodo::CopyDrag(pane));
+            return;
+        }
         let Some(p) = self.panes.get_mut(&pane) else { return };
         if opts.cancel {
             if p.mode.is_some() {
@@ -1325,7 +1357,8 @@ pub(crate) fn read_config(path: &str) -> Result<ConfigFile, ConfigError> {
     let name = file.display().to_string();
     let commands = cfg.commands.iter().map(|e| (e.command.clone(), format!("{name}:{}:{}", e.line, e.column))).collect();
     let diagnostics = cfg.diagnostics.iter().map(|d| (d.severity == lif_config::Severity::Error, format!("{name}:{d}"))).collect();
-    Ok(ConfigFile { commands, diagnostics })
+    let startup = cfg.startup.iter().map(|e| (e.command.clone(), format!("{name}:{}:{}", e.line, e.column))).collect();
+    Ok(ConfigFile { commands, startup, diagnostics })
 }
 
 /// An I/O error as tmux prints it: the OS's message without Rust's

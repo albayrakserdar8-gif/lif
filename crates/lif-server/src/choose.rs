@@ -91,8 +91,16 @@ impl ChoosePane {
             }
             put_str(row, 0, cols, &line.text, style);
         }
-        let Some(title) = screen.title else { return };
-        let top = screen.list_rows as usize;
+        self.draw_preview(size, panes, screen.title, screen.list_rows as usize, screen.preview);
+        if let Some(help) = screen.help {
+            draw_help(&mut self.frame, &help, cols, rows);
+        }
+    }
+
+    /// The box under the list and what it shows of the selected item.
+    fn draw_preview(&mut self, size: Size, panes: &HashMap<PaneId, PaneRt>, title: Option<String>, top: usize, preview: Preview) {
+        let (cols, rows) = (size.cols as usize, size.rows as usize);
+        let Some(title) = title else { return };
         if rows < top + 2 || cols < 4 {
             return;
         }
@@ -118,7 +126,7 @@ impl ChoosePane {
         if w == 0 || h == 0 {
             return;
         }
-        match screen.preview {
+        match preview {
             Preview::None => {}
             Preview::Text(text) => {
                 for (i, line) in text.lines().take(h).enumerate() {
@@ -143,6 +151,41 @@ impl ChoosePane {
                     draw_label(&mut self.frame, label, cx, cw, y0, h);
                 }
             }
+        }
+    }
+}
+
+/// The key help: a box in the middle of the pane, keys on the left of a
+/// rule and what they do on the right, as tmux draws it. What does not
+/// fit is cut.
+fn draw_help(frame: &mut PaneFrame, help: &[(&str, &str)], cols: usize, rows: usize) {
+    let kw = help.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let dw = help.iter().map(|(_, d)| d.len()).max().unwrap_or(0);
+    // │ keys │ text │
+    let w = (kw + dw + 7).min(cols);
+    let h = (help.len() + 2).min(rows);
+    if w < kw + 8 || h < 3 {
+        return;
+    }
+    let (x0, y0) = ((cols - w) / 2, (rows - h) / 2);
+    let plain = Style::default();
+    for (i, row) in frame.rows.iter_mut().enumerate().skip(y0).take(h) {
+        let edge = i == y0 || i + 1 == y0 + h;
+        let (l, r, fill) = match i {
+            i if i == y0 => ('┌', '┐', '─'),
+            _ if edge => ('└', '┘', '─'),
+            _ => ('│', '│', ' '),
+        };
+        for c in &mut row.cells[x0..x0 + w] {
+            *c = Cell { ch: fill, ..Cell::BLANK };
+        }
+        row.cells[x0].ch = l;
+        row.cells[x0 + w - 1].ch = r;
+        if !edge {
+            let (keys, text) = help[i - y0 - 1];
+            put_str(row, x0 + 2 + (kw - keys.len()), x0 + 2 + kw, keys, plain);
+            row.cells[x0 + kw + 3].ch = '│';
+            put_str(row, x0 + kw + 5, x0 + w - 2, text, plain);
         }
     }
 }

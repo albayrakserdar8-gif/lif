@@ -107,6 +107,50 @@ pub fn hello_from_env() -> Hello {
     }
 }
 
+/// Connects to the server's socket without ever waiting for room in its
+/// listen queue. A server that is stopped with a full queue refuses the
+/// connection on macOS; on Linux a blocking `connect` would wait for it
+/// for ever, so the connection is made non-blocking (where a full queue
+/// is `EAGAIN`, reported as a refusal here) and switched back.
+pub fn connect_stream(socket_path: &Path) -> io::Result<UnixStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = socket_path.as_os_str().as_bytes();
+    // SAFETY: a zeroed sockaddr_un is a valid value to fill in.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    // SAFETY: socket(2) with constant arguments; the descriptor is owned
+    // from here on and closed on every path.
+    let fd = unsafe {
+        let fd = sys::cvt(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0))?;
+        OwnedFd::from_raw_fd(fd)
+    };
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+    // SAFETY: fcntl and connect on the descriptor just made, with an
+    // address of the size given.
+    unsafe {
+        sys::cvt(libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC))?;
+        let flags = sys::cvt(libc::fcntl(raw, libc::F_GETFL))?;
+        sys::cvt(libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if libc::connect(raw, (&raw const addr).cast(), len) != 0 {
+            let e = io::Error::last_os_error();
+            return Err(match e.kind() {
+                io::ErrorKind::WouldBlock => io::Error::new(io::ErrorKind::ConnectionRefused, "the server's listen queue is full"),
+                _ => e,
+            });
+        }
+        sys::cvt(libc::fcntl(raw, libc::F_SETFL, flags))?;
+    }
+    Ok(UnixStream::from(fd))
+}
+
 /// Connects and performs the handshake with [`hello_from_env`].
 pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Connection> {
     connect_with(socket_path, hello_from_env())
@@ -114,7 +158,7 @@ pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Connection> {
 
 /// Connects and performs the handshake with the given `Hello`.
 pub fn connect_with(socket_path: impl AsRef<Path>, hello: Hello) -> io::Result<Connection> {
-    let stream = UnixStream::connect(socket_path)?;
+    let stream = connect_stream(socket_path.as_ref())?;
     // macOS fails setsockopt with EINVAL once the peer has closed; a dead
     // server shows up on the first read or write instead.
     let _ = no_sigpipe(&stream);

@@ -142,3 +142,55 @@ fn mouse_selects_and_double_click_chooses() {
     t.write(b"\x1b[<0;5;3M\x1b[<0;5;3m");
     assert!(env.wait(secs(10), || show(&env, "#{window_index} #{pane_in_mode}") == "1 0"));
 }
+
+/// tmux's `m`, `M`, `S-Up`, `S-Down` and the key help in the tree.
+#[test]
+fn tree_marks_swaps_windows_and_shows_help() {
+    let env = Env::new();
+    drop(attach(&env));
+    env.ok(&["new-window", "-d", "-t", "alpha", "-n", "third"]);
+    // Tall enough for the whole help.
+    let mut t = Term::spawn(&env, &["attach", "-t", "alpha"], Size::new(80, 44));
+    t.wait_text("$");
+    t.write(b"\x02w");
+    t.wait_text("(view: preview)");
+    // C-h (or F1): the keys, in a box over the list; any key takes it down
+    // and does nothing else.
+    t.write(b"\x08");
+    t.wait_text("│ Swap current and previous window");
+    let l = t.lines();
+    assert!(l.iter().any(|l| l.contains("│      Up, k │ Move cursor up")), "{l:#?}");
+    assert!(l.iter().any(|l| l.contains("│          m │ Set the marked pane")), "{l:#?}");
+    t.write(b"q");
+    t.wait_for("the help gone", secs(10), |t| !t.screen().contains("Move cursor up"));
+    assert_eq!(show(&env, "#{pane_in_mode}"), "1", "q closed the help, not the mode");
+    t.write(b"\x1bOP");
+    t.wait_text("│ Swap current and previous window");
+    t.write(b" ");
+    t.wait_for("the help gone", secs(10), |t| !t.screen().contains("Move cursor up"));
+    // m marks the selected window's active pane: M in its flags.
+    t.write(b"\x1b[Bm");
+    t.wait_for("window 1 marked", secs(10), |t| t.lines()[2].starts_with("(2) ├─→ + 1: second-M") || t.lines()[2].starts_with("(2) ├─→ + 1: secondM"));
+    assert_eq!(env.ok(&["display-message", "-p", "-t", "~", "#{window_name}"]), "second\n");
+    // S-Down: it trades places with the next window, and stays selected.
+    t.write(b"\x1b[1;2B");
+    t.wait_for("second is window 2", secs(10), |t| t.lines()[3].starts_with("(3) └─→ + 2: second"));
+    assert_eq!(env.ok(&["list-windows", "-t", "alpha", "-F", "#{window_index}:#{window_name}"]), "0:[lif]\n1:third\n2:second\n");
+    assert!(t.lines().iter().any(|l| l.starts_with("┌ 2 (sort")), "the selection moved with the window: {}", t.screen());
+    // No further: it is the last one.
+    t.write(b"\x1b[1;2B");
+    // S-Up twice: past the window the list is in, which stays current.
+    t.write(b"\x1b[1;2A\x1b[1;2A");
+    t.wait_for("second is window 0", secs(10), |t| t.lines()[1].starts_with("(1) ├─→ + 0: second"));
+    assert_eq!(env.ok(&["list-windows", "-t", "alpha", "-F", "#{window_index}:#{window_name}#{?window_active,*,}"]), "0:second\n1:[lif]*\n2:third\n");
+    assert_eq!(show(&env, "#{pane_in_mode}"), "1", "the list is still up");
+    // On a session line there is nothing to swap.
+    t.write(b"\x1b[A\x1b[1;2B");
+    // M clears the mark.
+    t.write(b"M");
+    t.wait_for("no mark", secs(10), |t| !t.lines()[1].contains("secondM") && t.lines()[1].contains("second"));
+    assert_eq!(show(&env, "#{pane_marked_set}"), "0");
+    assert_eq!(env.ok(&["list-windows", "-t", "alpha", "-F", "#{window_index}:#{window_name}"]), "0:second\n1:[lif]\n2:third\n");
+    t.write(b"q");
+    assert!(env.wait(secs(10), || show(&env, "#{pane_in_mode}") == "0"));
+}

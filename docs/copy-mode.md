@@ -140,8 +140,12 @@ the whole history).
 - Programs that turn on mouse reporting (vim, htop, ...) get the mouse events
   instead.
 
-Mouse actions are built into the server, not key bindings: `list-keys` shows
-no mouse entries and `bind-key` rejects mouse key names.
+Outside copy mode these are tmux's mouse keys in the root table
+(`WheelUpPane`, `MouseDrag1Pane`, `DoubleClick1Pane`, ...), which can be
+bound, rebound and unbound; see the
+[migration guide](tmux-migration.md#mouse). Inside copy mode the mouse is
+built into the server: the `copy-mode` and `copy-mode-vi` tables have no
+mouse entries, and a mouse key bound there is never used.
 
 ## Commands
 
@@ -165,7 +169,7 @@ looked up in the copy-mode key table, as if typed: with vi keys,
 ## Default key tables
 
 Generated from `lif list-keys -T copy-mode-vi` and `lif list-keys -T copy-mode`
-(lif 0.3.0). Change them in the `[keys.copy-mode-vi]` and `[keys.copy-mode]`
+(lif 0.4.0). Change them in the `[keys.copy-mode-vi]` and `[keys.copy-mode]`
 sections of the configuration file or with `bind-key -T`.
 
 ### copy-mode-vi (mode-keys vi)
@@ -331,11 +335,12 @@ sections of the configuration file or with `bind-key -T`.
 
 - **Same keyboard tables.** Both tables are tmux 3.8's, except emacs `L`
   (`line-numbers-toggle`), which is left out because lif has no line-number
-  gutter, and the mouse entries (`MouseDown1Pane`, `MouseDrag1Pane`,
-  `MouseDragEnd1Pane`, `WheelUpPane`, `WheelDownPane`, `DoubleClick1Pane`,
-  `TripleClick1Pane`), which are built in. tmux's extra `C-[` entries are the
+  gutter, and the mouse entries of these two tables (`MouseDown1Pane`,
+  `MouseDrag1Pane`, `MouseDragEnd1Pane`, `WheelUpPane`, `WheelDownPane`,
+  `DoubleClick1Pane`, `TripleClick1Pane`), which are built in (the root
+  table's mouse keys are bindings, as in tmux). tmux's extra `C-[` entries are the
   same key as `Escape`.
-- **Mouse bindings are an option.** What a drag end does is the
+- **The drag end is an option.** What a drag end does is the
   `mouse-drag-end` option instead of the `MouseDragEnd1Pane` binding; the
   default (copy and leave) is tmux's. After a double or triple click lif copies
   at once, where tmux shows the selection for 0.3 s first.

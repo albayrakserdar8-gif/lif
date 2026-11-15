@@ -10,19 +10,29 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Waits until `fd` is readable (or hung up) or the deadline passes.
 pub fn wait_readable(fd: i32, deadline: Instant) -> bool {
-    let now = Instant::now();
-    if now >= deadline {
-        return false;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let r = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
+        if r > 0 {
+            return true;
+        }
+        // A signal is not a timeout: the tests of this binary share a
+        // process, and on Linux the SIGCHLD of another test's child can
+        // land on this thread.
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
     }
-    let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd.
-    let r = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
-    r > 0
 }
 
 /// Reads until `needle` appears in the output. Panics on timeout or EOF.

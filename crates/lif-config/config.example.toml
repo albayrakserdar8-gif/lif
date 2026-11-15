@@ -108,6 +108,14 @@ buffer-limit = 50
 # "off", "on" (detach), "no-detached", "previous" or "next" (switch session).
 detach-on-destroy = "on"
 
+# Destroy a session when nobody is attached to it any more: "off" or "on"
+# ("keep-last" and "keep-group" are tmux's values for session groups and
+# keep every session).
+destroy-unattached = "off"
+
+# Tell programs that ask for it when the terminal gains or loses focus.
+focus-events = true
+
 # ------------------------------------------------------ windows and panes ---
 
 # Number of the first window and the first pane.
@@ -140,12 +148,22 @@ bell-action = "any"
 visual-bell = "off"
 monitor-bell = true
 monitor-activity = false
+# The same for output in a watched window, and for a window that has been
+# quiet for monitor-silence seconds (0: not watched).
+activity-action = "other"
+visual-activity = "off"
+monitor-silence = 0
+silence-action = "other"
+visual-silence = "off"
 
 # Size of sessions created without a client, and how a window shared by
 # clients of different sizes is sized: "largest", "smallest", "manual" or
 # "latest" (the client that was active last).
 default-size = "80x24"
 window-size = "latest"
+# Size a window only for the clients that are showing it: a window that is
+# not the current one keeps its size until it is selected.
+aggressive-resize = false
 
 # Layout sizes for main-horizontal / main-vertical, in cells or "50%".
 main-pane-width = 80
@@ -160,6 +178,11 @@ tiled-layout-max-columns = 0
 # "bottom". The window gives up one row for it.
 pane-border-status = "off"
 pane-border-format = '#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'
+
+# The lines popups and menus are drawn with: "single", "rounded", "double",
+# "heavy", "simple", "padded" or "none".
+popup-border-lines = "single"
+menu-border-lines = "single"
 
 # Set the outer terminal's title (to set-titles-string, a format).
 set-titles = false
@@ -234,6 +257,13 @@ current-match = "bg=magenta,fg=black"
 # window-style and window-active-style).
 pane = "default"
 active-pane = "default"
+# Popups and menus (display-popup, display-menu), their borders, and a
+# menu's selected line.
+popup = "default"
+popup-border = "default"
+menu = "default"
+menu-selected = "bg=yellow,fg=black"
+menu-border = "default"
 
 # ---------------------------------------------------------- key bindings ----
 
@@ -261,9 +291,14 @@ Up = { command = "select-pane -U", repeat = true }
 # "C-o" = false              # unbind rotate-window
 
 # [keys.root] binds keys without the prefix: they no longer reach programs.
+# tmux's mouse keys are bound here too (MouseDown3Pane, WheelUpStatus,
+# C-MouseDown1Status, ...): in their commands the target "=" is what is
+# under the mouse, and false removes what the mouse does there.
 [keys.root]
 # "M-Left" = "select-pane -L"
 # "M-Right" = "select-pane -R"
+# MouseDown3Pane = false
+# "C-MouseDown1Status" = "kill-window -t ="
 
 # [keys.copy-mode] and [keys.copy-mode-vi] bind keys in copy mode (emacs and
 # vi mode-keys) the same way.
@@ -285,3 +320,9 @@ Up = { command = "select-pane -U", repeat = true }
 [env]
 # EDITOR = "nvim"
 # SSH_ASKPASS = false
+
+# [startup] has one key, run: a command or a list of commands the server
+# runs once when it starts, after the settings above (not again when the
+# file is reloaded). A .tmux.conf's commands that are not settings go here.
+[startup]
+# run = ["new-session -d -s main", "run-shell '~/bin/lif-start'"]

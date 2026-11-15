@@ -63,6 +63,8 @@ const OFF_ON: &[&str] = &["off", "on"];
 /// (`[status]`) and styles (`[theme]`). Named as in tmux, except
 /// `scrollback`, which takes human sizes.
 pub(crate) static TOP: &[Opt] = &[
+    o("activity-action", "activity-action", Choice(&["none", "any", "current", "other"])),
+    o("aggressive-resize", "aggressive-resize", Bool),
     o("allow-passthrough", "allow-passthrough", Choice(&["off", "on", "all"])),
     o("automatic-rename", "automatic-rename", Bool),
     o("automatic-rename-format", "automatic-rename-format", Str),
@@ -76,16 +78,20 @@ pub(crate) static TOP: &[Opt] = &[
     o("default-shell", "default-shell", Str),
     o("default-size", "default-size", Dim),
     o("detach-on-destroy", "detach-on-destroy", Choice(&["off", "on", "no-detached", "previous", "next"])),
+    o("destroy-unattached", "destroy-unattached", Choice(&["off", "on", "keep-last", "keep-group"])),
     o("display-panes-time", "display-panes-time", Int),
     o("display-time", "display-time", Int),
     srv("escape-time", Int),
     srv("exit-empty", Bool),
+    srv("focus-events", Bool),
     o("history-limit", "history-limit", Int),
     o("main-pane-height", "main-pane-height", Size),
     o("main-pane-width", "main-pane-width", Size),
+    o("menu-border-lines", "menu-border-lines", Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"])),
     o("mode-keys", "mode-keys", Choice(&["emacs", "vi"])),
     o("monitor-activity", "monitor-activity", Bool),
     o("monitor-bell", "monitor-bell", Bool),
+    o("monitor-silence", "monitor-silence", Int),
     o("mouse", "mouse", Bool),
     o("mouse-drag-end", "mouse-drag-end", Choice(&["copy-pipe-and-cancel", "copy-pipe-no-clear", "none"])),
     o("other-pane-height", "other-pane-height", Size),
@@ -93,6 +99,7 @@ pub(crate) static TOP: &[Opt] = &[
     o("pane-base-index", "pane-base-index", Int),
     o("pane-border-format", "pane-border-format", Str),
     o("pane-border-status", "pane-border-status", Choice(&["off", "top", "bottom"])),
+    o("popup-border-lines", "popup-border-lines", Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"])),
     o("prefix", "prefix", Key),
     o("prefix2", "prefix2", Key),
     o("remain-on-exit", "remain-on-exit", Choice(&["off", "on", "failed"])),
@@ -101,11 +108,14 @@ pub(crate) static TOP: &[Opt] = &[
     o("scrollback", "scrollback-bytes", Bytes),
     srv("set-clipboard", Choice(&["off", "external", "on"])),
     o("set-titles", "set-titles", Bool),
+    o("silence-action", "silence-action", Choice(&["none", "any", "current", "other"])),
     o("set-titles-string", "set-titles-string", Str),
     o("synchronize-panes", "synchronize-panes", Bool),
     o("tiled-layout-max-columns", "tiled-layout-max-columns", Int),
     srv("tmux-compat", Bool),
+    o("visual-activity", "visual-activity", Choice(&["off", "on", "both"])),
     o("visual-bell", "visual-bell", Choice(&["off", "on", "both"])),
+    o("visual-silence", "visual-silence", Choice(&["off", "on", "both"])),
     o("window-size", "window-size", Choice(&["largest", "smallest", "manual", "latest"])),
     o("word-separators", "word-separators", Str),
     o("wrap-search", "wrap-search", Bool),
@@ -144,12 +154,17 @@ pub(crate) static THEME: &[Opt] = &[
     o("message", "message-style", Style),
     o("match", "copy-mode-match-style", Style),
     o("current-match", "copy-mode-current-match-style", Style),
+    o("popup", "popup-style", Style),
+    o("popup-border", "popup-border-style", Style),
+    o("menu", "menu-style", Style),
+    o("menu-selected", "menu-selected-style", Style),
+    o("menu-border", "menu-border-style", Style),
 ];
 
 /// Key tables a `[keys.NAME]` section may name.
 pub(crate) const TABLES: &[&str] = &["prefix", "root", "copy-mode", "copy-mode-vi"];
 
-const SECTIONS: &[&str] = &["keys", "status", "theme", "hooks", "env"];
+const SECTIONS: &[&str] = &["keys", "status", "theme", "hooks", "env", "startup"];
 
 /// Named keys, for suggestions on misspelled key names.
 const KEY_NAMES: &[&str] = &[
@@ -178,6 +193,9 @@ struct Item {
 struct Tr<'t> {
     lines: Lines<'t>,
     items: Vec<Item>,
+    /// `[startup]`'s commands with where each is, in file order. They are
+    /// not settings: the server runs them once, after the settings.
+    startup: Vec<(usize, String)>,
     diags: Vec<(usize, Severity, String)>,
     scratch: Scratch,
     damaged: Vec<u32>,
@@ -208,16 +226,25 @@ impl<'t> Lines<'t> {
 }
 
 /// Translate a file into commands and diagnostics.
-pub(crate) fn translate(text: &str) -> (Vec<Entry>, Vec<Diagnostic>) {
+/// The settings as commands, the `[startup]` commands, and the problems.
+pub(crate) fn translate(text: &str) -> (Vec<Entry>, Vec<Entry>, Vec<Diagnostic>) {
     let (root, errors) = DeTable::parse_recoverable(text);
-    let mut tr = Tr { lines: Lines::new(text), items: Vec::new(), diags: Vec::new(), scratch: Scratch::new(), damaged: Vec::new() };
+    let mut tr =
+        Tr { lines: Lines::new(text), items: Vec::new(), startup: Vec::new(), diags: Vec::new(), scratch: Scratch::new(), damaged: Vec::new() };
     for e in &errors {
         let at = e.span().map(|s| s.start).unwrap_or(0);
         tr.damaged.push(tr.lines.pos(at).0);
         tr.diags.push((at, Severity::Error, format!("invalid TOML: {}", e.message())));
     }
     tr.root(root.get_ref());
-    let Tr { lines, mut items, mut diags, mut scratch, .. } = tr;
+    let Tr { lines, mut items, startup, mut diags, mut scratch, .. } = tr;
+    let startup = startup
+        .into_iter()
+        .map(|(pos, command)| {
+            let (line, column) = lines.pos(pos);
+            Entry { command, line, column }
+        })
+        .collect();
     items.sort_by_key(|i| (i.phase, i.pos));
     let mut entries = Vec::with_capacity(items.len());
     for it in items {
@@ -237,7 +264,7 @@ pub(crate) fn translate(text: &str) -> (Vec<Entry>, Vec<Diagnostic>) {
             Diagnostic { severity, line, column, message }
         })
         .collect();
-    (entries, diagnostics)
+    (entries, startup, diagnostics)
 }
 
 /// Table entries in file order.
@@ -357,6 +384,8 @@ impl Tr<'_> {
                 ("theme", other) => self.err(at, format!("`theme` must be a table of styles ([theme]), found {}", describe(other))),
                 ("hooks", DeValue::Table(t)) => self.hooks(t),
                 ("hooks", other) => self.err(at, format!("`hooks` must be a table of hooks ([hooks]), found {}", describe(other))),
+                ("startup", DeValue::Table(t)) => self.startup(t),
+                ("startup", other) => self.err(at, format!("`startup` must be a table ([startup] with run = [...]), found {}", describe(other))),
                 ("env", DeValue::Table(t)) => self.env(t),
                 ("env", other) => self.err(at, format!("`env` must be a table of environment variables ([env]), found {}", describe(other))),
                 _ => match TOP.iter().find(|o| o.key == name) {
@@ -592,6 +621,42 @@ impl Tr<'_> {
         }
     }
 
+    /// `[startup]`: `run = "command"` or a list of commands the server
+    /// runs once when it starts, after everything else in the file. They
+    /// are checked like bindings (they parse and name commands lif has)
+    /// and not run while the file is checked.
+    fn startup(&mut self, t: &DeTable<'_>) {
+        for (k, v) in entries(t) {
+            if self.is_damaged(k.span().start..v.span().end) {
+                continue;
+            }
+            let name = k.get_ref().as_ref();
+            let at = v.span().start;
+            if name != "run" {
+                let hint = did_you_mean(name, ["run"], ("`", "`"));
+                self.err(k.span().start, format!("unknown key `{name}` in [startup]{hint} (it has one key: run)"));
+                continue;
+            }
+            let what = "run in [startup]";
+            let one = |tr: &mut Self, s: &str, pos: usize| match validate_command(s) {
+                Ok(()) => tr.startup.push((pos, s.to_string())),
+                Err(m) => tr.err(pos, format!("{what}: {m}")),
+            };
+            match v.get_ref() {
+                DeValue::String(s) => one(self, s, at),
+                DeValue::Array(a) => {
+                    for item in a.iter() {
+                        match item.get_ref() {
+                            DeValue::String(s) => one(self, s, item.span().start),
+                            other => self.err(item.span().start, format!("{what}: expected a command string, found {}", describe(other))),
+                        }
+                    }
+                }
+                other => self.err(at, format!("{what}: expected a command string or a list of them, found {}", describe(other))),
+            }
+        }
+    }
+
     /// `[env]`: `NAME = "value"` for new panes and shell commands, or
     /// `false` to remove a variable from their environment
     /// (`set-environment -g`, `-gr`).
@@ -785,7 +850,7 @@ mod tests {
         for opt in TOP.iter().chain(STATUS).chain(THEME) {
             assert!(known.iter().any(|k| k == opt.option), "{} is not a lif-core option", opt.option);
         }
-        let server = ["buffer-limit", "copy-command", "escape-time", "exit-empty", "set-clipboard", "tmux-compat"];
+        let server = ["buffer-limit", "copy-command", "escape-time", "exit-empty", "focus-events", "set-clipboard", "tmux-compat"];
         for opt in TOP {
             assert_eq!(opt.server, server.contains(&opt.option), "{}", opt.option);
         }

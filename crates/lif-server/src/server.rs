@@ -154,6 +154,7 @@ impl Server {
         };
         log!("descriptor limit {limit} (was {old_limit:?})");
         log!("server {} started on {}", std::process::id(), s.opts.socket.display());
+        s.model.collect_startup(true);
         for line in crate::load_startup_commands(&s.opts) {
             match lif_core::parse_string(&line) {
                 Ok(list) => {
@@ -165,6 +166,16 @@ impl Server {
                     }
                 }
                 Err(e) => log!("startup command {line:?}: {e}"),
+            }
+        }
+        s.model.collect_startup(false);
+        // The configuration's [startup] commands, once the settings are in
+        // place. Each is a command list of its own: one that waits (for a
+        // shell command, say) does not hold up the next.
+        for (cmd, at) in s.model.take_startup() {
+            log!("startup: {cmd}");
+            if let Err(e) = lif_core::parse_string(&cmd).and_then(|list| s.run_commands(None, &list)) {
+                s.model.log_message(format!("{at}: {e}"));
             }
         }
         // Every problem of the configuration (warnings too) is in the
@@ -360,6 +371,7 @@ impl Server {
                 return Some(now);
             }
             min(p.compact_at);
+            min(p.silence_at);
             min(p.name_recheck);
             min(p.autoscroll_at);
         }
@@ -566,6 +578,11 @@ impl Server {
             p.update_mode();
             self.after_output(id);
             self.model.pane_activity(id, &mut self.rt);
+            // monitor-silence counts from the last output.
+            let quiet = self.model.silence_secs(id);
+            if let Some(p) = self.rt.panes.get_mut(&id) {
+                p.silence_at = (quiet > 0).then(|| now + Duration::from_secs(quiet));
+            }
         }
         if r.eof && let Some(p) = self.rt.panes.get_mut(&id) {
             // Stop polling a hung-up PTY; the exit comes from the reaper.
@@ -1218,12 +1235,23 @@ impl Server {
                 p.engine.set_scrollback_limits(want.0, want.1);
             }
         }
+        // monitor-silence turned on counts from now; turned off, it stops.
+        let now = Instant::now();
+        for p in self.rt.panes.values_mut() {
+            match self.model.silence_secs(p.id) {
+                0 => p.silence_at = None,
+                secs if p.silence_at.is_none() => p.silence_at = Some(now + Duration::from_secs(secs)),
+                _ => {}
+            }
+        }
     }
 
     /// After any model call: drop a respawn stash nobody took, forget
     /// environments of sessions that are gone, bring views up to date.
     pub(crate) fn after_model(&mut self) {
         self.rt.respawn_stash = None;
+        // destroy-unattached: sessions the last client just left.
+        self.model.check_unattached(&mut self.rt);
         // Popups that closed: the commands that waited for them go on.
         while !self.rt.popups_done.is_empty() {
             for (job, status) in std::mem::take(&mut self.rt.popups_done) {

@@ -32,6 +32,10 @@ const MAX_SEND_BYTES: u64 = 1 << 20;
 /// type, `ESC [ 57441 ; 16 : 3 u`).
 const KEY_INPUT_BYTES: u64 = 16;
 
+/// How many `[startup]` commands the configuration files read at start-up
+/// may hold together.
+pub const MAX_STARTUP_COMMANDS: usize = 256;
+
 /// tmux's CMD_SOURCE_FILE_DEPTH_LIMIT: how deeply `source-file` may nest.
 const MAX_SOURCE_DEPTH: u32 = 50;
 
@@ -337,6 +341,7 @@ impl Model {
                         if let Some(w) = self.windows.get_mut(&w) {
                             w.bell = false;
                             w.activity = false;
+                            w.silence = false;
                         }
                     }
                     host.redraw(Redraw::Status(f.s));
@@ -751,7 +756,7 @@ impl Model {
         for step in 1..n {
             let i = if forward { (pos + step) % n } else { (pos + n - step) % n };
             let wid = keys[i].1;
-            if alert && !self.windows.get(&wid).is_some_and(|w| w.bell || w.activity) {
+            if alert && !self.windows.get(&wid).is_some_and(|w| w.bell || w.activity || w.silence) {
                 continue;
             }
             self.select_window(sid, wid, host);
@@ -1000,6 +1005,7 @@ impl Model {
                 last_panes: Vec::new(),
                 bell: false,
                 activity: false,
+                silence: false,
                 options,
                 last_preset: None,
                 old_layout: None,
@@ -1100,6 +1106,7 @@ impl Model {
             },
         };
         let tick = self.tick();
+        self.unattached_dirty = true;
         self.sessions.insert(
             id,
             Session {
@@ -1168,10 +1175,12 @@ impl Model {
         let name = self.sessions[&sid].name.clone();
         for other in self.clients_of(sid) {
             if other != keep {
-                self.detach(other, DetachReason::Kicked { session: name.clone() }, host);
+                // Its parent first: once the client is told to go it may
+                // be gone, and its parent with it, before anyone looks.
                 if hup {
                     host.hangup_client_parent(other);
                 }
+                self.detach(other, DetachReason::Kicked { session: name.clone() }, host);
             }
         }
     }
@@ -1180,10 +1189,11 @@ impl Model {
         let hup = a.has('P');
         let detach = |m: &mut Model, c: ClientId, host: &mut dyn Host| {
             let session = m.clients[&c].session.and_then(|s| m.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
-            m.detach(c, DetachReason::Detached { session }, host);
+            // The parent is looked up while the client is surely there.
             if hup {
                 host.hangup_client_parent(c);
             }
+            m.detach(c, DetachReason::Detached { session }, host);
         };
         if let Some(t) = a.get('s') {
             let f = self.find_target(ctx, Some(t), Kind::Session, Flags::default())?;
@@ -1507,7 +1517,7 @@ impl Model {
     }
 
     fn cmd_swap_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        let src = self.find_target(ctx, a.get('s'), Kind::Window, Flags::default())?;
+        let src = self.find_source(ctx, a.get('s'), Kind::Window)?;
         let dst = self.find_target(ctx, a.get('t'), Kind::Window, Flags::default())?;
         let (ws, wd) = (need_window(&src)?, need_window(&dst)?);
         if ws == wd {
@@ -1651,6 +1661,19 @@ impl Model {
             host.redraw(Redraw::Status(f.s));
             return ok();
         }
+        if a.has('m') || a.has('M') {
+            // -m marks the pane, or clears the mark if it has it; -M
+            // clears it. Nothing is selected.
+            let old = self.marked();
+            self.marked_pane = if a.has('M') || old == Some(p) { None } else { Some(p) };
+            for pane in [old, self.marked_pane].into_iter().flatten() {
+                if let Some(w) = self.panes.get(&pane).map(|p| p.window) {
+                    host.redraw(Redraw::Window(w));
+                    host.redraw(Redraw::Status(self.windows[&w].session));
+                }
+            }
+            return ok();
+        }
         if a.has('d') || a.has('e') {
             // Input off or on; nothing is selected (tmux 3.8).
             self.panes.get_mut(&p).expect("pane").input_off = a.has('d');
@@ -1692,6 +1715,11 @@ impl Model {
     fn cmd_resize_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let (wid, p) = (need_window(&f)?, need_pane(&f)?);
+        if a.has('M') {
+            // From a mouse key on a border: the drag resizes.
+            host.mouse_request(crate::host::MouseRequest::ResizeBorder);
+            return ok();
+        }
         if a.has('Z') {
             let w = self.windows.get_mut(&wid).expect("window");
             if !w.layout.unzoom() {
@@ -1736,7 +1764,7 @@ impl Model {
             let i = if a.has('D') { (pos + 1) % n } else { (pos + n - 1) % n };
             (dw, w.panes[i])
         } else {
-            let src = self.find_target(ctx, a.get('s'), Kind::Pane, Flags::default())?;
+            let src = self.find_source(ctx, a.get('s'), Kind::Pane)?;
             (need_window(&src)?, need_pane(&src)?)
         };
         if sp == dp {
@@ -1810,6 +1838,9 @@ impl Model {
             None => Found { s: src.s, w: None, p: None, idx: None },
         };
         let name = a.get('n').map(|n| self.expand_found(&src, ctx, &*host, n));
+        if self.marked() == Some(p) && self.windows[&sw].panes.len() > 1 {
+            self.marked_pane = None;
+        }
         if self.windows[&sw].panes.len() == 1 {
             // Only one pane: move the whole window, as tmux does.
             let (idx, displaced) = if dst.idx.is_none() && !a.has('a') && !a.has('b') {
@@ -1872,6 +1903,7 @@ impl Model {
                 last_panes: Vec::new(),
                 bell: false,
                 activity: false,
+                silence: false,
                 options,
                 last_preset: None,
                 old_layout: None,
@@ -1895,11 +1927,15 @@ impl Model {
     /// for a new pane. A window left without panes goes away.
     fn cmd_join_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let dst = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
-        let src = self.find_target(ctx, a.get('s'), Kind::Pane, Flags::default())?;
+        let src = self.find_source(ctx, a.get('s'), Kind::Pane)?;
         let (dw, target) = (need_window(&dst)?, need_pane(&dst)?);
         let (sw, p) = (need_window(&src)?, need_pane(&src)?);
         if p == target {
             return err("source and target panes must be different");
+        }
+        // A marked pane that moves is no longer marked (tmux 3.8).
+        if self.marked() == Some(p) {
+            self.marked_pane = None;
         }
         let axis = if a.has('h') { Axis::LeftRight } else { Axis::TopBottom };
         let size = if let Some(l) = a.get('l') {
@@ -1928,7 +1964,10 @@ impl Model {
         }
         let w = self.windows.get_mut(&dw).expect("window");
         w.layout.unzoom();
-        if let Err(e) = w.layout.split(target, p, axis, size, before) {
+        // -f: beside everything in the window, not only the target pane.
+        let full = a.has('f');
+        let split = if full { w.layout.split_full(p, axis, size, before) } else { w.layout.split(target, p, axis, size, before) };
+        if let Err(e) = split {
             self.windows.get_mut(&dw).expect("window").layout = saved_dst;
             self.windows.get_mut(&sw).expect("window").layout = saved_src;
             return err(e.to_string());
@@ -1949,6 +1988,7 @@ impl Model {
         }
         let w = self.windows.get_mut(&dw).expect("window");
         let pos = w.panes.iter().position(|x| *x == target).expect("target in window");
+        // Next to the target in the pane order, with -f too (tmux 3.8).
         w.panes.insert(if before { pos } else { pos + 1 }, p);
         self.panes.get_mut(&p).expect("pane").window = dw;
         if last_of_window {
@@ -2208,6 +2248,16 @@ impl Model {
             },
             None => 1,
         };
+        if a.has('M') {
+            // From a mouse key: the mouse event itself goes to the pane
+            // it is over (the target, if one was given).
+            let pane = match (a.get('t'), self.mouse.and_then(|m| m.pane)) {
+                (None, Some(over)) => over,
+                _ => p,
+            };
+            host.mouse_request(crate::host::MouseRequest::Forward(pane));
+            return ok();
+        }
         let keys: Vec<String> = a
             .strings(0)
             .into_iter()
@@ -2336,6 +2386,15 @@ impl Model {
             }
             if a.has('n') {
                 continue;
+            }
+            if self.collect_startup {
+                // Bounded: a tree of files sourcing files could otherwise
+                // hold any number of them.
+                let room = MAX_STARTUP_COMMANDS.saturating_sub(self.startup_commands.len());
+                if file.startup.len() > room {
+                    self.log_message(format!("{path}: more than {MAX_STARTUP_COMMANDS} start-up commands, the rest are not run"));
+                }
+                self.startup_commands.extend(file.startup.iter().take(room).cloned());
             }
             for (cmd, at) in &file.commands {
                 if a.has('v') {
@@ -2623,6 +2682,9 @@ impl Model {
     }
 
     fn cmd_set_option(&mut self, a: &Args, window_flag: bool, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        // destroy-unattached may have been turned on for a session nobody
+        // is attached to.
+        self.unattached_dirty = true;
         if a.has('p') {
             return self.cmd_set_pane_option(a, ctx, host);
         }

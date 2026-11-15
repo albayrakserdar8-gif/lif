@@ -348,7 +348,24 @@ fn main() {
             exit(1);
         }
     };
-    let conn = match connect_with(&socket, hello(&socket)) {
+    // A server that is exiting (after kill-server, or when its last session
+    // closed) may still take a connection and drop it. That is no answer:
+    // ask again, until its socket is gone or another server answers.
+    let connect = || {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match connect_with(&socket, hello(&socket)) {
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
+                        && std::time::Instant::now() < end =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                r => return r,
+            }
+        }
+    };
+    let conn = match connect() {
         Ok(c) => c,
         Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
             if !may_start {
@@ -370,7 +387,7 @@ fn main() {
                     exit(1);
                 }
             }
-            match connect_with(&socket, hello(&socket)) {
+            match connect() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("lif: error connecting to {} ({e})", socket.display());

@@ -2,25 +2,25 @@
 
 # lif
 
-lif is a terminal multiplexer for macOS (and, untested, Linux) that keeps tmux's
+lif is a terminal multiplexer for macOS and Linux that keeps tmux's
 commands, key bindings and target syntax, so most of what your hands and
 scripts know about tmux works unchanged. It is a single-threaded Rust server
 built on Ghostty's terminal engine (libghostty-vt), aimed at high output
 throughput, low idle cost and a small self-contained binary.
 
-Status: version 0.3.0. Enough of tmux is implemented for daily use; the list of
+Status: version 0.4.0. Enough of tmux is implemented for daily use; the list of
 what is missing is below and in [docs/tmux-migration.md](docs/tmux-migration.md).
 
 ## Benchmarks
 
-<!-- BEGIN BENCHMARKS: generated from bench/results/2026-11-15-0330-final-summary.md; replace this whole block when the numbers are re-measured -->
+<!-- BEGIN BENCHMARKS: generated from bench/results/2026-11-15-2221-0.4.0-dev-summary.md; replace this whole block when the numbers are re-measured -->
 
-lif 0.1.0 against tmux 3.8, zellij 0.46.0 and a bare shell on the same PTY
-("none"). One run on one machine (Mac18,5, Apple M6, 12 cores, 16 GiB,
-macOS 27.2; 2026-11-15) with other work running (load average about 4.5),
-client PTY 200x50, every tool with its default settings. Medians; spreads and
-sample counts are in
-[bench/results/2026-11-15-0330-final-summary.md](bench/results/2026-11-15-0330-final-summary.md),
+lif 0.4.0 (measured just before the version was set) against tmux 3.8, zellij 0.46.0 and a bare
+shell on the same PTY ("none"). One run on one machine (Mac18,5, Apple M6,
+12 cores, 16 GiB, macOS 27.2; 2026-11-15) with other work running (load
+average 3.8 at the start, 2.1 at the end), client PTY 200x50, every tool
+with its default settings. Medians; spreads and sample counts are in
+[bench/results/2026-11-15-2221-0.4.0-dev-summary.md](bench/results/2026-11-15-2221-0.4.0-dev-summary.md),
 the methodology in [bench/README.md](bench/README.md), and the history of how
 the numbers moved in [bench/results/comparison.md](bench/results/comparison.md).
 Absolute latencies vary several-fold between runs on this machine for every
@@ -28,31 +28,31 @@ tool at once; compare tools within a run.
 
 | | none | tmux 3.8 | zellij 0.46.0 | lif |
 |---|---|---|---|---|
-| `cat` 100 MB ASCII (MB/s) | 209.2 | 49.8 | 76.4 | 210.9 |
-| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 213.1 | 19.0 | 75.7 | 142.7 |
-| `cat` one 20 MB line (MB/s) | 196.6 | 53.5 | 14.4 | 204.1 |
-| server memory, idle, 1 pane (MiB, footprint / RSS) | - | 3.8 / 5.2 | 25.1 / 41.7 | 3.4 / 5.2 |
-| server memory, idle, 50 visible panes (MiB) | - | 4.2 / 5.7 | 37.7 / 54.7 | 9.6 / 11.6 |
-| server memory, 100k colored lines of history (MiB) | - | 257.0 / 258.4 | 232.2 / 248.7 | 43.3 / 235.6 |
-| server memory after a 100 MB `cat` (MiB), lines kept | - | 6.4 / 7.9, 1,818 | 44.5 / 61.0, 9,997 | 5.6 / 13.8, 3,784 |
-| server over 30 s idle: CPU ms, interrupt wakeups | - | 0.7, 3 | 10.2, 363 | 0.1, 1 |
-| create session + kill server (ms) | - | 13.0 | 61.9 | 6.9 |
-| attach, draw, detach (ms, includes a 20 ms wait) | - | 28.6 | 69.6 | 25.2 |
-| new session until a typed command runs (ms) | 11.5 | 24.1 | 108.7 | 33.3 |
-| key echo, idle pane, p50 / p95 (us) | 2 / 4 | 21 / 26 | 97 / 138 | 17 / 23 |
-| key echo while another pane runs `yes`, p50 / p95 (us) | - | 273 / 365 | 1,114 / 1,392 | 40 / 51 |
-| bare ESC to the program, default settings, p50 (us) | 8 | 10,075 | 56,614 | 5,046 |
-| bare ESC with `escape-time 0` / kitty keyboard protocol, p50 (us) | - | 1,283 / - | - | 24 / 24 |
-| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 3.14, system libraries only |
+| `cat` 100 MB ASCII (MB/s) | 224.9 | 53.1 | 79.6 | 200.2 |
+| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 279.3 | 21.1 | 81.8 | 148.9 |
+| `cat` one 20 MB line (MB/s) | 165.4 | 52.9 | 17.6 | 162.4 |
+| server memory, idle, 1 pane (MiB, footprint / RSS) | - | 3.7 / 5.2 | 25.2 / 41.7 | 3.5 / 5.5 |
+| server memory, idle, 50 visible panes (MiB) | - | 4.2 / 5.7 | 37.5 / 54.5 | 10.0 / 12.2 |
+| server memory, 100k colored lines of history (MiB) | - | 289.7 / 291.2 | 232.0 / 248.5 | 43.5 / 236.0 |
+| server memory after a 100 MB `cat` (MiB), lines kept | - | 6.1 / 7.6, 1,818 | 44.1 / 60.7, 9,997 | 5.7 / 14.0, 3,784 |
+| server over 30 s idle: CPU ms, interrupt wakeups | - | 1.4, 3 | 29.7, 363 | 0.0, 0 |
+| create session + kill server (ms) | - | 11.0 | 52.5 | 5.3 |
+| attach, draw, detach (ms, includes a 20 ms wait) | - | 31.8 | 63.6 | 29.3 |
+| new session until a typed command runs (ms) | 31.6 | 54.6 | 85.4 | 39.1 |
+| key echo, idle pane, p50 / p95 (us) | 16 / 23 | 118 / 167 | 436 / 619 | 102 / 155 |
+| key echo while another pane runs `yes`, p50 / p95 (us) | - | 262 / 330 | 948 / 1,066 | 39 / 48 |
+| bare ESC to the program, default settings, p50 (us) | 46 | 11,535 | 59,782 | 5,506 |
+| bare ESC with `escape-time 0` / kitty keyboard protocol, p50 (us) | - | 1,415 / - | - | 137 / 140 |
+| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 3.54, system libraries only |
 
-Where lif still loses: each extra visible pane costs about 130 KiB (tmux:
-about 9 KiB), so 50 idle panes take 9.6 MiB against tmux's 4.2 MiB. After
-large output its RSS stays higher than tmux's (13.8 MiB against 7.9 after the
-100 MB `cat`, and nearly as high as tmux's with 100k lines of history)
-although its footprint is lower: compressed history leaves its old pages
-resident until macOS reclaims them. A new session took 9 ms longer than
-tmux's to run its first typed command in this run (in an earlier run lif was
-10 ms faster; see comparison.md). The binary is 2.6 times tmux's.
+Where lif still loses: each extra visible pane costs about 140 KiB (tmux:
+about 11 KiB), so 50 idle panes take 10.0 MiB against tmux's 4.2 MiB. After
+large output its RSS stays higher than tmux's (14.0 MiB against 7.6 after the
+100 MB `cat`) although its footprint is lower: compressed history leaves its
+old pages resident until macOS reclaims them, which is also why 100k lines of
+history show 236 MiB resident for a 43.5 MiB footprint. Plain ASCII went
+through at 89% of the bare shell's rate in this run. The binary is 3.0 times
+tmux's.
 
 <!-- END BENCHMARKS -->
 
@@ -103,7 +103,7 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
 
 ## Same as tmux
 
-- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (71 of
+- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (73 of
   tmux's 93 default prefix bindings are identical; the rest are listed in the
   migration guide). The copy-mode tables (`copy-mode`, `copy-mode-vi`) are
   tmux 3.8's, minus the mouse entries and emacs `L`.
@@ -111,7 +111,8 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   flags, the command language (`;` separators, `{ }` blocks, quoting), and the
   error messages for unknown commands, options and targets.
 - Targets: `session:window.pane`, `$id`, `@id`, `%id`, `=exact`, `{last}`,
-  `{next}`, `+N`/`-N`, `{top}`/`{bottom}`/`{left}`/`{right}`, globs.
+  `{next}`, `+N`/`-N`, `{top}`/`{bottom}`/`{left}`/`{right}`, `{marked}`
+  (`~`), `{mouse}` (`=`), globs.
 - Formats: `#{variable}`, `#S #I #W #P #T #D #F #H #h`, conditionals,
   comparisons and the common modifiers (`=N`, `pN`, `t:`, `b:`, `d:`, `l:`,
   `E:`, `T:`, `q:`, `n:`, `w:`, `s/a/b/:`, `m:`, `e|op|:`),
@@ -122,9 +123,9 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   commands (`set-environment`, `show-environment`, `-e` on the commands
   that create panes), with tmux's output and messages.
 - Option names, scopes (`-s`, `-g`, `-w`, `-p`, per session, window and
-  pane) and the defaults of the 70 tmux options lif has (except
-  `escape-time`, `history-limit` and `pane-border-format`), plus user
-  options (`@name`).
+  pane) and the defaults of the 85 tmux options lif has (except
+  `escape-time`, `history-limit`, `pane-border-format`, `focus-events`
+  and the popup and menu styles), plus user options (`@name`).
 - Layouts: `even-horizontal`, `even-vertical`, `main-horizontal`,
   `main-vertical`, their `-mirrored` variants, `tiled`, and tmux layout
   strings in `#{window_layout}`.
@@ -136,6 +137,12 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   tmux's notes on the default keys (`C-b /` describes a key).
 - Popups and menus: `display-popup` (sizes, positions, borders, `-E`,
   the exit status) and `display-menu`, with `C-b <` and `C-b >`.
+- Mouse keys in the root table, with tmux's names and default bindings:
+  `bind -n MouseDown3Pane ...`, `unbind -n WheelUpPane`, the target `=`,
+  `send-keys -M`, `copy-mode -M`, `resize-pane -M`, the `mouse_*` formats,
+  and the right-button menus on panes and on the status line.
+- The marked pane: `select-pane -m` / `-M` (`C-b m`, `C-b M`), the
+  default source of `swap-pane`, `join-pane` and `swap-window`.
 - A server per socket, started by the first client, sessions surviving detach.
 
 ## Deliberately different
@@ -193,10 +200,13 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   `client-attached`, `client-detached`, `client-session-changed`,
   `client-resized`, `pane-exited`, `pane-died`, `alert-bell` and
   `alert-activity`.
-- **Mouse handling is built in**: mouse support is on by default (as in tmux
-  3.8) and does what tmux's default mouse bindings do (a drag or a double or
-  triple click copies and leaves copy mode), but mouse events cannot be bound.
-  The `mouse-drag-end` option replaces rebinding `MouseDragEnd1Pane`.
+- **The mouse inside copy mode is built in.** Mouse keys are bound in the
+  root table as in tmux, but the copy-mode tables have no mouse entries:
+  what a click, a drag or the wheel does once a pane is in copy mode is
+  fixed, and the `mouse-drag-end` option replaces rebinding
+  `MouseDragEnd1Pane`. A mouse key left at its default is handled by the
+  server directly instead of running its commands (same result, no command
+  parsing per event). See the migration guide's Mouse section.
 
 ## Claude Code
 
@@ -213,17 +223,16 @@ tmux: `lif install-tmux-shim` and `tmux-compat = true` make lif answer for
 Checked against the command table and by running each one (they fail with
 `unsupported command: NAME`):
 
-- Floating panes (`new-pane`, `move-pane`), mouse bindings (and so
-  right-click menus).
+- Floating panes (`new-pane`, `move-pane`), scrollbars, and the mouse
+  keys that belong to them.
 - `customize-mode`, `switch-mode`.
 - Session groups and linked windows (`new-session -t`, `link-window`,
   `unlink-window`).
 - Locking, `server-access`.
-- Control mode (`-C`), marked panes, most of tmux's 204 options (lif has 70
+- Control mode (`-C`), most of tmux's 204 options (lif has 85
   of them, plus 3 of its own).
-- Images (sixel, kitty graphics), Windows. Plugins are untested: TPM is
-  loaded from `.tmux.conf` with `run`, and lif's configuration file has
-  no place for a command run at start-up.
+- Images (sixel, kitty graphics), Windows. tmux plugins (TPM) are not
+  supported: they are scripts that call `tmux` and read `.tmux.conf`.
 
 ## Configuration in brief
 
@@ -302,13 +311,14 @@ the documented default file. Full reference: [docs/configuration.md](docs/config
 
 ## Platforms
 
-- **macOS on Apple Silicon (arm64)**: the only platform it has been built,
-  tested and benchmarked on.
-- **Linux**: it builds. The workspace is checked, linted (clippy with
-  `-D warnings`) and linked for `aarch64-unknown-linux-gnu` by cross
-  compiling from macOS (libghostty-vt included; zig is the linker), but
-  the binary and the tests have never been run on Linux. Expect problems
-  in the Linux-only paths (epoll, `/proc`, PTY handling).
+- **macOS on Apple Silicon (arm64)**: where it is developed, and the only
+  platform it has been benchmarked on.
+- **Linux on arm64**: the whole test suite passes on Ubuntu 26.04 (kernel
+  7.0) in a virtual machine, with one test set aside: next to a pane that
+  floods its output, the echo of a key takes about 4 ms there instead of
+  well under one (issues/0006). No benchmarks have been run on Linux.
+  x86_64 Linux is built and tested only by the CI workflow
+  (`.github/workflows/ci.yml`).
 - Other Unix systems: untested. Windows: not supported.
 
 ## License

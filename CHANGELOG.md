@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+- Mouse keys: what the mouse does outside copy mode is bound in the root
+  table under tmux 3.8's names (`MouseDown1Pane`, `MouseDrag1Border`,
+  `WheelUpStatus`, `DoubleClick1Pane`, `C-MouseDown1Status`, ...) with
+  tmux's default bindings, and can be bound, rebound and unbound
+  (`bind -n`, `unbind -n`, `[keys.root]`). New for them: the target `=`
+  (`{mouse}`), `send-keys -M`, `copy-mode -M`, `resize-pane -M`,
+  `display-menu -x M -y M` / `-x W -y W` / `-O`, and the formats
+  `mouse_x`, `mouse_y`, `mouse_word`, `mouse_line`, `mouse_any_flag`,
+  `alternate_on`, `pane_mode`. A key left at its default is still handled
+  by the server directly, so the default mouse costs what it did.
+- New defaults that come with them, as in tmux: the middle button pastes,
+  the right button opens the pane menu (on a window in the status line the
+  window menu, on `status-left` a session menu), and the wheel over the
+  status line changes window.
+- The marked pane: `select-pane -m` / `-M` (`C-b m`, `C-b M`), the
+  targets `{marked}` and `~`, the default source of `swap-pane`,
+  `join-pane` and `swap-window`, `#{pane_marked}`, `#{pane_marked_set}`,
+  `#{window_marked_flag}` and `M` in the window flags; the menus have
+  tmux's "Swap Marked" and "Mark" items.
+- Tree mode: `m` and `M` (mark), `S-Up` / `S-Down` (swap the window with
+  its neighbour); all choosers: `C-h` or `F1` shows the keys.
+- `[startup]` in the configuration file: `run = [...]`, commands the
+  server runs once when it starts, after the settings (`new-session`,
+  `run-shell`, `if-shell`, user options, ...). Checked by `check-config`;
+  failures go to `show-messages`; `source-file` does not run them again.
+- 15 more tmux options (85 of them now): `monitor-silence` with
+  `silence-action` and `visual-silence` (a timer that exists only while a
+  watched pane has printed since it last fired), `activity-action` and
+  `visual-activity`, `destroy-unattached`, `aggressive-resize`,
+  `focus-events` (on by default), and `popup-style`,
+  `popup-border-style`, `popup-border-lines`, `menu-style`,
+  `menu-selected-style`, `menu-border-style`, `menu-border-lines`.
+  `#{window_silence_flag}`, `~` in the window flags, the `alert-silence`
+  hook. Changed with them: activity in a watched window now rings the
+  bell once (tmux's default `activity-action other`).
+- `join-pane -f`.
+- The README's benchmark table is re-measured against tmux 3.8 and zellij
+  0.46.0 (`bench/results/2026-11-15-2221-0.4.0-dev-summary.md`).
+- Fixed: `split-window -f -b` gave the new pane the smaller half of the
+  window; tmux gives it the larger (issues/0005).
+- `migrate-tmux-conf` translates mouse bindings of the root table, and
+  the commands of a `.tmux.conf` that are not settings into `[startup]`
+  (not `source-file`, and not shell commands that mention tmux, such as
+  the line that starts TPM).
+- Changed: a menu opened from a mouse key now behaves as in tmux (it is up
+  while the button is held; `-O` keeps it), and `list-keys` lists the root
+  table's mouse keys, so the root table always exists.
+- Fixed: a command run right after `kill-server` could meet the exiting
+  server and fail with `server closed the connection`; the client now
+  asks again (issues/0004).
+- Linux: the tests now run there (Ubuntu 26.04 arm64 in a Lima VM) and
+  pass, with one set aside (issues/0006: the echo of a key next to a
+  flooding pane takes about 4 ms on Linux). Found and fixed on the way:
+  a client no longer waits for ever to connect to a stopped server whose
+  listen queue is full (Linux blocks there; `connect_stream`), and
+  `detach-client -P` and `attach -x` look up the client's parent before
+  the client is told to leave (it could be gone by then). Test fixes for
+  Linux's limits and for a shell that is called `sh`. A CI workflow builds,
+  lints and tests on macOS arm64 and Linux arm64 and x86_64.
+- A new icon (`docs/lif.svg`): the active pane with its prompt next to
+  two others.
+- Model interface: `KeyCode::mouse`, `KeyBindings::mouse_binding`,
+  `MouseBinding`, `MouseAt`, `Model::set_mouse`, `Host::mouse_request`,
+  `Model::status_ranges`, `Model::marked`, `PaneInfo::mouse_any` and
+  `alternate`, `MenuState::release_chooses`, `ChooseScreen::help`.
+
 ## 0.3.0 (unreleased)
 
 - Chooser modes: `choose-tree` (`C-b s`, `C-b w`), `choose-buffer`

@@ -69,6 +69,8 @@ struct Out {
     keys: [Section; 4],
     hooks: Section,
     env: Section,
+    /// Commands for `[startup]`, each with the comments above it.
+    startup: Vec<(String, Vec<String>)>,
     prefix: Option<KeyCode>,
 }
 
@@ -159,6 +161,7 @@ impl Out {
     fn command(&mut self, cmd: &Command, comments: &mut Option<Vec<String>>) -> Result<(), String> {
         let a = cmd.args();
         match cmd.name() {
+            "set-option" | "set-window-option" if a.value(0).is_some_and(|n| n.starts_with('@')) => self.at_startup(cmd, comments),
             "set-option" | "set-window-option" => {
                 for f in ['a', 'F', 'o', 'u', 't'] {
                     if a.has(f) {
@@ -169,9 +172,6 @@ impl Out {
                     return Err("only global options (set -g) can be translated".to_string());
                 }
                 let name = a.value(0).unwrap_or("");
-                if name.starts_with('@') {
-                    return Err("user options (@name) have no config.toml equivalent".to_string());
-                }
                 let value = a.value(1).ok_or_else(|| format!("no value given for {name}"))?;
                 let Some((section, opt)) = location(name) else {
                     return Err(format!("lif has no option {name}"));
@@ -201,9 +201,12 @@ impl Out {
                 if name == "MouseDragEnd1Pane" && table.starts_with("copy-mode") {
                     return self.drag_end(bind, &a.values()[1..], comments);
                 }
-                if MOUSE_KEYS.iter().any(|p| name.starts_with(p)) {
+                // Mouse keys bind like any other, in the root table; what
+                // the mouse does inside copy mode is not bound in lif.
+                let bare = name.rsplit('-').next().unwrap_or(name);
+                if table.starts_with("copy-mode") && MOUSE_KEYS.iter().any(|p| bare.starts_with(p)) {
                     return Err(format!(
-                        "{name}: lif's mouse actions are built in, not bound \
+                        "{name}: lif's mouse actions inside copy mode are built in, not bound \
                          (mouse-drag-end and copy-command configure the copy at the end of a selection)"
                     ));
                 }
@@ -297,12 +300,30 @@ impl Out {
                 self.env.set(name.to_string(), value, comments.take().unwrap_or_default());
                 Ok(())
             }
-            "run-shell" | "if-shell" => Err(format!(
-                "{} at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])",
-                cmd.name()
-            )),
-            other => Err(format!("{other} has no config.toml equivalent")),
+            // A tmux file: what it holds needs translating too.
+            "source-file" => Err("source-file names a tmux file: translate it as well and add what it gives to this file".to_string()),
+            // Anything else lif has is a command to run when the server
+            // starts, as tmux runs it when it reads the file.
+            _ => self.at_startup(cmd, comments),
         }
+    }
+
+    /// A command with no setting of its own: one of `[startup]`'s.
+    fn at_startup(&mut self, cmd: &lif_core::Command, comments: &mut Option<Vec<String>>) -> Result<(), String> {
+        if sources_a_file(cmd) {
+            return Err("it runs source-file on a tmux file: translate that file as well and add what it gives to this file".to_string());
+        }
+        // A plugin manager, or a script calling tmux: run by lif it would
+        // talk to tmux (and start its server), not to lif.
+        if matches!(cmd.name(), "run-shell" | "if-shell") && cmd.to_string().contains("tmux") {
+            return Err(format!(
+                "{} runs something written for tmux, which would talk to tmux and not to lif: \
+                 add it to run in [startup] yourself if it works without tmux",
+                cmd.name()
+            ));
+        }
+        self.startup.push((cmd.to_string(), comments.take().unwrap_or_default()));
+        Ok(())
     }
 
     /// `MouseDragEnd1Pane` in a copy-mode table: lif's `mouse-drag-end`.
@@ -371,8 +392,40 @@ impl Out {
         }
         section(&mut s, "[hooks]", &self.hooks);
         section(&mut s, "[env]", &self.env);
+        if !self.startup.is_empty() {
+            s.push_str("\n[startup]\nrun = [\n");
+            for (cmd, comments) in &self.startup {
+                for c in comments {
+                    s.push_str("    # ");
+                    s.push_str(c);
+                    s.push('\n');
+                }
+                s.push_str(&format!("    {},\n", toml_str(cmd)));
+            }
+            s.push_str("]\n");
+        }
         s
     }
+}
+
+/// Whether `cmd`, or a command it would run (`if-shell`'s branches, a
+/// prompt's template, a block), is `source-file`: in a `.tmux.conf` what
+/// that reads is tmux's, which lif cannot read.
+fn sources_a_file(cmd: &lif_core::Command) -> bool {
+    if cmd.name() == "source-file" {
+        return true;
+    }
+    // Arguments that are shell commands, not lif's: all of run-shell's
+    // (without -C) and if-shell's condition.
+    let skip = match cmd.name() {
+        "run-shell" if !cmd.args().has('C') => usize::MAX,
+        "if-shell" => 1,
+        _ => 0,
+    };
+    cmd.args().values().iter().skip(skip).any(|v| match v {
+        Arg::Str(s) => parse_string(s).is_ok_and(|l| l.commands().iter().any(sources_a_file)),
+        Arg::Block(b) => b.commands().iter().any(sources_a_file),
+    })
 }
 
 /// The command string of a binding from `bind-key`'s arguments: one string

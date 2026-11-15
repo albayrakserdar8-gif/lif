@@ -669,7 +669,12 @@ impl Layout {
             return Err(LayoutError::NoSpace);
         }
         let new_size = match size {
-            SplitSize::Half => saved.div_ceil(2) - 1,
+            // tmux's halves: the second pane gets the smaller one, and
+            // with `before` the new pane is the first.
+            SplitSize::Half => {
+                let second = saved.div_ceil(2) - 1;
+                if before { saved - 1 - second } else { second }
+            }
             SplitSize::Cells(n) => n,
             SplitSize::Percent(p) => (saved as u64 * p as u64 / 100) as u32,
         }

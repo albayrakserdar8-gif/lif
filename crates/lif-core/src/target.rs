@@ -84,6 +84,15 @@ impl Model {
         Some(Found { s: win.session, w: Some(w), p: Some(p), idx: Some(win.index) })
     }
 
+    /// The source of a command whose `-s` defaults to the marked pane
+    /// (`swap-pane`, `join-pane`, `swap-window`).
+    pub(crate) fn find_source(&self, ctx: &CmdContext, source: Option<&str>, kind: Kind) -> Result<Found, CmdError> {
+        match (source, self.marked()) {
+            (None, Some(_)) => self.find_target(ctx, Some("~"), kind, Flags::default()),
+            _ => self.find_target(ctx, source, kind, Flags::default()),
+        }
+    }
+
     /// Resolve `target` (`None` or empty: the current state). What it
     /// found is remembered as the target of the command being run, for
     /// its `after-` hook.
@@ -94,6 +103,26 @@ impl Model {
     }
 
     fn resolve_target(&self, ctx: &CmdContext, target: Option<&str>, kind: Kind, flags: Flags) -> Result<Found, CmdError> {
+        // `=` (or `{mouse}`): where the mouse is, in a mouse key's commands.
+        if matches!(target, Some("=" | "{mouse}")) {
+            let at = self.mouse.ok_or_else(|| CmdError::new("no mouse target"))?;
+            let found = match (at.pane, at.window) {
+                (Some(p), _) => self.found_pane(p),
+                (None, Some(w)) => self.found_window(w),
+                // Beside the windows in the status line: the current
+                // window, as in tmux.
+                (None, None) => self.current_state(ctx, false).ok(),
+            };
+            return found.map(|f| Found { idx: None, ..f }).ok_or_else(|| CmdError::new("no mouse target"));
+        }
+        // The marked pane; the current one when nothing is marked, as in
+        // tmux.
+        if matches!(target, Some("~" | "{marked}")) {
+            return match self.marked().and_then(|p| self.found_pane(p)) {
+                Some(f) => Ok(Found { idx: None, ..f }),
+                None => self.current_state(ctx, flags.prefer_unattached).map(|f| Found { idx: None, ..f }),
+            };
+        }
         let Some(target) = target.filter(|t| !t.is_empty()) else {
             // No target names no index: `new-window` run from a pane's
             // shell takes the next free one, not its own window's.

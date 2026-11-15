@@ -97,6 +97,7 @@ pub struct Window {
     pub(crate) last_panes: Vec<PaneId>,
     pub(crate) bell: bool,
     pub(crate) activity: bool,
+    pub(crate) silence: bool,
     pub(crate) options: OptionSet,
     pub(crate) last_preset: Option<Preset>,
     pub(crate) old_layout: Option<Layout>,
@@ -149,6 +150,11 @@ impl Window {
     /// `monitor-activity`).
     pub fn activity_flag(&self) -> bool {
         self.activity
+    }
+    /// The window was quiet for `monitor-silence` seconds while it was
+    /// not current.
+    pub fn silence_flag(&self) -> bool {
+        self.silence
     }
     /// The window size.
     pub fn size(&self) -> Size {
@@ -364,6 +370,19 @@ pub struct Model {
     /// The time the last command list ran at (Unix seconds): the model
     /// reads no clock, and paste buffers want a creation time.
     pub(crate) clock: i64,
+    /// Where the mouse is, while a mouse key's commands run.
+    pub(crate) mouse: Option<crate::host::MouseAt>,
+    /// A client left a session, a session was made or an option was set
+    /// since [`Model::check_unattached`] last looked.
+    pub(crate) unattached_dirty: bool,
+    /// The server is starting: `source-file` keeps the files' `[startup]`
+    /// commands in `startup_commands` for it.
+    pub(crate) collect_startup: bool,
+    pub(crate) startup_commands: Vec<(String, String)>,
+    /// tmux's marked pane (`select-pane -m`): the default source of
+    /// `swap-pane`, `join-pane` and `swap-window`. Read through
+    /// [`Model::marked`], which forgets a pane that is gone.
+    pub(crate) marked_pane: Option<PaneId>,
 }
 
 /// The largest window index: `base-index`'s maximum, tmux's INT_MAX. Every
@@ -410,6 +429,11 @@ impl Model {
             environ: Default::default(),
             last_found: Default::default(),
             clock: 0,
+            mouse: None,
+            marked_pane: None,
+            unattached_dirty: false,
+            collect_startup: false,
+            startup_commands: Vec::new(),
         }
     }
 
@@ -624,6 +648,14 @@ impl Model {
         if policy == 2 {
             return None;
         }
+        // aggressive-resize: only clients showing the window count, and a
+        // session's clients all show its current window.
+        if let Some(w) = wid
+            && self.sessions.get(&sid).is_some_and(|s| s.current != w)
+            && self.wopt(wid, "aggressive-resize").as_flag()
+        {
+            return None;
+        }
         let sl = self.status_lines(sid) + (self.border_status(wid) != BorderStatus::Off) as u16;
         let sizes: Vec<(u64, Size)> = self
             .clients
@@ -648,6 +680,8 @@ impl Model {
 
     /// Resize the windows of a session to what its clients want.
     pub(crate) fn recalc_session(&mut self, sid: SessionId, host: &mut dyn Host) {
+        // Every way a client joins or leaves a session comes through here.
+        self.unattached_dirty = true;
         let Some(sess) = self.sessions.get(&sid) else { return };
         let wids: Vec<WindowId> = sess.windows.values().copied().collect();
         for wid in wids {
@@ -708,6 +742,12 @@ impl Model {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.bell = false;
             w.activity = false;
+            w.silence = false;
+        }
+        // A window sized only for the clients looking at it has some now,
+        // and the one left behind has none.
+        if [old, wid].iter().any(|w| self.wopt(Some(*w), "aggressive-resize").as_flag()) {
+            self.recalc_session(sid, host);
         }
         self.notify("session-window-changed", None, Some(sid), Some(wid), None);
         host.redraw(Redraw::Session(sid));
@@ -813,6 +853,7 @@ impl Model {
             if let Some(nw) = self.windows.get_mut(&next) {
                 nw.bell = false;
                 nw.activity = false;
+                nw.silence = false;
             }
         }
         if renumber && self.sopt(Some(sid), "renumber-windows").as_flag() {
@@ -1073,17 +1114,83 @@ impl Model {
                 host.redraw(Redraw::Status(sid));
             }
         }
-        let action = self.sopt(Some(sid), "bell-action").as_num();
-        let ring = match action {
+        self.alert(sid, wid, current, "bell-action", "visual-bell", "Bell", host);
+    }
+
+    /// Tell a session's clients about an alert in one of its windows, as
+    /// the `*-action` option selects (none, any window, the current one,
+    /// the others) and the `visual-*` option says how: a bell, a message
+    /// (`Bell in window 2`), or both.
+    #[allow(clippy::too_many_arguments)]
+    fn alert(&mut self, sid: SessionId, wid: WindowId, current: bool, action: &str, visual: &str, what: &str, host: &mut dyn Host) {
+        let tell = match self.sopt(Some(sid), action).as_num() {
             0 => false,
             2 => current,
             3 => !current,
             _ => true,
         };
-        if ring && self.sopt(Some(sid), "visual-bell").as_num() != 1 {
-            for c in self.clients_of(sid) {
+        if !tell {
+            return;
+        }
+        let visual = self.sopt(Some(sid), visual).as_num();
+        let ms = self.sopt(Some(sid), "display-time").as_num() as u64;
+        let text = if current { format!("{what} in current window") } else { format!("{what} in window {}", self.windows[&wid].index) };
+        for c in self.clients_of(sid) {
+            if visual != 1 {
                 host.bell(c);
             }
+            if visual != 0 {
+                host.show_message(c, &text, ms);
+            }
+        }
+    }
+
+    /// How long `pane`'s window may be quiet before it is flagged
+    /// (`monitor-silence`, seconds); 0: silence is not watched.
+    pub fn silence_secs(&self, pane: PaneId) -> u64 {
+        match self.panes.get(&pane) {
+            Some(p) => self.wopt(Some(p.window), "monitor-silence").as_num().max(0) as u64,
+            None => 0,
+        }
+    }
+
+    /// `pane` printed nothing for its window's `monitor-silence` seconds:
+    /// the window gets its silence flag unless it is the current one, and
+    /// the clients `silence-action` selects are told.
+    pub fn pane_silence(&mut self, pane: PaneId, host: &mut dyn Host) {
+        let Some(p) = self.panes.get(&pane) else { return };
+        let wid = p.window;
+        if self.wopt(Some(wid), "monitor-silence").as_num() <= 0 {
+            return;
+        }
+        let sid = self.windows[&wid].session;
+        let current = self.sessions[&sid].current == wid;
+        if current || self.windows[&wid].silence {
+            return;
+        }
+        self.windows.get_mut(&wid).expect("window").silence = true;
+        self.notify("alert-silence", None, Some(sid), Some(wid), Some(pane));
+        host.redraw(Redraw::Status(sid));
+        self.alert(sid, wid, current, "silence-action", "visual-silence", "Silence", host);
+    }
+
+    /// Destroy the sessions nobody is attached to that have
+    /// `destroy-unattached` on. Cheap unless something that could have
+    /// left one changed since the last call (a client left, a session was
+    /// made, an option was set); the server calls it after every batch of
+    /// commands.
+    pub fn check_unattached(&mut self, host: &mut dyn Host) {
+        if !std::mem::take(&mut self.unattached_dirty) {
+            return;
+        }
+        let gone: Vec<SessionId> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|s| self.sopt(Some(*s), "destroy-unattached").as_num() == 1 && self.clients.values().all(|c| c.session != Some(*s)))
+            .collect();
+        for sid in gone {
+            self.destroy_session(sid, host);
         }
     }
 
@@ -1102,6 +1209,8 @@ impl Model {
                 w.activity = true;
                 self.notify("alert-activity", None, Some(sid), Some(wid), Some(pane));
                 host.redraw(Redraw::Status(sid));
+                // Once per flag, as in tmux: not for every line of output.
+                self.alert(sid, wid, false, "activity-action", "visual-activity", "Activity", host);
             }
         }
     }
@@ -1197,6 +1306,30 @@ impl Model {
         Some(options::value_text(def, self.popt(pane, def.name)))
     }
 
+    /// While `on`, the `[startup]` commands of configuration files that
+    /// `source-file` reads are kept for [`Model::take_startup`]; the
+    /// server turns this on only while it starts.
+    pub fn collect_startup(&mut self, on: bool) {
+        self.collect_startup = on;
+    }
+
+    /// The `[startup]` commands collected so far, each with where it came
+    /// from (`path:line:column`), in the order they were read.
+    pub fn take_startup(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.startup_commands)
+    }
+
+    /// The marked pane, if there is one and it still exists.
+    pub fn marked(&self) -> Option<PaneId> {
+        self.marked_pane.filter(|p| self.panes.contains_key(p))
+    }
+
+    /// Where the mouse is, for the commands of a mouse key about to run
+    /// (`-t =`, the `mouse_*` formats); `None` when they are done.
+    pub fn set_mouse(&mut self, at: Option<crate::host::MouseAt>) {
+        self.mouse = at;
+    }
+
     /// `select-pane -d` turned the pane's input off: what clients type
     /// or paste there is dropped.
     pub fn pane_input_off(&self, pane: PaneId) -> bool {
@@ -1250,7 +1383,22 @@ impl Model {
     /// The status line of `session` for a client `width` cells wide, in
     /// tmux's default look unless the status options say otherwise.
     pub fn status_line(&self, session: SessionId, width: u16, now: WallClock, host: &dyn Host) -> StyledLine {
-        let Some(s) = self.sessions.get(&session) else { return StyledLine::new() };
+        self.status_parts(session, width, now, host).map(|p| status::render(&p)).unwrap_or_default()
+    }
+
+    /// Where the parts of [`Model::status_line`] are, and the window of
+    /// each entry: what a mouse key on the status line is about.
+    pub fn status_ranges(&self, session: SessionId, width: u16, now: WallClock, host: &dyn Host) -> (status::StatusRanges, Vec<WindowId>) {
+        let mut r = status::StatusRanges::default();
+        if let Some(p) = self.status_parts(session, width, now, host) {
+            status::render_with(&p, Some(&mut r));
+        }
+        let ids = self.sessions.get(&session).map(|s| s.windows.values().copied().filter(|w| self.windows.contains_key(w)).collect()).unwrap_or_default();
+        (r, ids)
+    }
+
+    fn status_parts(&self, session: SessionId, width: u16, now: WallClock, host: &dyn Host) -> Option<StatusParts> {
+        let s = self.sessions.get(&session)?;
         let sid = Some(session);
         let cur = s.current;
         let active = self.windows.get(&cur).map(|w| w.active);
@@ -1281,12 +1429,12 @@ impl Model {
             }
             if w.bell {
                 status::apply_style(self.wopt(wo, "window-status-bell-style").as_str(), &mut style, base);
-            } else if w.activity {
+            } else if w.activity || w.silence {
                 status::apply_style(self.wopt(wo, "window-status-activity-style").as_str(), &mut style, base);
             }
             windows.push(WindowEntry { text, style, current: is_cur });
         }
-        status::render(&StatusParts {
+        Some(StatusParts {
             width: width as usize,
             base,
             left,
@@ -1404,6 +1552,47 @@ impl Vars for Fctx<'_> {
         {
             return Some(v);
         }
+        match name {
+            "mouse_any_flag" => return flag(self.p.is_some_and(|p| self.host.pane_info(p).mouse_any)),
+            "alternate_on" => return flag(self.p.is_some_and(|p| self.host.pane_info(p).alternate)),
+            "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" => {
+                let at = m.mouse?;
+                let (x, y) = if at.pane.is_some() { at.cell } else { at.screen };
+                return Some(match name {
+                    "mouse_x" => x.to_string(),
+                    "mouse_y" => y.to_string(),
+                    _ => {
+                        // The line under the mouse, and the word on it.
+                        let pane = at.pane?;
+                        let range = crate::host::CaptureRange {
+                            start: crate::host::LinePos::Line(y as i64),
+                            end: crate::host::LinePos::Line(y as i64),
+                            join_wrapped: false,
+                            keep_trailing: false,
+                            styled: false,
+                        };
+                        let line = self.host.capture_pane(pane, range);
+                        let line = line.trim_end_matches('\n');
+                        if name == "mouse_line" {
+                            line.to_string()
+                        } else {
+                            let seps = m.sopt(self.s, "word-separators").as_str();
+                            let chars: Vec<char> = line.chars().collect();
+                            let is_word = |c: char| !c.is_whitespace() && !seps.contains(c);
+                            let i = (x as usize).min(chars.len().saturating_sub(1));
+                            if chars.is_empty() || !is_word(chars[i]) {
+                                String::new()
+                            } else {
+                                let a = (0..=i).rev().take_while(|j| is_word(chars[*j])).last().unwrap_or(i);
+                                let b = (i..chars.len()).take_while(|j| is_word(chars[*j])).last().unwrap_or(i);
+                                chars[a..=b].iter().collect()
+                            }
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
         if let Some(rest) = name.strip_prefix("session_") {
             let s = s?;
             return match rest {
@@ -1423,7 +1612,7 @@ impl Vars for Fctx<'_> {
                         .iter()
                         .filter_map(|(i, wid)| {
                             let w = m.windows.get(wid)?;
-                            let f = if w.bell { "!" } else if w.activity { "#" } else { return None };
+                            let f = if w.bell { "!" } else if w.activity { "#" } else if w.silence { "~" } else { return None };
                             Some(format!("{i}{f}"))
                         })
                         .collect();
@@ -1449,11 +1638,17 @@ impl Vars for Fctx<'_> {
                     if w.bell {
                         f.push('!');
                     }
+                    if w.silence {
+                        f.push('~');
+                    }
                     if is_cur {
                         f.push('*');
                     }
                     if is_last {
                         f.push('-');
+                    }
+                    if m.marked().is_some_and(|p| m.panes[&p].window == w.id) {
+                        f.push('M');
                     }
                     if w.layout.zoomed().is_some() {
                         f.push('Z');
@@ -1464,7 +1659,9 @@ impl Vars for Fctx<'_> {
                 "last_flag" => flag(is_last),
                 "bell_flag" => flag(w.bell),
                 "activity_flag" => flag(w.activity),
-                "silence_flag" | "bigger" | "marked_flag" | "linked" => flag(false),
+                "marked_flag" => flag(m.marked().is_some_and(|p| m.panes[&p].window == w.id)),
+                "silence_flag" => flag(w.silence),
+                "bigger" | "linked" => flag(false),
                 "zoomed_flag" => flag(w.layout.zoomed().is_some()),
                 "panes" => Some(w.panes.len().to_string()),
                 "width" => Some(w.size.cols.to_string()),
@@ -1501,6 +1698,7 @@ impl Vars for Fctx<'_> {
                 "dead" => flag(p.dead),
                 "dead_status" => Some(p.exit_status.map(|s| s.to_string()).unwrap_or_default()),
                 "in_mode" => flag(info.in_mode),
+                "mode" => Some(if info.in_mode { "copy-mode" } else { "" }.to_string()),
                 "synchronized" => flag(m.popt(p.id, "synchronize-panes").as_flag()),
                 "start_command" => Some(p.command.display()),
                 "start_path" => Some(p.cwd.clone()),
@@ -1515,7 +1713,8 @@ impl Vars for Fctx<'_> {
                 "format" => flag(true),
                 "input_off" => flag(p.input_off),
                 "pipe" => flag(info.pipe),
-                "marked" | "marked_set" => flag(false),
+                "marked" => flag(m.marked() == Some(p.id)),
+                "marked_set" => flag(m.marked().is_some()),
                 _ => None,
             };
         }

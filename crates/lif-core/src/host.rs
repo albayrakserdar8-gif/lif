@@ -170,8 +170,39 @@ pub struct PaneInfo<'a> {
     pub history_bytes: usize,
     /// The pane shows copy mode (or another mode) instead of its program.
     pub in_mode: bool,
+    /// The program asked for mouse events (`#{mouse_any_flag}`).
+    pub mouse_any: bool,
+    /// The program is on the alternate screen (`#{alternate_on}`).
+    pub alternate: bool,
     /// `pipe-pane` is piping the pane's output to a command.
     pub pipe: bool,
+}
+
+/// Where the mouse is while a mouse key's commands run: what `-t =`
+/// resolves to and what the `mouse_*` formats describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseAt {
+    /// The pane under it, if any.
+    pub pane: Option<PaneId>,
+    /// The window under it: the pane's, or the one whose entry in the
+    /// status line it is on.
+    pub window: Option<WindowId>,
+    /// Its cell on the client's screen.
+    pub screen: (u16, u16),
+    /// Its cell in the pane, if it is on one.
+    pub cell: (u16, u16),
+    /// On a window's entry in the status line: the column it starts at.
+    pub status_x: Option<u16>,
+}
+
+/// Something a command asks the server to do with the mouse event whose
+/// key is running it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseRequest {
+    /// `send-keys -M`: pass the event on to the pane's program or mode.
+    Forward(PaneId),
+    /// `resize-pane -M`: the drag that started resizes panes.
+    ResizeBorder,
 }
 
 /// A line position for `capture-pane -S/-E`.
@@ -208,6 +239,10 @@ pub struct ConfigFile {
     /// Commands in the order they run, each with where it came from
     /// (`path:line:column`), which prefixes its error if it fails.
     pub commands: Vec<(String, String)>,
+    /// Commands for the server's start only (`[startup]`), with where
+    /// each came from. `source-file` hands them to the model, which keeps
+    /// them only while the server is starting.
+    pub startup: Vec<(String, String)>,
     /// Problems found while reading it, already formatted
     /// (`path:line:column: error: ...`), in file order, each marked as an
     /// error (`true`) or a warning. The commands that could be read still
@@ -394,6 +429,13 @@ pub trait Host {
     /// `display-popup -C`: close `client`'s popup or menu, if any.
     fn close_overlay(&mut self, client: ClientId) {
         let _ = client;
+    }
+
+    /// A command run by a mouse key asks for something to be done with the
+    /// event (`send-keys -M`, `resize-pane -M`). Without a mouse event
+    /// under way there is nothing to do.
+    fn mouse_request(&mut self, what: MouseRequest) {
+        let _ = what;
     }
 
     /// `clock-mode`: show a large clock in the pane until a key is

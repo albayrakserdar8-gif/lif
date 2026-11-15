@@ -40,6 +40,9 @@ pub struct KeyBindings {
     /// default (not yet moved into `tables` by a change).
     copy_pending: [bool; 2],
     copy_defaults: std::cell::OnceCell<[HashMap<KeyCode, Binding>; 2]>,
+    /// The default mouse bindings ([`ROOT_DEFAULTS`]) and whether each is
+    /// built in, to tell a default from a rebinding.
+    mouse_defaults: HashMap<KeyCode, (CommandList, bool)>,
 }
 
 /// Index of a copy-mode table in `KeyBindings::copy_pending`.
@@ -97,18 +100,19 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     (
         "<",
         false,
-        "display-menu -T \"#[align=centre]#{window_index}:#{window_name}\" -x W -y W \"#{?#{>:#{session_windows},1},,-}Swap Left\" l { swap-window -t :-1 } \"#{?#{>:#{session_windows},1},,-}Swap Right\" r { swap-window -t :+1 } '' Kill X { kill-window } Respawn R { respawn-window -k } Rename n { command-prompt -F -I \"#W\" { rename-window -t \"#{window_id}\" \"%%\" } } '' \"New After\" w { new-window -a } \"New At End\" W { new-window }",
+        "display-menu -T \"#[align=centre]#{window_index}:#{window_name}\" -x W -y W \"#{?#{>:#{session_windows},1},,-}Swap Left\" l { swap-window -t :-1 } \"#{?#{>:#{session_windows},1},,-}Swap Right\" r { swap-window -t :+1 } \"#{?pane_marked_set,,-}Swap Marked\" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } \"#{?pane_marked,Unmark,Mark}\" m { select-pane -m } Rename n { command-prompt -F -I \"#W\" { rename-window -t \"#{window_id}\" \"%%\" } } '' \"New After\" w { new-window -a } \"New At End\" W { new-window }",
     ),
     ("=", false, "choose-buffer -Z"),
     (
         ">",
         false,
-        "display-menu -T \"#[align=centre]#{pane_index} (#{pane_id})\" -x P -y P \"#{?pane_in_mode,Go To Top,}\" < { send-keys -X history-top } \"#{?pane_in_mode,Go To Bottom,}\" > { send-keys -X history-bottom } '' \"#{?pane_in_mode,,Paste}\" p { paste-buffer } '' \"Horizontal Split\" h { split-window -h } \"Vertical Split\" v { split-window -v } '' \"#{?#{>:#{window_panes},1},,-}Swap Up\" u { swap-pane -U } \"#{?#{>:#{window_panes},1},,-}Swap Down\" d { swap-pane -D } '' Kill X { kill-pane } Respawn R { respawn-pane -k } \"#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}\" z { resize-pane -Z }",
+        "display-menu -T \"#[align=centre]#{pane_index} (#{pane_id})\" -x P -y P \"#{?pane_in_mode,Go To Top,}\" < { send-keys -X history-top } \"#{?pane_in_mode,Go To Bottom,}\" > { send-keys -X history-bottom } '' \"#{?pane_in_mode,,Paste}\" p { paste-buffer } '' \"Horizontal Split\" h { split-window -h } \"Vertical Split\" v { split-window -v } '' \"#{?#{>:#{window_panes},1},,-}Swap Up\" u { swap-pane -U } \"#{?#{>:#{window_panes},1},,-}Swap Down\" d { swap-pane -D } \"#{?pane_marked_set,,-}Swap Marked\" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } \"#{?pane_marked,Unmark,Mark}\" m { select-pane -m } \"#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}\" z { resize-pane -Z }",
     ),
     ("?", false, "list-keys"),
     ("D", false, "choose-client -Z"),
     ("E", false, "select-layout -E"),
     ("L", false, "switch-client -l"),
+    ("M", false, "select-pane -M"),
     ("T", false, "command-prompt -I \"#T\" { select-pane -T \"%%\" }"),
     ("[", false, "copy-mode"),
     ("]", false, "paste-buffer -p"),
@@ -117,6 +121,7 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     ("f", false, "command-prompt { find-window -Z \"%%\" }"),
     ("i", false, "display-message"),
     ("l", false, "last-window"),
+    ("m", false, "select-pane -m"),
     ("n", false, "next-window"),
     ("o", false, "select-pane -t :.+"),
     ("p", false, "previous-window"),
@@ -164,6 +169,63 @@ pub const COPY_MODE_VI_TABLE: &str = "copy-mode-vi";
 /// `tmux list-keys -T copy-mode-vi` prints it, without the mouse bindings
 /// (copy mode handles the mouse itself) and `C-[` (the same key as Escape).
 ///
+/// tmux 3.8's default root-table mouse bindings, for what lif has (no
+/// floating panes, scrollbars or marks). `(key, built in, command)`: the
+/// ones marked built in are what the server's mouse handling does by
+/// itself, and it does so for as long as the binding is this one; rebound,
+/// the key runs its commands, and unbound it does nothing. The others
+/// always run as commands.
+const ROOT_DEFAULTS: &[(&str, bool, &str)] = &[
+    ("MouseDown1Pane", true, "select-pane -t = ; send-keys -M"),
+    ("MouseDown1Status", true, "switch-client -t ="),
+    ("MouseDown1Border", true, "select-pane -t ="),
+    ("MouseDown2Pane", false, "select-pane -t = ; if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { paste-buffer -p }"),
+    (
+        "MouseDown3Pane",
+        false,
+        "if-shell -F -t = \"#{||:#{mouse_any_flag},#{pane_in_mode}}\" { select-pane -t = ; send-keys -M } { display-menu -T \"#[align=centre]#{pane_index} (#{pane_id})\" -t = -x M -y M \"#{?pane_in_mode,Go To Top,}\" < { send-keys -X history-top } \"#{?pane_in_mode,Go To Bottom,}\" > { send-keys -X history-bottom } '' \"#{?pane_in_mode,,Paste}\" p { paste-buffer } '' \"Horizontal Split\" h { split-window -h } \"Vertical Split\" v { split-window -v } '' \"#{?#{>:#{window_panes},1},,-}Swap Up\" u { swap-pane -U } \"#{?#{>:#{window_panes},1},,-}Swap Down\" d { swap-pane -D } \"#{?pane_marked_set,,-}Swap Marked\" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } \"#{?pane_marked,Unmark,Mark}\" m { select-pane -m } \"#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}\" z { resize-pane -Z } }",
+    ),
+    (
+        "MouseDown3Status",
+        false,
+        "display-menu -T \"#[align=centre]#{window_index}:#{window_name}\" -t = -x W -y W \"#{?#{>:#{session_windows},1},,-}Swap Left\" l { swap-window -t :-1 } \"#{?#{>:#{session_windows},1},,-}Swap Right\" r { swap-window -t :+1 } \"#{?pane_marked_set,,-}Swap Marked\" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } \"#{?pane_marked,Unmark,Mark}\" m { select-pane -m } Rename n { command-prompt -F -I \"#W\" { rename-window -t \"#{window_id}\" \"%%\" } } '' \"New After\" w { new-window -a } \"New At End\" W { new-window }",
+    ),
+    (
+        "MouseDown3StatusLeft",
+        false,
+        "display-menu -T \"#[align=centre]#{session_name}\" -t = -x M -y W Renumber N { move-window -r } Rename r { command-prompt -I \"#S\" { rename-session -- \"%%\" } } Detach d { detach-client } '' \"New Session\" s { new-session } \"New Window\" w { new-window }",
+    ),
+    ("MouseDrag1Pane", true, "if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { copy-mode -M }"),
+    ("MouseDrag1Border", true, "resize-pane -M"),
+    ("WheelDownStatus", false, "next-window"),
+    ("WheelUpPane", true, "if-shell -F \"#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { copy-mode -e }"),
+    ("WheelUpStatus", false, "previous-window"),
+    (
+        "DoubleClick1Pane",
+        true,
+        "select-pane -t = ; if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }",
+    ),
+    (
+        "TripleClick1Pane",
+        true,
+        "select-pane -t = ; if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { copy-mode -H ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }",
+    ),
+];
+
+/// What the root table says about a mouse key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseBinding<'a> {
+    /// Nothing is bound to it.
+    Unbound,
+    /// Its default binding, which the server's built-in handling stands
+    /// for.
+    BuiltIn,
+    /// Its default binding, to run as commands.
+    Default(&'a CommandList),
+    /// Something the user bound.
+    Custom(&'a CommandList),
+}
+
 /// tmux 3.8's notes for the default prefix bindings (`list-keys -N`), by
 /// key.
 const NOTES: &[(&str, &str)] = &[
@@ -200,6 +262,7 @@ const NOTES: &[(&str, &str)] = &[
     ("D", "Choose and detach a client from a list"),
     ("E", "Spread panes out evenly"),
     ("L", "Switch to the last client"),
+    ("M", "Clear the marked pane"),
     ("T", "Change the pane title"),
     ("[", "Enter copy mode"),
     ("]", "Paste the most recent paste buffer"),
@@ -208,6 +271,7 @@ const NOTES: &[(&str, &str)] = &[
     ("f", "Search for a pane"),
     ("i", "Display window information"),
     ("l", "Select the previously current window"),
+    ("m", "Toggle the marked pane"),
     ("n", "Select the next window"),
     ("o", "Select the next pane"),
     ("p", "Select the previous window"),
@@ -429,8 +493,29 @@ impl KeyBindings {
             let note = NOTES.iter().find(|(k, _)| *k == raw).map(|(_, n)| n.to_string());
             b.bind(PREFIX_TABLE, Binding { key: KeyCode::parse(raw).expect("checked"), repeat: *repeat, note, commands });
         }
+        for (key, built_in, cmd) in ROOT_DEFAULTS {
+            let key = KeyCode::parse(key).unwrap_or_else(|| panic!("bad default key {key}"));
+            let commands = parse_string(cmd).unwrap_or_else(|e| panic!("bad default binding {cmd}: {e}"));
+            b.mouse_defaults.insert(key, (commands.clone(), *built_in));
+            b.bind(ROOT_TABLE, Binding { key, repeat: false, note: None, commands });
+        }
         b.copy_pending = [true, true];
         b
+    }
+
+    /// What the root table has for mouse key `key`.
+    pub fn mouse_binding(&self, key: &KeyCode) -> MouseBinding<'_> {
+        let Some(b) = self.tables.get(ROOT_TABLE).and_then(|t| t.get(key)) else { return MouseBinding::Unbound };
+        match self.mouse_defaults.get(key) {
+            Some((d, built_in)) if *d == b.commands => {
+                if *built_in {
+                    MouseBinding::BuiltIn
+                } else {
+                    MouseBinding::Default(&b.commands)
+                }
+            }
+            _ => MouseBinding::Custom(&b.commands),
+        }
     }
 
     /// A table's bindings, the copy-mode defaults included.
@@ -739,7 +824,7 @@ mod tests {
         let mut b = KeyBindings::with_defaults();
         assert!(b.copy_defaults.get().is_none(), "not parsed at start-up");
         let names: Vec<&str> = b.table_names().collect();
-        assert_eq!(names, ["copy-mode", "copy-mode-vi", "prefix"]);
+        assert_eq!(names, ["copy-mode", "copy-mode-vi", "prefix", "root"]);
         assert!(b.has_table(COPY_MODE_VI_TABLE));
         let q = KeyCode::parse("q").unwrap();
         assert_eq!(run(&KeyDecision::Run(b.lookup_code(COPY_MODE_VI_TABLE, &q).unwrap().commands.clone())), "send-keys -X cancel");
@@ -831,7 +916,9 @@ mod tests {
         s.set_table(PREFIX_TABLE);
         assert_eq!(s.handle(&b, &prefix, 500, &rel, 0), KeyDecision::Swallow);
         assert!(b.unbind(ROOT_TABLE, &KeyCode::parse("M-h").unwrap()));
-        assert!(!b.has_table(ROOT_TABLE));
+        // The mouse keys' defaults keep the root table.
+        assert!(b.lookup(ROOT_TABLE, &ev("M-h")).is_none());
+        assert!(b.has_table(ROOT_TABLE));
         assert!(b.lookup(PREFIX_TABLE, &ev("c")).is_some());
     }
 
