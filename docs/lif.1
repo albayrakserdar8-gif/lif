@@ -84,6 +84,28 @@ to
 .Nm Ns 's
 TOML format on standard output, and print each line that was not
 translated, with the reason, on standard error.
+.It Ic install-tmux-shim Op Ar dir
+Make
+.Ar dir Ns Pa /tmux
+(by default
+.Pa ~/.local/share/lif/shim/tmux )
+a link to
+.Nm .
+Invoked as
+.Ic tmux
+inside a
+.Nm
+pane, it is
+.Nm
+(finding its server through
+.Ev TMUX
+too, and answering
+.Fl V
+with the tmux version it follows); anywhere else it runs the next
+.Ic tmux
+on
+.Ev PATH .
+An existing file that is not a link is never replaced.
 .El
 .Sh TARGETS
 Commands find sessions, windows and panes with
@@ -342,6 +364,19 @@ List sessions.
 .Xc
 List windows of a session (-a: all).
 .It Xo
+.Ic load-buffer Pq Ic loadb
+.Op Fl w
+.Op Fl b Ar buffer-name
+.Op Fl t Ar target-client
+.Ar path
+.Xc
+Load a file (relative to the client's directory) into a buffer;
+.Ql -
+reads the client's standard input (at most 16 MiB). -w also sets the
+attached terminals' clipboard (OSC 52) unless
+.Ic set-clipboard
+is off.
+.It Xo
 .Ic move-window Pq Ic movew
 .Op Fl abdkr
 .Op Fl s Ar src-window
@@ -459,10 +494,12 @@ undoes the last layout change.
 .It Xo
 .Ic select-pane Pq Ic selectp
 .Op Fl DLlRUZ
+.Op Fl T Ar title
 .Op Fl t Ar target-pane
 .Xc
 Make a pane active, or the pane in a direction with -L, -R, -U, -D; -l
-selects the last pane.
+selects the last pane. -T sets the pane's title and selects nothing; a
+title the program sets later replaces it.
 .It Xo
 .Ic select-window Pq Ic selectw
 .Op Fl lnpT
@@ -498,13 +535,13 @@ Send the prefix key (-2: prefix2) to a pane.
 Set a buffer's contents; -a appends, -n renames.
 .It Xo
 .Ic set-option Pq Ic set
-.Op Fl aFgoqsuw
+.Op Fl aFgopqsuw
 .Op Fl t Ar target-pane
 .Ar option Oo Ar value Oc
 .Xc
-Set an option. -g global, -s server, -w window, -u unset, -a append, -o only
-if not set yet (global options always are), -q quiet, -F expand formats in
-the value.
+Set an option. -g global, -s server, -w window, -p pane (a window option
+for one pane), -u unset, -a append, -o only if not set yet (global options
+always are), -q quiet, -F expand formats in the value.
 .It Xo
 .Ic set-window-option Pq Ic setw
 .Op Fl aFgoqu
@@ -512,6 +549,17 @@ the value.
 .Ar option Oo Ar value Oc
 .Xc
 Same as set-option -w.
+.It Xo
+.Ic save-buffer Pq Ic saveb
+.Op Fl a
+.Op Fl b Ar buffer-name
+.Ar path
+.Xc
+Write a buffer to
+.Ar path
+(-a appends), relative to the client's directory;
+.Ql -
+writes it to standard output.
 .It Xo
 .Ic show-buffer Pq Ic showb
 .Op Fl b Ar buffer-name
@@ -525,7 +573,7 @@ Print a buffer.
 Print the message log, which includes configuration file errors.
 .It Xo
 .Ic show-options Pq Ic show
-.Op Fl gqsvw
+.Op Fl gpqsvw
 .Op Fl t Ar target-pane
 .Oo Ar option Oc
 .Xc
@@ -621,7 +669,6 @@ commands are recognized and fail with
 .Ic if-shell ,
 .Ic join-pane ,
 .Ic link-window ,
-.Ic load-buffer ,
 .Ic lock-client ,
 .Ic lock-server ,
 .Ic lock-session ,
@@ -631,7 +678,6 @@ commands are recognized and fail with
 .Ic resize-window ,
 .Ic respawn-window ,
 .Ic run-shell ,
-.Ic save-buffer ,
 .Ic server-access ,
 .Ic set-environment ,
 .Ic set-hook ,
@@ -703,6 +749,8 @@ list-keys
 select-layout -E
 .It Li L
 switch-client -l
+.It Li T
+command-prompt -I "#T" { select-pane -T "%%" }
 .It Li \&[
 copy-mode
 .It Li \&]
@@ -862,6 +910,15 @@ refuses to attach while it is set and not empty.
 .It Ev LIF_PANE
 Set in every pane to its pane id, for example
 .Ql %3 .
+.It Ev TMUX , Ev TMUX_PANE
+Set in panes started while the
+.Ic tmux-compat
+option is on, like
+.Ev LIF
+and
+.Ev LIF_PANE ,
+for programs that only know
+.Xr tmux 1 .
 .El
 .Pp
 Programs in panes also get
@@ -871,7 +928,9 @@ Programs in panes also get
 and
 .Ev TERM_PROGRAM_VERSION ;
 .Ev TMUX
-and variables starting with
+(unless
+.Ic tmux-compat
+is on) and variables starting with
 .Li TMUX ,
 .Li LIF
 or

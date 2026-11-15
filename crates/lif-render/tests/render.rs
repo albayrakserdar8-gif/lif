@@ -6,7 +6,7 @@ mod common;
 
 use common::{Rng, Vt, diff, escape, reference};
 use lif_render::{
-    MatchSpan, Message, Renderer, Scene, ScenePane, Selection, SelectionKind, StatusBar, StatusPosition,
+    BorderLabel, MatchSpan, Message, Renderer, Scene, ScenePane, Selection, SelectionKind, StatusBar, StatusPosition,
     Theme,
 };
 use lif_types::{
@@ -96,6 +96,7 @@ fn pane(id: u64, rect: Rect, frame: &PaneFrame, active: bool) -> ScenePane<'_> {
         selection: None,
         matches: &[],
         indicator: None,
+        base: Default::default(),
     }
 }
 
@@ -1113,6 +1114,7 @@ fn run_seed(seed: u64, steps: usize) -> (usize, usize) {
                 selection: p.sel,
                 matches: &p.matches,
                 indicator: p.ind.as_deref(),
+                base: Default::default(),
             })
             .collect();
         let mut scene = Scene::new(Size::new(w.cols, w.rows), &panes);
@@ -1209,4 +1211,52 @@ fn differential_random() {
         total.0,
         SCROLLS.load(std::sync::atomic::Ordering::Relaxed)
     );
+}
+
+#[test]
+fn border_labels_and_pane_base_colors() {
+    // Two panes side by side under a label row (pane-border-status top).
+    let size = Size::new(21, 5);
+    let mut f = PaneFrame::new(Size::new(10, 4));
+    let g = PaneFrame::new(Size::new(10, 4));
+    put(&mut f, 0, 0, "hi", Style::default());
+    put(&mut f, 0, 1, "red", Style { fg: Color::Indexed(1), ..Style::default() });
+    let blue = Style { fg: Color::Indexed(4), bg: Color::Indexed(8), ..Style::default() };
+    let panes = [
+        ScenePane { base: blue, ..pane(1, Rect::new(0, 1, 10, 4), &f, true) },
+        pane(2, Rect::new(11, 1, 10, 4), &g, false),
+    ];
+    let bold = Style { attrs: Attrs::BOLD, fg: Color::Indexed(3), ..Style::default() };
+    let one: StyledLine = vec![Span::new(" lead ".to_string(), bold)];
+    let two: StyledLine = vec![Span::new(" 中x helper-with-a-long-name".to_string(), Style::default())];
+    let labels = [
+        BorderLabel { x: 2, y: 0, width: 6, line: &one },
+        BorderLabel { x: 13, y: 0, width: 6, line: &two },
+    ];
+    let mut scene = single(size, &panes);
+    scene.labels = &labels;
+    let mut r = Renderer::new(full_caps());
+    let mut vt = Vt::new(21, 5);
+    check(&mut r, &mut vt, &scene, full_caps(), "labels");
+    let shot = vt.shot();
+    assert_eq!(shot.row_text(0), "── lead ──┬── 中x h──");
+    assert_eq!(shot.cells[3].style.attrs, Attrs::BOLD);
+    // window-style: default colors take the pane's base, explicit ones stay.
+    assert_eq!(shot.cells[21].style.fg, Color::Indexed(4), "default fg");
+    assert_eq!(shot.cells[2 * 21].style.fg, Color::Indexed(1), "explicit fg");
+    assert_eq!(shot.cells[21 + 5].style.bg, Color::Indexed(8), "blank cell");
+    // A changed label repaints its row; an unchanged scene sends nothing.
+    let one: StyledLine = vec![Span::new(" boss ".to_string(), bold)];
+    let labels = [BorderLabel { x: 2, y: 0, width: 6, line: &one }, labels[1]];
+    scene.labels = &labels;
+    let out = check(&mut r, &mut vt, &scene, full_caps(), "label changed");
+    assert!(!out.is_empty());
+    assert_eq!(vt.shot().row_text(0), "── boss ──┬── 中x h──");
+    let out = check(&mut r, &mut vt, &scene, full_caps(), "same");
+    assert!(out.is_empty(), "{}", escape(&out));
+    // A wide character cut by the label's width becomes a blank.
+    let three: StyledLine = vec![Span::new("abcde中".to_string(), Style::default())];
+    let labels = [BorderLabel { x: 2, y: 0, width: 6, line: &three }];
+    scene.labels = &labels;
+    check(&mut r, &mut vt, &scene, full_caps(), "wide cut");
 }

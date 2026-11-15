@@ -76,6 +76,8 @@ pub(crate) struct PaneRt {
     pub(crate) sync_since: Option<Instant>,
     pub(crate) current_command: String,
     pub(crate) current_path: String,
+    /// The directory the program reported with OSC 7, as a path.
+    pub(crate) osc7_path: String,
     pub(crate) name_checked: Option<Instant>,
     /// One more name check after the last frame that showed this pane's
     /// window in a status line: catches a program that started right after.
@@ -113,6 +115,12 @@ pub(crate) struct PaneRt {
     pub(crate) input_at: Option<Instant>,
     /// Output read since then.
     pub(crate) echo_bytes: usize,
+    /// tmux passthrough unwrapping, while `allow-passthrough` or
+    /// `tmux-compat` is on for the pane (see `Server::sync_views`).
+    pub(crate) passthrough: Option<Box<crate::passthrough::Unwrap>>,
+    /// Window-style colors for the pane's default colors (`window-style`,
+    /// `window-active-style`), from its options.
+    pub(crate) base_style: lif_types::Style,
 }
 
 /// The engine limits for the `scrollback-bytes` and `history-limit`
@@ -155,6 +163,7 @@ impl PaneRt {
             sync_since: None,
             current_command: String::new(),
             current_path: String::new(),
+            osc7_path: String::new(),
             name_checked: None,
             name_recheck: None,
             output_seen: false,
@@ -173,6 +182,8 @@ impl PaneRt {
             echo_credit: false,
             input_at: None,
             echo_bytes: 0,
+            passthrough: None,
+            base_style: lif_types::Style::default(),
         }
     }
 
@@ -247,7 +258,13 @@ impl PaneRt {
                 }
             }
             if filled > 0 {
-                self.engine.feed(&buf[..filled]);
+                match self.passthrough.as_mut() {
+                    Some(u) => {
+                        let engine = &mut self.engine;
+                        u.feed(&buf[..filled], &mut |b| engine.feed(b));
+                    }
+                    None => self.engine.feed(&buf[..filled]),
+                }
                 res.bytes += filled;
             }
             if stop {
@@ -292,5 +309,46 @@ impl PaneRt {
     pub(crate) fn with_mode<R>(&mut self, f: impl FnOnce(&mut dyn PaneMode, &mut ModeCtx<'_>) -> R) -> Option<R> {
         let m = self.mode.as_deref_mut()?;
         Some(f(m, &mut ModeCtx { engine: &mut self.engine }))
+    }
+}
+
+/// The path of an OSC 7 `file://host/path` URL, percent-decoded; text that
+/// is not such a URL is taken as a path already.
+pub(crate) fn file_url_path(url: &str) -> String {
+    let Some(rest) = url.strip_prefix("file://") else { return url.to_string() };
+    let path = match rest.find('/') {
+        Some(i) => &rest[i..],
+        None => return String::new(),
+    };
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::file_url_path;
+
+    #[test]
+    fn osc7_urls_become_paths() {
+        assert_eq!(file_url_path("file://host/tmp"), "/tmp");
+        assert_eq!(file_url_path("file:///Users/a/My%20Dir/%C3%A7"), "/Users/a/My Dir/ç");
+        assert_eq!(file_url_path("file://host/a%2"), "/a%2");
+        assert_eq!(file_url_path("/already/a/path"), "/already/a/path");
+        assert_eq!(file_url_path("file://hostonly"), "");
     }
 }

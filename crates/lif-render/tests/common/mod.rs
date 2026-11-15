@@ -323,6 +323,15 @@ pub fn reference(scene: &Scene<'_>, caps: OuterCaps) -> Shot {
                         current |= m.current;
                     }
                 }
+                let based = |mut st: Style| {
+                    if st.fg == lif_types::Color::Default {
+                        st.fg = p.base.fg;
+                    }
+                    if st.bg == lif_types::Color::Default {
+                        st.bg = p.base.bg;
+                    }
+                    st
+                };
                 let sel_or = |st: Style| {
                     if selected {
                         scene.theme.selection
@@ -335,7 +344,7 @@ pub fn reference(scene: &Scene<'_>, caps: OuterCaps) -> Shot {
                     }
                 };
                 let Some(cell) = cell else {
-                    g[y * cols + x] = ECell::styled_blank(sel_or(Style::default()));
+                    g[y * cols + x] = ECell::styled_blank(sel_or(based(Style::default())));
                     x += 1;
                     continue;
                 };
@@ -368,7 +377,7 @@ pub fn reference(scene: &Scene<'_>, caps: OuterCaps) -> Shot {
                 } else {
                     None
                 };
-                let style = sel_or(cell.style);
+                let style = sel_or(based(cell.style));
                 match cell.width {
                     CellWidth::Narrow => {
                         g[y * cols + x] = ECell {
@@ -483,6 +492,28 @@ pub fn reference(scene: &Scene<'_>, caps: OuterCaps) -> Shot {
                 style,
                 link: None,
             };
+        }
+    }
+    // Border labels: on border cells only, never half a wide character.
+    for l in scene.labels {
+        let (lx, y) = (l.x as usize, l.y as usize);
+        if y >= rows || lx >= cols {
+            continue;
+        }
+        let spans: Vec<(String, Style)> = l.line.iter().map(|s| (s.text.clone(), s.style)).collect();
+        let cells = ui_text(&spans, (l.width as usize).min(cols - lx));
+        let n = cells.len();
+        for (k, c) in cells.into_iter().enumerate() {
+            let x = lx + k;
+            if !is_border(x as isize, y as isize) {
+                continue;
+            }
+            let whole = match c.wide {
+                1 => k + 1 < n && is_border(x as isize + 1, y as isize),
+                2 => k > 0 && is_border(x as isize - 1, y as isize),
+                _ => true,
+            };
+            g[y * cols + x] = if whole { c } else { ECell::styled_blank(c.style) };
         }
     }
     // Status line or message.

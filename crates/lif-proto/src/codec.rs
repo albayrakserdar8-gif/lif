@@ -205,6 +205,7 @@ impl ClientMsg {
                 }
             }),
             ClientMsg::Input(b) => frame(out, type_id::INPUT, |o| put_bytes(o, b)),
+            ClientMsg::Stdin(b) => frame(out, type_id::STDIN, |o| put_bytes(o, b)),
             ClientMsg::Resize { size, pixels } => frame(out, type_id::RESIZE, |o| {
                 put_size(o, *size);
                 put_pixels(o, *pixels);
@@ -240,6 +241,7 @@ impl ClientMsg {
             }),
             type_id::COMMAND => ClientMsg::Command { argv: r.opt(|r| r.vec(4, Reader::string))? },
             type_id::INPUT => ClientMsg::Input(r.opt(|r| r.bytes().map(<[u8]>::to_vec))?),
+            type_id::STDIN => ClientMsg::Stdin(r.opt(|r| r.bytes().map(<[u8]>::to_vec))?),
             type_id::RESIZE => ClientMsg::Resize { size: r.opt(Reader::size)?, pixels: r.opt(Reader::pixels)? },
             type_id::DETACH => ClientMsg::Detach,
             type_id::USE_TTY => ClientMsg::UseTty { path: r.opt(Reader::string)?, dev: r.opt(Reader::u64)? },

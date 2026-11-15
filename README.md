@@ -103,7 +103,7 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
 
 ## Same as tmux
 
-- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (61 of
+- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (62 of
   tmux's 93 default prefix bindings are identical; the rest are listed in the
   migration guide). The copy-mode tables (`copy-mode`, `copy-mode-vi`) are
   tmux 3.8's, minus the mouse entries and emacs `L`.
@@ -116,9 +116,10 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   comparisons and the common modifiers (`=N`, `pN`, `t:`, `b:`, `d:`, `l:`,
   `E:`, `T:`, `q:`, `n:`, `w:`, `s/a/b/:`, `m:`, `e|op|:`) and
   strftime in the status line.
-- Option names, scopes (`-s`, `-g`, `-w`, per session and window) and the
-  defaults of the 60 tmux options lif has (except `escape-time` and
-  `history-limit`, see below), plus user options (`@name`).
+- Option names, scopes (`-s`, `-g`, `-w`, `-p`, per session, window and
+  pane) and the defaults of the 67 tmux options lif has (except
+  `escape-time`, `history-limit` and `pane-border-format`), plus user
+  options (`@name`).
 - Layouts: `even-horizontal`, `even-vertical`, `main-horizontal`,
   `main-vertical`, their `-mirrored` variants, `tiled`, and tmux layout
   strings in `#{window_layout}`.
@@ -167,6 +168,16 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   triple click copies and leaves copy mode), but mouse events cannot be bound.
   The `mouse-drag-end` option replaces rebinding `MouseDragEnd1Pane`.
 
+## Claude Code
+
+Claude Code runs in a lif pane without configuration: Shift+Enter,
+synchronized output, OSC 52 copying, notifications and true color pass
+through. Its agent teams can open their teammates in lif panes as they do in
+tmux: `lif install-tmux-shim` and `tmux-compat = true` make lif answer for
+`tmux` inside lif panes, with pane options, border titles
+(`pane-border-status`), `select-pane -T` and `load-buffer -w -`. See
+[docs/claude-code.md](docs/claude-code.md).
+
 ## Not implemented
 
 Checked against the command table and by running each one (they fail with
@@ -181,12 +192,10 @@ Checked against the command table and by running each one (they fail with
   `customize-mode`, `find-window`, `clock-mode`, `switch-mode`.
 - Session groups and linked windows (`new-session -t`, `link-window`,
   `unlink-window`), `join-pane`, `resize-window`, `respawn-window`.
-- Environment commands (`set-environment`, `show-environment`), buffers to and
-  from files (`load-buffer`, `save-buffer`), `clear-history`, locking,
-  `server-access`, prompt history.
-- Control mode (`-C`), marked panes, synchronized panes, pane titles set by
-  `select-pane -T`, pane options (`set -p`), most of tmux's 204 options (lif
-  has 60 of them, plus 2 of its own).
+- Environment commands (`set-environment`, `show-environment`),
+  `clear-history`, locking, `server-access`, prompt history.
+- Control mode (`-C`), marked panes, synchronized panes, most of tmux's 204
+  options (lif has 67 of them, plus 3 of its own).
 - Images (sixel, kitty graphics), plugins (TPM and anything that needs
   `run-shell`), Windows.
 

@@ -125,6 +125,12 @@ pub(crate) struct Attached {
     /// The last left click on a pane not in a mode: (pane, cell, time in
     /// ms, clicks so far), for double and triple clicks.
     pub(crate) clicks: Option<(PaneId, lif_types::Pos, u64, u8)>,
+    /// Pane border lines (`pane-border-status`): x, y, width, text.
+    pub(crate) labels: Vec<(u16, u16, u16, StyledLine)>,
+    /// The labels must be recomputed before the next frame.
+    pub(crate) labels_stale: bool,
+    /// The title last set on the outer terminal (`set-titles`).
+    pub(crate) title: Option<String>,
 }
 
 /// Why an attached client's terminal is left alone.
@@ -266,6 +272,8 @@ pub(crate) struct ClientRt {
     pub(crate) token: Token,
     pub(crate) dec: Decoder<ClientMsg>,
     pub(crate) hello: Option<Hello>,
+    /// `Stdin` sent for the next command.
+    pub(crate) stdin: Option<Vec<u8>>,
     /// Protocol bytes for the socket; `out[out_pos..]` is unsent.
     pub(crate) out: Vec<u8>,
     out_pos: usize,
@@ -291,6 +299,7 @@ impl ClientRt {
     pub(crate) fn new(id: ClientId, stream: mio::net::UnixStream, token: Token, peer: crate::sys::PeerCred) -> Self {
         ClientRt {
             id,
+            stdin: None,
             stream,
             token,
             dec: Decoder::new(),

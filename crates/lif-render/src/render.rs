@@ -4,11 +4,11 @@ use crate::cell::{DEFAULT_STYLE, RCell, W, hash_cells, same, style_eq};
 use crate::esc::{Sink, csi_n, num};
 use crate::layout::{self, ACTIVE, CHROME, PANE, glyph_of, is_border};
 use crate::moves::move_cursor;
-use crate::scene::{LinkLookup, MatchSpan, Scene, Selection, StatusPosition, Theme};
+use crate::scene::{BorderLabel, LinkLookup, MatchSpan, Scene, Selection, StatusPosition, Theme};
 use crate::sgr::{self, Norm};
 use crate::text;
 use lif_types::{
-    Cell, CellWidth, Cursor, CursorShape, FrameRow, OuterCaps, Rect, Size, Style, StyledLine,
+    Cell, CellWidth, Color, Cursor, CursorShape, FrameRow, OuterCaps, Rect, Size, Style, StyledLine,
 };
 use std::collections::HashMap;
 
@@ -598,6 +598,24 @@ struct Track {
     matches: Vec<MatchSpan>,
     has_ind: bool,
     ind: String,
+    base: Style,
+}
+
+/// A border label as last drawn, laid out into cells once.
+#[derive(Default)]
+struct Label {
+    x: u16,
+    y: u16,
+    width: u16,
+    line: StyledLine,
+    cells: Vec<RCell>,
+    arena: String,
+}
+
+impl Label {
+    fn matches(&self, l: &BorderLabel<'_>) -> bool {
+        self.x == l.x && self.y == l.y && self.width == l.width && self.line == *l.line
+    }
 }
 
 impl Track {
@@ -630,6 +648,7 @@ struct Comp<'r, 's> {
     carena: &'r str,
     ind: &'r mut Vec<RCell>,
     iarena: &'r mut String,
+    labels: &'r [Label],
 }
 
 /// Compose screen row `y`, columns `a..b`, into `dst[x - base]`.
@@ -674,6 +693,26 @@ fn compose(
                 ..RCell::BLANK
             };
             dst[x - base..e - base].fill(cell);
+            for l in c.labels.iter().filter(|l| l.y as usize == y) {
+                let (lx, lw) = (l.x as usize, l.cells.len());
+                for i in x.max(lx)..e.min(lx + lw) {
+                    let mut cell = l.cells[i - lx];
+                    // Half a wide character (the other half is off the
+                    // border or the label): a blank.
+                    let whole = match cell.w {
+                        W::Wide => i + 1 < lx + lw && is_border(c.owner[row + i + 1]),
+                        W::Tail => i > lx && is_border(c.owner[row + i - 1]),
+                        _ => true,
+                    };
+                    if !whole {
+                        cell = RCell { style: cell.style, ..RCell::BLANK };
+                    } else if let Some(t) = cell.text(&l.arena) {
+                        cell.off = arena.len() as u32;
+                        arena.push_str(t);
+                    }
+                    dst[i - base] = cell;
+                }
+            }
         } else {
             dst[x - base..e - base].fill(RCell::BLANK);
         }
@@ -789,6 +828,17 @@ fn pane_run(
                     ..RCell::BLANK
                 };
                 x += 1;
+            }
+        }
+    }
+    if p.base != Style::default() {
+        let (fg, bg) = (p.base.fg, p.base.bg);
+        for d in &mut dst[x0 - base..x1 - base] {
+            if d.style.fg == Color::Default {
+                d.style.fg = fg;
+            }
+            if d.style.bg == Color::Default {
+                d.style.bg = bg;
             }
         }
     }
@@ -951,6 +1001,7 @@ pub struct Renderer {
     mh: Vec<u64>,
     ind: Vec<RCell>,
     iarena: String,
+    labels: Vec<Label>,
 }
 
 impl Renderer {
@@ -988,6 +1039,7 @@ impl Renderer {
             mh: Vec::new(),
             ind: Vec::new(),
             iarena: String::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -1087,6 +1139,7 @@ impl Renderer {
         }
         self.update_chrome(scene);
         self.update_overlays(scene);
+        self.update_labels(scene);
 
         if self.scroll_opt {
             for i in 0..self.tracks.len() {
@@ -1140,7 +1193,7 @@ impl Renderer {
             && scene.chrome_row() == self.chrome
             && scene.panes.len() == self.tracks.len()
             && scene.panes.iter().zip(&self.tracks).all(|(p, t)| {
-                p.id == t.id && p.rect == t.rect && p.frame.size == t.fsize && p.active == t.active
+                p.id == t.id && p.rect == t.rect && p.frame.size == t.fsize && p.active == t.active && p.base == t.base
             })
     }
 
@@ -1168,6 +1221,7 @@ impl Renderer {
             t.matches.clear();
             t.has_ind = false;
             t.ind.clear();
+            t.base = p.base;
         }
         self.row_stale.fill(true);
         self.any_row_stale = true;
@@ -1258,6 +1312,32 @@ impl Renderer {
         }
     }
 
+    /// Lay out border labels that changed and mark the rows they cover, old
+    /// and new, for repainting.
+    fn update_labels(&mut self, scene: &Scene<'_>) {
+        if self.labels.len() == scene.labels.len() && self.labels.iter().zip(scene.labels).all(|(a, b)| a.matches(b)) {
+            return;
+        }
+        for l in &self.labels {
+            mark_row(&mut self.row_stale, &mut self.any_row_stale, l.y);
+        }
+        self.labels.truncate(scene.labels.len());
+        self.labels.resize_with(scene.labels.len(), Label::default);
+        for (l, s) in self.labels.iter_mut().zip(scene.labels) {
+            mark_row(&mut self.row_stale, &mut self.any_row_stale, s.y);
+            (l.x, l.y, l.width) = (s.x, s.y, s.width);
+            l.line.clone_from(s.line);
+            l.cells.clear();
+            l.arena.clear();
+            let width = (s.width as usize).min(self.o.cols.saturating_sub(s.x as usize));
+            text::layout_spans(text::line_spans(s.line), width, None, &mut l.cells, &mut l.arena);
+            for c in &mut l.cells {
+                self.norm.style(&mut c.style);
+                c.normalize_blank();
+            }
+        }
+    }
+
     fn build_chrome(&mut self, scene: &Scene<'_>) {
         self.crow.clear();
         self.carena.clear();
@@ -1292,6 +1372,7 @@ impl Renderer {
             carena: &self.carena,
             ind: &mut self.ind,
             iarena: &mut self.iarena,
+            labels: &self.labels,
         };
         compose(&mut c, y, a, b, &mut self.drow, 0, &mut self.darena);
     }
@@ -1333,6 +1414,7 @@ impl Renderer {
                 carena: &self.carena,
                 ind: &mut self.ind,
                 iarena: &mut self.iarena,
+                labels: &self.labels,
             };
             for py in 0..h {
                 let dst = &mut self.pbuf[py * w..(py + 1) * w];
@@ -1427,5 +1509,12 @@ impl Renderer {
             }
         }
         self.tracks[i].clear();
+    }
+}
+
+fn mark_row(rows: &mut [bool], any: &mut bool, y: u16) {
+    if let Some(r) = rows.get_mut(y as usize) {
+        *r = true;
+        *any = true;
     }
 }

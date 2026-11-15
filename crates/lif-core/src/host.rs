@@ -81,6 +81,8 @@ pub struct SpawnSpec {
     /// The pane already exists and this replaces its process
     /// (`respawn-pane`); keep the terminal and its scrollback.
     pub respawn: bool,
+    /// The `tmux-compat` option: give the pane `TMUX` and `TMUX_PANE`.
+    pub tmux_compat: bool,
 }
 
 /// Input for the program in a pane.
@@ -354,6 +356,32 @@ pub trait Host {
     /// runs the commands and reports what failed.
     fn read_config(&mut self, path: &str) -> Result<ConfigFile, ConfigError> {
         Err(ConfigError::Invalid(format!("{path}: configuration files are not supported here")))
+    }
+
+    /// The standard input the client sent with the command being run
+    /// (`load-buffer -`), taken once; `None` if it sent none.
+    fn command_stdin(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// `load-buffer`: the contents of `path`, relative to the directory of
+    /// `client` (or the server's) when not absolute.
+    fn read_file(&mut self, client: Option<ClientId>, path: &str) -> Result<Vec<u8>, String> {
+        let _ = client;
+        Err(format!("{path}: files are not supported here"))
+    }
+
+    /// `save-buffer`: write (or append) `data` to `path`, resolved as in
+    /// [`Host::read_file`].
+    fn write_file(&mut self, client: Option<ClientId>, path: &str, data: &[u8], append: bool) -> Result<(), String> {
+        let _ = (client, data, append);
+        Err(format!("{path}: files are not supported here"))
+    }
+
+    /// Set the clipboard of every attached terminal to `data` (OSC 52), as
+    /// copying does (`load-buffer -w`).
+    fn set_clipboard(&mut self, data: &[u8]) {
+        let _ = data;
     }
 
     /// Show `text` on `client`'s status line for `duration_ms` (0: until the

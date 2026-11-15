@@ -89,6 +89,8 @@ pub(crate) struct Rt {
     /// Keys `send-keys` sent to a pane in a mode whose binding is commands
     /// (`ModeAction::Binding`): run after the model call, which they need.
     pub(crate) mode_bindings: Vec<(PaneId, lif_types::KeyEvent)>,
+    /// Standard input the client sent with the command being run.
+    pub(crate) cmd_stdin: Option<Vec<u8>>,
     /// `copy-pipe` commands still being fed, by id (`PIPE_TOKEN | id`).
     pub(crate) pipes: HashMap<u32, crate::pipe::PipeJob>,
     pub(crate) next_pipe: u32,
@@ -137,6 +139,7 @@ impl Rt {
             startup_message: None,
             escape_time: lif_input::DEFAULT_ESC_TIMEOUT,
             mode_bindings: Vec::new(),
+            cmd_stdin: None,
             pipes: HashMap::new(),
             next_pipe: 0,
             fd_limit: 0,
@@ -427,6 +430,17 @@ impl Rt {
         }
     }
 
+    /// `path` relative to the directory of the client that ran the command
+    /// (as tmux resolves `load-buffer` and `save-buffer` paths).
+    fn client_path(&self, client: Option<ClientId>, path: &str) -> PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        let cwd = client.and_then(|c| self.clients.get(&c)).and_then(|c| c.hello.as_ref()).map(|h| h.cwd.as_str()).unwrap_or("");
+        if cwd.is_empty() { p.to_path_buf() } else { std::path::Path::new(cwd).join(p) }
+    }
+
     fn pane_env(&self, spec: &SpawnSpec) -> Vec<(OsString, OsString)> {
         let mut env: Vec<(OsString, OsString)> = Vec::new();
         let from_client = spec.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.hello.as_ref()).map(|h| &h.env);
@@ -451,6 +465,12 @@ impl Rt {
         set("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION").into());
         set("LIF", format!("{},{},{}", self.socket, self.server_pid, spec.session.0));
         set("LIF_PANE", spec.pane.to_string());
+        if spec.tmux_compat {
+            // What tmux sets, pointing at lif's socket: programs that only
+            // know tmux run `tmux` (lif, see `install-tmux-shim`) with it.
+            set("TMUX", format!("{},{},{}", self.socket, self.server_pid, spec.session.0));
+            set("TMUX_PANE", spec.pane.to_string());
+        }
         if let SpawnCommand::LoginShell { shell } = &spec.command {
             set("SHELL", shell.clone());
         }
@@ -499,6 +519,9 @@ impl Rt {
             mode_drag: None,
             mouse_press: None,
             clicks: None,
+            labels: Vec::new(),
+            labels_stale: true,
+            title: None,
         });
         if let Some(text) = self.startup_message.take() {
             att.message = Some(Message { line: vec![Span::new(text, att.msg_style)], expires: None });
@@ -560,6 +583,46 @@ fn exit_message(reason: &DetachReason) -> (ExitReason, String) {
 impl Host for Rt {
     fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
         self.suspend(client)
+    }
+
+    fn command_stdin(&mut self) -> Option<Vec<u8>> {
+        self.cmd_stdin.take()
+    }
+
+    fn read_file(&mut self, client: Option<ClientId>, path: &str) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let full = self.client_path(client, path);
+        let f = std::fs::File::open(&full).map_err(|e| format!("{path}: {}", io_text(&e)))?;
+        let mut data = Vec::new();
+        // A buffer bigger than a protocol frame could not be shown or saved.
+        f.take(lif_proto::MAX_PAYLOAD as u64 + 1).read_to_end(&mut data).map_err(|e| format!("{path}: {}", io_text(&e)))?;
+        if data.len() > lif_proto::MAX_PAYLOAD {
+            return Err(format!("{path}: file too large"));
+        }
+        Ok(data)
+    }
+
+    fn write_file(&mut self, client: Option<ClientId>, path: &str, data: &[u8], append: bool) -> Result<(), String> {
+        use std::io::Write;
+        let full = self.client_path(client, path);
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true);
+        if append {
+            o.append(true);
+        } else {
+            o.write(true).truncate(true);
+        }
+        o.open(&full).and_then(|mut f| f.write_all(data)).map_err(|e| format!("{path}: {}", io_text(&e)))
+    }
+
+    fn set_clipboard(&mut self, data: &[u8]) {
+        let mut seq = String::from("\x1b]52;c;");
+        crate::input::base64(data, &mut seq);
+        seq.push_str("\x1b\\");
+        let attached: Vec<ClientId> = self.clients.values().filter(|c| c.att.is_some()).map(|c| c.id).collect();
+        for c in attached {
+            self.send_output(c, seq.as_bytes());
+        }
     }
 
     fn spawn_pane(&mut self, spec: &SpawnSpec) -> Result<(), String> {
@@ -718,7 +781,7 @@ impl Host for Rt {
 
     fn pane_info(&self, pane: PaneId) -> PaneInfo<'_> {
         let Some(p) = self.panes.get(&pane) else { return PaneInfo::default() };
-        let path = if p.current_path.is_empty() { p.engine.pwd() } else { p.current_path.as_str() };
+        let path = if p.current_path.is_empty() { p.osc7_path.as_str() } else { p.current_path.as_str() };
         PaneInfo {
             pid: p.pid,
             title: p.engine.title(),
@@ -1002,4 +1065,14 @@ pub(crate) fn read_config(path: &str) -> Result<ConfigFile, ConfigError> {
     let commands = cfg.commands.iter().map(|e| (e.command.clone(), format!("{name}:{}:{}", e.line, e.column))).collect();
     let diagnostics = cfg.diagnostics.iter().map(|d| (d.severity == lif_config::Severity::Error, format!("{name}:{d}"))).collect();
     Ok(ConfigFile { commands, diagnostics })
+}
+
+/// An I/O error as tmux prints it: the OS's message without Rust's
+/// "(os error N)".
+fn io_text(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
 }

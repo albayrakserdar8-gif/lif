@@ -24,6 +24,8 @@ fn client_msgs() -> Vec<ClientMsg> {
         ClientMsg::Hello(Hello::default()),
         ClientMsg::Command { argv: vec!["new-session".into(), "-s".into(), "work".into(), String::new()] },
         ClientMsg::Command { argv: vec![] },
+        ClientMsg::Stdin(b"piped\x00bytes".to_vec()),
+        ClientMsg::Stdin(Vec::new()),
         ClientMsg::Input(b"\x1b[A\x00\xff hello".to_vec()),
         ClientMsg::Input(vec![]),
         ClientMsg::Resize { size: Size::new(80, 24), pixels: PixelSize { width: 640, height: 480 } },

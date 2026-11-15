@@ -68,7 +68,7 @@ accepted without changing anything are listed in
 | `list-panes` (`lsp`) | supported with differences | no `-O`, `-r` |
 | `list-sessions` (`ls`) | supported with differences | no `-O`, `-r` |
 | `list-windows` (`lsw`) | supported with differences | no `-O`, `-r` |
-| `load-buffer` (`loadb`) | not supported | |
+| `load-buffer` (`loadb`) | supported with differences | has `-b`, `-w` and `-` (standard input, at most 16 MiB); `-t` changes nothing |
 | `lock-client` (`lockc`) | not supported | |
 | `lock-server` (`lock`) | not supported | |
 | `lock-session` (`locks`) | not supported | |
@@ -92,9 +92,9 @@ accepted without changing anything are listed in
 | `respawn-window` (`respawnw`) | not supported | |
 | `rotate-window` (`rotatew`) | supported | |
 | `run-shell` (`run`) | not supported | |
-| `save-buffer` (`saveb`) | not supported | |
+| `save-buffer` (`saveb`) | supported | `-` writes to standard output |
 | `select-layout` (`selectl`) | supported | |
-| `select-pane` (`selectp`) | supported with differences | no `-d`, `-e` (input on/off), `-m`, `-M` (marked pane), `-T` (title) |
+| `select-pane` (`selectp`) | supported with differences | no `-d`, `-e` (input on/off), `-m`, `-M` (marked pane); `-T` takes the title literally (no format expansion) |
 | `select-window` (`selectw`) | supported | |
 | `send-keys` (`send`) | supported with differences | no `-c`, `-K`, `-M` |
 | `send-prefix` | supported | |
@@ -102,13 +102,13 @@ accepted without changing anything are listed in
 | `set-buffer` (`setb`) | supported with differences | no `-t`, `-w` |
 | `set-environment` (`setenv`) | not supported | |
 | `set-hook` | not supported | |
-| `set-option` (`set`) | supported with differences | only the options listed below; no `-p` (pane options), `-U` |
+| `set-option` (`set`) | supported with differences | only the options listed below; no `-U`. `-p` sets window options per pane, as in tmux; the ones a pane's value changes are `remain-on-exit`, `allow-passthrough`, `window-style`, `window-active-style`, `pane-border-format` and the border styles of its `pane-border-status` line (border lines themselves keep the window's style) |
 | `set-window-option` (`setw`) | supported | |
 | `show-buffer` (`showb`) | supported | |
 | `show-environment` (`showenv`) | not supported | |
 | `show-hooks` | not supported | |
 | `show-messages` (`showmsgs`) | supported | |
-| `show-options` (`show`) | supported with differences | no `-A`, `-F`, `-H`, `-p` |
+| `show-options` (`show`) | supported with differences | no `-A`, `-F`, `-H` |
 | `show-prompt-history` (`showphist`) | not supported | |
 | `show-window-options` (`showw`) | supported with differences | no `-F` |
 | `source-file` (`source`) | supported with differences | reads lif TOML files only; a `.conf` file or a file of tmux commands is refused with a pointer to `lif migrate-tmux-conf` |
@@ -123,8 +123,9 @@ accepted without changing anything are listed in
 | `unlink-window` (`unlinkw`) | not supported | |
 | `wait-for` (`wait`) | not supported | |
 
-The three commands `check-config`, `print-config` and `migrate-tmux-conf`
+The commands `check-config`, `print-config` and `migrate-tmux-conf`
 are lif's own; they run without a server (see [configuration.md](configuration.md)).
+So is `install-tmux-shim [dir]` (see [claude-code.md](claude-code.md)).
 
 ### Flags accepted without effect
 
@@ -143,8 +144,8 @@ behaves (or something lif does not have):
 
 ## Default prefix key table
 
-Prefix `C-b` in both. 61 bindings are identical, 7 differ (6 only in
-form, plus `?`), and 25 tmux bindings have no lif equivalent (they use
+Prefix `C-b` in both. 62 bindings are identical, 7 differ (6 only in
+form, plus `?`), and 24 tmux bindings have no lif equivalent (they use
 commands or flags lif lacks). Mouse
 bindings are not in lif's tables at all (see [Mouse](#mouse)). Long tmux
 commands are cut at 70 characters.
@@ -189,7 +190,7 @@ commands are cut at 70 characters.
 | `E` | `select-layout -E` | `select-layout -E` | same |
 | `L` | `switch-client -l` | `switch-client -l` | same |
 | `M` | `select-pane -M` |  | missing in lif |
-| `T` | `command-prompt -I "#T" { select-pane -T "%%" }` |  | missing in lif |
+| `T` | `command-prompt -I "#T" { select-pane -T "%%" }` | `command-prompt -I "#T" { select-pane -T "%%" }` | same |
 | `[` | `copy-mode` | `copy-mode` | same |
 | `]` | `paste-buffer -p` | `paste-buffer -p` | same |
 | `c` | `new-window` | `new-window` | same |
@@ -255,10 +256,10 @@ The copy-mode tables are compared in [copy-mode.md](copy-mode.md#differences-fro
 
 ## Options
 
-lif has 62 options: 60 with tmux's names, scopes and (except for colors that
-tmux 3.8 expresses with theme colors, and `escape-time` and `history-limit`)
-tmux 3.8's defaults, plus two of its own, `scrollback-bytes` and
-`mouse-drag-end`. `set-option`, `set-window-option`, `show-options`
+lif has 70 options: 67 with tmux's names, scopes and (except for colors that
+tmux 3.8 expresses with theme colors, `pane-border-format`, and
+`escape-time` and `history-limit`) tmux 3.8's defaults, plus three of its
+own, `scrollback-bytes`, `mouse-drag-end` and `tmux-compat`. `set-option`, `set-window-option`, `show-options`
 and `show-window-options` work on them as in tmux, including `-g`, `-s`,
 `-w`, `-t`, `-u`, `-a`, `-q`, `-F` and toggling a flag by leaving
 out the value. User options (`@name`) can be set and read in formats.
@@ -267,6 +268,7 @@ silences it).
 
 | Option | Scope | Values | Default | config.toml key |
 |---|---|---|---|---|
+| `allow-passthrough` | window | one of: off, on, all | `off` | `allow-passthrough` |
 | `automatic-rename` | window | on/off | `on` | `automatic-rename` |
 | `automatic-rename-format` | window | string | `#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}` | `automatic-rename-format` |
 | `base-index` | session | number | `0` | `base-index` |
@@ -297,6 +299,8 @@ silences it).
 | `other-pane-width` | window | cells or N% | `0` | `other-pane-width` |
 | `pane-active-border-style` | window | string | `fg=green` | `[theme] active-border` |
 | `pane-base-index` | window | number | `0` | `pane-base-index` |
+| `pane-border-format` | window | string | `#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"` (tmux adds mouse buttons) | `pane-border-format` |
+| `pane-border-status` | window | one of: off, top, bottom | `off` | `pane-border-status` |
 | `pane-border-style` | window | string | `default` | `[theme] border` |
 | `prefix` | session | key | `C-b` | `prefix` |
 | `prefix2` | session | key | `None` | `prefix2` |
@@ -305,6 +309,8 @@ silences it).
 | `repeat-time` | session | number | `500` | `repeat-time` |
 | `scrollback-bytes` (lif only) | session | number (bytes) | `10485760` | `scrollback` |
 | `set-clipboard` | server | one of: off, external, on | `external` | `set-clipboard` |
+| `set-titles` | session | on/off | `off` | `set-titles` |
+| `set-titles-string` | session | string | `#S:#I:#W - "#T"` | `set-titles-string` |
 | `status` | session | one of: off, on | `on` | `[status] enabled` |
 | `status-interval` | session | number | `15` | `[status] interval` |
 | `status-justify` | session | one of: left, centre, right, absolute-centre | `left` | `[status] justify` |
@@ -317,7 +323,9 @@ silences it).
 | `status-right-style` | session | string | `default` | `[theme] status-right` |
 | `status-style` | session | string | `bg=green,fg=black` | `[theme] status` |
 | `tiled-layout-max-columns` | window | number | `0` | `tiled-layout-max-columns` |
+| `tmux-compat` (lif only) | server | on/off | `off` | `tmux-compat` |
 | `visual-bell` | session | one of: off, on, both | `off` | `visual-bell` |
+| `window-active-style` | window | string | `default` | `[theme] active-pane` |
 | `window-size` | window | one of: largest, smallest, manual, latest | `latest` | `window-size` |
 | `window-status-activity-style` | window | string | `reverse` | `[theme] activity` |
 | `window-status-bell-style` | window | string | `reverse` | `[theme] bell` |
@@ -327,17 +335,23 @@ silences it).
 | `window-status-last-style` | window | string | `default` | `[theme] last-window` |
 | `window-status-separator` | window | string | ` ` | `[status] separator` |
 | `window-status-style` | window | string | `default` | `[theme] window` |
+| `window-style` | window | string | `default` | `[theme] pane` |
 | `word-separators` | session | string | `` !"#$%&'()*+,-./:;<=>?@[\]^`{\|}~ `` | `word-separators` |
 | `wrap-search` | window | on/off | `on` | `wrap-search` |
 
 Some tmux options people often set and lif does not have: `default-terminal`,
 `terminal-overrides`, `terminal-features`, `focus-events`,
-`allow-passthrough`, `update-environment`, `set-titles`,
-`synchronize-panes`, `pane-border-status`, `pane-border-format`,
+`extended-keys`, `update-environment`, `synchronize-panes`,
 `status-keys`, `aggressive-resize`, `allow-rename`, `message-command-style`,
-`window-style`/`window-active-style`, `clock-mode-*`, `lock-*`. The
-behavior several of these exist to turn on (true color, focus events, OSC 52,
-titles) is on or automatic in lif.
+`clock-mode-*`, `lock-*`. The behavior several of these exist to turn on
+(true color, focus events, extended keys, OSC 52) is on or automatic in lif.
+
+`allow-passthrough` unwraps tmux's `ESC P tmux; ... ESC \` wrapper and hands
+the wrapped sequence to the pane's terminal, so what lif passes on anyway
+(OSC 52, notifications) reaches the outer terminal; other wrapped sequences
+are not written to it raw. `all` is the same as `on`. `pane-border-status`
+takes one row from the window, as in tmux, and draws each pane's
+`pane-border-format` on its border, two cells in from each end.
 
 ## Format variables
 

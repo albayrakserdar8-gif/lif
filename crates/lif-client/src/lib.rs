@@ -17,5 +17,5 @@ mod term;
 
 pub use attach::{attach_loop, attach_loop_with, ExitCause, ExitInfo, TermFds};
 pub use term::FALLBACK_RESTORE;
-pub use conn::{connect, connect_with, hello_from_env, run_command, CommandOutcome, Connection, ServerInfo, ENV_ALLOW_LIST};
+pub use conn::{connect, connect_with, hello_from_env, run_command, CommandOutcome, Connection, ServerInfo, ENV_ALLOW_LIST, STDIN_LIMIT};
 pub use path::{default_socket_path, resolve_socket_path, secure_dir, socket_from_lif_env, SocketPath};

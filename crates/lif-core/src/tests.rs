@@ -35,6 +35,12 @@ struct TestHost {
     hangups: Vec<ClientId>,
     /// spawn_pane and kill_pane calls in order, for the fuzz test.
     events: Vec<ProcEvent>,
+    /// What `command_stdin` returns (taken once).
+    stdin: Option<Vec<u8>>,
+    /// The files `read_file` and `write_file` see.
+    files: HashMap<String, Vec<u8>>,
+    /// Data given to `set_clipboard`.
+    clipboard: Vec<Vec<u8>>,
 }
 
 impl Host for TestHost {
@@ -105,6 +111,23 @@ impl Host for TestHost {
         self.bells.push(client);
     }
     fn redraw(&mut self, _what: Redraw) {}
+    fn command_stdin(&mut self) -> Option<Vec<u8>> {
+        self.stdin.take()
+    }
+    fn read_file(&mut self, _client: Option<ClientId>, path: &str) -> Result<Vec<u8>, String> {
+        self.files.get(path).cloned().ok_or_else(|| format!("{path}: No such file or directory"))
+    }
+    fn write_file(&mut self, _client: Option<ClientId>, path: &str, data: &[u8], append: bool) -> Result<(), String> {
+        let f = self.files.entry(path.to_string()).or_default();
+        if !append {
+            f.clear();
+        }
+        f.extend_from_slice(data);
+        Ok(())
+    }
+    fn set_clipboard(&mut self, data: &[u8]) {
+        self.clipboard.push(data.to_vec());
+    }
     fn shutdown(&mut self) {
         self.shutdown = true;
     }
@@ -1395,4 +1418,100 @@ fn list_commands_format() {
     assert_eq!(t.ok("lscm -F '#{command_list_usage}' kill-server"), "\n");
     let all = t.ok("lscm -F '#{command_list_name}'");
     assert_eq!(all.lines().count(), t.ok("lscm").lines().count());
+}
+
+
+// ----- what Claude Code's tmux backend runs (agent teams) ---------------------
+
+#[test]
+fn pane_options_override_the_window() {
+    // tmux 3.8: any window option can be set per pane; show -p lists only
+    // the pane's own values.
+    let mut t = T::with_session();
+    t.ok("splitw -h");
+    t.ok("set -p -t %1 remain-on-exit failed");
+    t.ok("set -p -t %1 pane-border-style fg=red");
+    t.ok("set -p -t %1 @who lead");
+    assert_eq!(t.ok("show -p -t %1"), "pane-border-style fg=red\nremain-on-exit failed\n@who lead\n");
+    assert_eq!(t.ok("show -p -t %0"), "");
+    assert_eq!(t.ok("show -pv -t %1 remain-on-exit"), "failed\n");
+    assert_eq!(t.err("set -p -t %1 status off"), "not a pane option: status");
+    assert_eq!(t.err("set -p -t %1 nonsuch x"), "invalid option: nonsuch");
+    assert_eq!(t.m.pane_option_text(PaneId(1), "pane-border-style").as_deref(), Some("fg=red"));
+    assert_eq!(t.m.pane_option_text(PaneId(0), "pane-border-style").as_deref(), Some("default"));
+    // remain-on-exit read per pane: %1 stays when it fails, %0 goes.
+    t.m.pane_exited(PaneId(1), Some(1), &mut t.h);
+    assert_eq!(t.ok("display -p -t %1 '#{pane_dead}'"), "1\n");
+    t.ok("set -p -u -t %1 remain-on-exit");
+    assert_eq!(t.ok("show -p -t %1"), "pane-border-style fg=red\n@who lead\n");
+}
+
+#[test]
+fn select_pane_title_until_the_program_sets_one() {
+    let mut t = T::with_session();
+    t.ok("splitw");
+    t.ok("selectp -t %0");
+    t.ok("selectp -t %1 -T researcher");
+    assert_eq!(t.ok("display -p '#D'"), "%0\n", "-T selects nothing");
+    assert_eq!(t.ok("display -p -t %1 '#{pane_title}'"), "researcher\n");
+    t.h.titles.insert(PaneId(1), "vim".into());
+    assert_eq!(t.ok("display -p -t %1 '#T'"), "researcher\n");
+    t.m.pane_title_reset(PaneId(1));
+    assert_eq!(t.ok("display -p -t %1 '#T'"), "vim\n");
+}
+
+#[test]
+fn border_status_takes_a_row_and_labels_panes() {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 25);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach");
+    t.ok("splitw -h");
+    assert_eq!(t.m.client_view(c).unwrap().window_size, Size::new(80, 24));
+    t.ok("set -w pane-border-status top");
+    let v = t.m.client_view(c).unwrap();
+    assert_eq!(v.border_status, BorderStatus::Top);
+    assert_eq!(v.window_size, Size::new(80, 23));
+    assert!(v.panes.iter().all(|(_, r)| r.y == 1 && r.rows == 23), "{:?}", v.panes);
+    t.ok("selectp -t %0 -T lead");
+    t.ok("set -p -t %0 pane-border-format '#[fg=red,bold] #{pane_title} #[default]'");
+    let line = t.m.pane_border_line(PaneId(0), 80, &t.h, NOW);
+    let text: String = line.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(text, " lead ");
+    assert!(line[0].style.attrs.contains(lif_types::Attrs::BOLD));
+    let line = t.m.pane_border_line(PaneId(1), 3, &t.h, NOW);
+    let text: String = line.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(text, "1 \"", "the default format, cut to the width");
+    t.ok("set -w pane-border-status off");
+    assert_eq!(t.m.client_view(c).unwrap().window_size, Size::new(80, 24));
+}
+
+#[test]
+fn load_and_save_buffers() {
+    let mut t = T::with_session();
+    t.h.stdin = Some(b"from stdin".to_vec());
+    t.ok("load-buffer -w -");
+    assert_eq!(t.ok("show-buffer"), "from stdin\n");
+    assert_eq!(t.h.clipboard, vec![b"from stdin".to_vec()]);
+    t.h.files.insert("/tmp/x".into(), b"from file".to_vec());
+    t.ok("loadb -b named /tmp/x");
+    assert_eq!(t.ok("showb -b named"), "from file\n");
+    assert_eq!(t.err("loadb /nope"), "/nope: No such file or directory");
+    t.ok("saveb -b named /tmp/y");
+    t.ok("saveb -a -b named /tmp/y");
+    assert_eq!(t.h.files["/tmp/y"], b"from filefrom file");
+    assert_eq!(t.ok("saveb -"), "from file", "the newest buffer");
+    t.ok("set -s set-clipboard off");
+    t.h.stdin = Some(b"quiet".to_vec());
+    t.ok("loadb -w -");
+    assert_eq!(t.h.clipboard.len(), 1, "set-clipboard off keeps the clipboard");
+}
+
+#[test]
+fn set_titles_string() {
+    let mut t = T::with_session();
+    assert_eq!(t.m.titles_string(SessionId(0), &t.h, NOW), None);
+    t.ok("set -g set-titles on");
+    t.h.titles.insert(PaneId(0), "vim x".into());
+    assert_eq!(t.m.titles_string(SessionId(0), &t.h, NOW).as_deref(), Some("a:0:zsh - \"vim x\""));
 }

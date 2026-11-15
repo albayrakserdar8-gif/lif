@@ -47,8 +47,12 @@ cargo test -p <crate>                    # one crate
 cargo test -p lif --test cli             # one integration-test file of the binary
 cargo test -p lif --test cli -- some_test_name --nocapture
 cargo clippy --all-targets -- -D warnings
-cargo fmt --check
 ```
+
+The code is not rustfmt-formatted (lines run to about 150 columns and
+`cargo fmt --check` reports differences in almost every file). Do not run
+`cargo fmt` on the workspace: it would rewrite every file. Match the style
+of the surrounding code by hand.
 
 "Done" = build, test and clippy (`-D warnings`) pass for every crate touched.
 
@@ -164,6 +168,9 @@ When behavior changes, update in the same change:
 - `docs/tmux-migration.md` (per-command support table and flag lists)
 - `docs/configuration.md` and `crates/lif-config/config.example.toml`
 - `docs/copy-mode.md`, `docs/lif.1` (man page)
+- `docs/claude-code.md` when anything Claude Code relies on changes (the
+  commands its tmux backend runs are exercised by
+  `crates/lif/tests/claude_compat.rs`)
 - `CHANGELOG.md` under the unreleased version
 
 Every claim in these docs was checked by running lif; keep it that way.
@@ -176,7 +183,7 @@ fix, what is not fixed, and measured cost. See `issues/0001-*` as the model.
 
 ## Code style
 
-- Rust 2024, `cargo fmt`. Comments say why, not what. Module docs (`//!`)
+- Rust 2024; follow the existing formatting (see above). Comments say why, not what. Module docs (`//!`)
   explain each file's role; keep them accurate when moving code.
 - Errors are plain enums/strings; no anyhow/thiserror. User-facing error text
   matches tmux's wording where tmux has the same error.

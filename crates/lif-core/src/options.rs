@@ -66,12 +66,20 @@ use Scope::*;
 ///   compressed (to about 50-400 bytes); the default 4000 lines keep twice
 ///   tmux's history in about tmux's memory. Changing either applies to
 ///   existing panes too.
+/// - `tmux-compat` (lif's own) makes panes started from then on look like
+///   tmux panes to programs that only know tmux: `TMUX` and `TMUX_PANE`
+///   are set (pointing at lif's socket and pane), and `lif` invoked as
+///   `tmux` serves them. Off by default because programs that see `TMUX`
+///   change behavior (passthrough wrapping, fewer colors).
+/// - Window options can also be set per pane (`set -p`), as in tmux; the
+///   pane value wins over the window's.
 /// - `mouse-drag-end` (lif's own) is what tmux's `MouseDragEnd1Pane`
 ///   binding sets, since lif's mouse actions are built in rather than
 ///   bound: copy and leave copy mode (tmux's default), copy and stay with
 ///   the selection shown, or only select. It applies to double- and
 ///   triple-click selections too.
 pub(crate) static DEFS: &[Def] = &[
+    d("allow-passthrough", Window, Choice(&["off", "on", "all"]), "off"),
     d("automatic-rename", Window, Flag, "on"),
     d("automatic-rename-format", Window, Str, "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"),
     d("base-index", Session, Number(0, MAXI), "0"),
@@ -102,6 +110,8 @@ pub(crate) static DEFS: &[Def] = &[
     d("other-pane-width", Window, SizeStr, "0"),
     d("pane-active-border-style", Window, Str, "fg=green"),
     d("pane-base-index", Window, Number(0, u16::MAX as i64), "0"),
+    d("pane-border-format", Window, Str, "#{?pane_active,#[reverse],}#{pane_index}#[default] \"#{pane_title}\""),
+    d("pane-border-status", Window, Choice(&["off", "top", "bottom"]), "off"),
     d("pane-border-style", Window, Str, "default"),
     d("prefix", Session, Key, "C-b"),
     d("prefix2", Session, Key, "None"),
@@ -110,6 +120,8 @@ pub(crate) static DEFS: &[Def] = &[
     d("repeat-time", Session, Number(0, i16::MAX as i64), "500"),
     d("scrollback-bytes", Session, Number(0, i64::MAX), "10485760"),
     d("set-clipboard", Server, Choice(&["off", "external", "on"]), "external"),
+    d("set-titles", Session, Flag, "off"),
+    d("set-titles-string", Session, Str, "#S:#I:#W - \"#T\""),
     d("status", Session, Choice(&["off", "on"]), "on"),
     d("status-interval", Session, Number(0, MAXI), "15"),
     d("status-justify", Session, Choice(&["left", "centre", "right", "absolute-centre"]), "left"),
@@ -127,7 +139,9 @@ pub(crate) static DEFS: &[Def] = &[
     d("status-right-style", Session, Str, "default"),
     d("status-style", Session, Str, "bg=green,fg=black"),
     d("tiled-layout-max-columns", Window, Number(0, MAXI), "0"),
+    d("tmux-compat", Server, Flag, "off"),
     d("visual-bell", Session, Choice(&["off", "on", "both"]), "off"),
+    d("window-active-style", Window, Str, "default"),
     d("window-size", Window, Choice(&["largest", "smallest", "manual", "latest"]), "latest"),
     d("window-status-activity-style", Window, Str, "reverse"),
     d("window-status-bell-style", Window, Str, "reverse"),
@@ -137,6 +151,7 @@ pub(crate) static DEFS: &[Def] = &[
     d("window-status-last-style", Window, Str, "default"),
     d("window-status-separator", Window, Str, " "),
     d("window-status-style", Window, Str, "default"),
+    d("window-style", Window, Str, "default"),
     d("word-separators", Session, Str, "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~"),
     d("wrap-search", Window, Flag, "on"),
 ];

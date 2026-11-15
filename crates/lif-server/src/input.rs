@@ -790,7 +790,16 @@ impl Server {
     pub(crate) fn pane_event(&mut self, pane: PaneId, ev: VtEvent) {
         match ev {
             VtEvent::Bell => self.model.pane_bell(pane, &mut self.rt),
-            VtEvent::TitleChanged | VtEvent::PwdChanged => self.model.pane_changed(pane, &mut self.rt),
+            VtEvent::TitleChanged => {
+                self.model.pane_title_reset(pane);
+                self.model.pane_changed(pane, &mut self.rt);
+            }
+            VtEvent::PwdChanged => {
+                if let Some(p) = self.rt.panes.get_mut(&pane) {
+                    p.osc7_path = crate::pane::file_url_path(p.engine.pwd());
+                }
+                self.model.pane_changed(pane, &mut self.rt);
+            }
             VtEvent::ClipboardWrite { selection, data } => self.clipboard_write(selection, &data, false),
             VtEvent::ClipboardRead { selection } => self.clipboard_read(pane, selection),
             VtEvent::Notification { title, body } => {
@@ -876,7 +885,7 @@ fn border_drag(view: &lif_core::ClientView, x: u16, y: u16) -> Option<Drag> {
     Some(Drag { pane, vertical, last: if vertical { x } else { y } })
 }
 
-fn base64(data: &[u8], out: &mut String) {
+pub(crate) fn base64(data: &[u8], out: &mut String) {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for chunk in data.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];

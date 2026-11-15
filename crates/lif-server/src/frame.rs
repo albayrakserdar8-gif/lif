@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use lif_core::{ClientId, PaneId};
-use lif_render::{Message, Scene, ScenePane, StatusBar, StatusPosition, Theme, pane_cursor};
+use lif_core::BorderStatus;
+use lif_render::{BorderLabel, Message, Scene, ScenePane, StatusBar, StatusPosition, Theme, pane_cursor};
 use lif_types::{Cursor, PaneFrame, Pos, Rect, Size, Style};
 use lif_vt::VtEngine;
 
@@ -42,6 +43,21 @@ fn recycle<'a>(v: &mut Vec<ScenePane<'static>>) -> Vec<ScenePane<'a>> {
 
 #[allow(clippy::unnecessary_filter_map)]
 fn unrecycle(v: Vec<ScenePane<'_>>) -> Vec<ScenePane<'static>> {
+    let mut v = v;
+    v.clear();
+    v.into_iter().filter_map(|_| None).collect()
+}
+
+/// [`recycle`] for border labels.
+#[allow(clippy::unnecessary_filter_map)]
+fn recycle_labels<'a>(v: &mut Vec<BorderLabel<'static>>) -> Vec<BorderLabel<'a>> {
+    let mut v = std::mem::take(v);
+    v.clear();
+    v.into_iter().filter_map(|_| None).collect()
+}
+
+#[allow(clippy::unnecessary_filter_map)]
+fn unrecycle_labels(v: Vec<BorderLabel<'_>>) -> Vec<BorderLabel<'static>> {
     let mut v = v;
     v.clear();
     v.into_iter().filter_map(|_| None).collect()
@@ -81,6 +97,7 @@ impl Server {
             a.view = Some(view);
             a.active_pane = Some(new);
             a.needs_frame = true;
+            a.labels_stale = true;
             if old != Some(new) && focused {
                 if let Some(o) = old {
                     self.focus_pane(o, false);
@@ -90,6 +107,25 @@ impl Server {
         }
         self.scratch_views = ids;
         self.release_hidden_panes();
+        self.sync_pane_options();
+    }
+
+    /// Per-pane settings the read and draw paths use, from the options
+    /// (`allow-passthrough`, `tmux-compat`, `window-style`,
+    /// `window-active-style`). Run with the views, never per frame.
+    fn sync_pane_options(&mut self) {
+        let compat = self.model.option_text("tmux-compat", None, None).as_deref() == Some("on");
+        for p in self.rt.panes.values_mut() {
+            let id = p.id;
+            let pass = compat || self.model.pane_option_text(id, "allow-passthrough").is_some_and(|v| v != "off");
+            if pass != p.passthrough.is_some() {
+                p.passthrough = pass.then(Default::default);
+            }
+            let active = self.model.pane(id).and_then(|q| self.model.window(q.window())).is_some_and(|w| w.active_pane() == id);
+            let style = |name: &str| self.model.pane_option_text(id, name).filter(|s| s != "default");
+            let spec = active.then(|| style("window-active-style")).flatten().or_else(|| style("window-style"));
+            p.base_style = spec.map(|s| lif_core::parse_style(&s)).unwrap_or_default();
+        }
     }
 
     /// A pane no attached client shows keeps only its terminal: its frame
@@ -301,7 +337,7 @@ impl Server {
             if is_due.is_none() && !view.panes.iter().any(|(p, _)| refreshed.contains(p)) {
                 continue;
             }
-            draw_client(&self.rt.panes, c, is_due.is_some(), &mut scratch);
+            draw_client(&self.rt.panes, c, is_due.is_some(), &mut scratch, &mut self.label_scratch);
             if let Some(full) = is_due {
                 if full && let Some(a) = c.att.as_mut() {
                     a.needs_frame = false;
@@ -325,13 +361,65 @@ impl Server {
         self.due = due;
     }
 
+    /// The `pane-border-format` lines of a client's view, when they may
+    /// have changed (the view, a title or an option did).
+    fn prepare_labels(&mut self, id: ClientId) {
+        let Some(c) = self.rt.clients.get(&id) else { return };
+        let Some(a) = c.att.as_ref() else { return };
+        let Some(view) = a.view.as_ref() else { return };
+        if !a.labels_stale && !a.status_stale {
+            return;
+        }
+        let mut labels = Vec::new();
+        if view.border_status != BorderStatus::Off {
+            let wall = crate::sys::wall_clock();
+            for (pid, r) in &view.panes {
+                let y = match view.border_status {
+                    BorderStatus::Top if r.y > 0 => r.y - 1,
+                    BorderStatus::Bottom => r.bottom(),
+                    _ => continue,
+                };
+                // tmux leaves two border cells on each side of the line.
+                if r.cols < 5 {
+                    continue;
+                }
+                let width = r.cols - 4;
+                labels.push((r.x + 2, y, width, self.model.pane_border_line(*pid, width, &self.rt, wall)));
+            }
+        }
+        let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
+        a.labels = labels;
+        a.labels_stale = false;
+    }
+
+    /// `set-titles`: set the outer terminal's title when it changed.
+    fn prepare_title(&mut self, id: ClientId, sid: lif_core::SessionId) {
+        let title = self.model.titles_string(sid, &self.rt, crate::sys::wall_clock());
+        let Some(c) = self.rt.clients.get_mut(&id) else { return };
+        let Some(a) = c.att.as_mut() else { return };
+        if title.is_none() || a.title == title {
+            return;
+        }
+        a.title = title;
+        let seq = format!("\x1b]2;{}\x1b\\", a.title.as_deref().unwrap_or(""));
+        c.send_output(seq.as_bytes());
+    }
+
     /// Status line (and automatic window names) for a client about to get
     /// a frame.
     fn prepare_chrome(&mut self, id: ClientId, now: Instant) {
+        self.prepare_labels(id);
         let Some(c) = self.rt.clients.get(&id) else { return };
         let Some(a) = c.att.as_ref() else { return };
         let Some(view) = a.view.as_ref() else { return };
         if view.status_row.is_none() {
+            if a.status_stale {
+                let sid = view.session;
+                self.prepare_title(id, sid);
+                if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                    a.status_stale = false;
+                }
+            }
             return;
         }
         let sid = view.session;
@@ -364,6 +452,7 @@ impl Server {
         if !stale {
             return;
         }
+        self.prepare_title(id, sid);
         let wall = crate::sys::wall_clock();
         let line = self.model.status_line(sid, width, wall, &self.rt);
         let clock = ["status-left", "status-right"]
@@ -394,7 +483,13 @@ fn check_name(p: &mut PaneRt, now: Instant) -> bool {
 }
 
 /// Builds the client's scene and renders it (or records a skipped frame).
-fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, scratch: &mut Vec<ScenePane<'static>>) {
+fn draw_client(
+    panes: &HashMap<PaneId, PaneRt>,
+    c: &mut ClientRt,
+    render: bool,
+    scratch: &mut Vec<ScenePane<'static>>,
+    label_scratch: &mut Vec<BorderLabel<'static>>,
+) {
     let size = c.hello.as_ref().map(|h| h.size).unwrap_or_default();
     // Mouse reporting on the outer terminal only while someone needs it.
     if render && let Some(a) = c.att.as_ref() {
@@ -416,6 +511,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
     let (att, out) = c.frame_parts();
     let Some(a) = att.as_mut() else { return };
     let mut sp = recycle(scratch);
+    let mut lb = recycle_labels(label_scratch);
     let mut prompt_col = 0;
     if let Some(p) = a.prompt.as_ref() {
         prompt_col = p.render(&mut a.prompt_line, a.msg_style);
@@ -423,6 +519,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
     {
         let Some(view) = a.view.as_ref() else {
             *scratch = unrecycle(sp);
+            *label_scratch = unrecycle_labels(lb);
             return;
         };
         let mut active_cursor = Cursor::default();
@@ -453,6 +550,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
                 selection: ov.and_then(|o| o.selection),
                 matches: ov.map_or(&[], |o| o.matches.as_slice()),
                 indicator,
+                base: p.base_style,
             });
         }
         let status = view.status_row.filter(|r| *r < size.rows).map(|row| StatusBar {
@@ -469,7 +567,9 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
         } else {
             a.message.as_ref().map(|m| Message { line: &m.line, fill: a.msg_style })
         };
+        lb.extend(a.labels.iter().map(|(x, y, width, line)| BorderLabel { x: *x, y: *y, width: *width, line }));
         let mut scene = Scene::new(size, &sp);
+        scene.labels = &lb;
         scene.theme = a.theme;
         scene.status = status;
         scene.message = message;
@@ -491,6 +591,7 @@ fn draw_client(panes: &HashMap<PaneId, PaneRt>, c: &mut ClientRt, render: bool, 
         }
     }
     *scratch = unrecycle(sp);
+    *label_scratch = unrecycle_labels(lb);
     if let Some(s) = start {
         c.end_frame(s);
     }

@@ -10,6 +10,7 @@ pub mod type_id {
     pub const USE_TTY: u16 = 0x06;
     pub const SUSPEND: u16 = 0x07;
     pub const RESUME: u16 = 0x08;
+    pub const STDIN: u16 = 0x09;
 
     pub const WELCOME: u16 = 0x101;
     pub const COMMAND_DONE: u16 = 0x102;
@@ -142,6 +143,10 @@ pub enum ClientMsg {
     /// sets its modes again and repaints it all. Also sent after a SIGCONT
     /// the client did not see coming (SIGSTOP), so the server resyncs.
     Resume { size: Size, pixels: PixelSize },
+    /// The client's standard input, for the next `Command` only
+    /// (`load-buffer -`); before attaching, at most one frame
+    /// ([`crate::MAX_PAYLOAD`]). A server that does not know it ignores it.
+    Stdin(Vec<u8>),
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }

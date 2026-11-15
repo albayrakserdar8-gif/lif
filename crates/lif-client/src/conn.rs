@@ -27,6 +27,9 @@ pub struct ServerInfo {
     pub pid: u32,
 }
 
+/// The most standard input a command can take (one protocol frame).
+pub const STDIN_LIMIT: usize = lif_proto::MAX_PAYLOAD - 64;
+
 /// A connection that has completed the handshake.
 #[derive(Debug)]
 pub struct Connection {
@@ -49,6 +52,15 @@ impl Connection {
     /// Capabilities both sides announced.
     pub fn caps(&self) -> Caps {
         self.caps
+    }
+
+    /// Standard input for the next command (`load-buffer -`), at most
+    /// one frame: [`STDIN_LIMIT`] bytes.
+    pub fn send_stdin(&mut self, data: Vec<u8>) -> io::Result<()> {
+        if data.len() > STDIN_LIMIT {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "standard input too large"));
+        }
+        self.send(&ClientMsg::Stdin(data))
     }
 
     fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {

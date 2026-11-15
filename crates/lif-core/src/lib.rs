@@ -48,7 +48,7 @@ pub use ids::{ClientId, PaneId, SessionId, WindowId};
 pub use keys::KeyCode;
 pub use layout::{Axis, Direction, Geometry, Layout, LayoutError, Preset, PresetParams, SizeSpec, SplitSize};
 pub use model::{
-    Client, ClientInfo, ClientView, CmdContext, CmdOutput, Model, Pane, PasteBuffer, Session, Window, clamp_size,
+    BorderStatus, Client, ClientInfo, ClientView, CmdContext, CmdOutput, Model, Pane, PasteBuffer, Session, Window, clamp_size,
 };
 
 /// Largest window width or height, in cells (tmux's limit too): a client

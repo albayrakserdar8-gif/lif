@@ -162,6 +162,7 @@ mod tests {
                 selection: None,
                 matches: &[],
                 indicator: None,
+                base: Default::default(),
             })
             .collect();
         let mut owner = Vec::new();

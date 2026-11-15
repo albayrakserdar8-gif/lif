@@ -174,6 +174,19 @@ pub(crate) fn styled_spans(text: &str, start: Style, base: Style, out: &mut Vec<
     }
 }
 
+/// Expanded text with `#[...]` directives as one line of at most `width`
+/// cells (pane border labels).
+pub(crate) fn label(text: &str, base: Style, width: usize) -> StyledLine {
+    let mut spans = Vec::new();
+    styled_spans(text, base, base, &mut spans);
+    if spans_width(&spans) <= width {
+        return spans;
+    }
+    let mut out = Vec::new();
+    crop(&spans, 0, width, &mut out);
+    out
+}
+
 fn push(out: &mut Vec<Span>, text: &str, style: Style) {
     let text: String = text.chars().filter(|c| !c.is_control()).collect();
     if text.is_empty() {

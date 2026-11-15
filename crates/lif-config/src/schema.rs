@@ -63,6 +63,7 @@ const OFF_ON: &[&str] = &["off", "on"];
 /// (`[status]`) and styles (`[theme]`). Named as in tmux, except
 /// `scrollback`, which takes human sizes.
 pub(crate) static TOP: &[Opt] = &[
+    o("allow-passthrough", "allow-passthrough", Choice(&["off", "on", "all"])),
     o("automatic-rename", "automatic-rename", Bool),
     o("automatic-rename-format", "automatic-rename-format", Str),
     o("base-index", "base-index", Int),
@@ -88,6 +89,8 @@ pub(crate) static TOP: &[Opt] = &[
     o("other-pane-height", "other-pane-height", Size),
     o("other-pane-width", "other-pane-width", Size),
     o("pane-base-index", "pane-base-index", Int),
+    o("pane-border-format", "pane-border-format", Str),
+    o("pane-border-status", "pane-border-status", Choice(&["off", "top", "bottom"])),
     o("prefix", "prefix", Key),
     o("prefix2", "prefix2", Key),
     o("remain-on-exit", "remain-on-exit", Choice(&["off", "on", "failed"])),
@@ -95,7 +98,10 @@ pub(crate) static TOP: &[Opt] = &[
     o("repeat-time", "repeat-time", Int),
     o("scrollback", "scrollback-bytes", Bytes),
     srv("set-clipboard", Choice(&["off", "external", "on"])),
+    o("set-titles", "set-titles", Bool),
+    o("set-titles-string", "set-titles-string", Str),
     o("tiled-layout-max-columns", "tiled-layout-max-columns", Int),
+    srv("tmux-compat", Bool),
     o("visual-bell", "visual-bell", Choice(&["off", "on", "both"])),
     o("window-size", "window-size", Choice(&["largest", "smallest", "manual", "latest"])),
     o("word-separators", "word-separators", Str),
@@ -129,6 +135,8 @@ pub(crate) static THEME: &[Opt] = &[
     o("bell", "window-status-bell-style", Style),
     o("border", "pane-border-style", Style),
     o("active-border", "pane-active-border-style", Style),
+    o("pane", "window-style", Style),
+    o("active-pane", "window-active-style", Style),
     o("selection", "mode-style", Style),
     o("message", "message-style", Style),
     o("match", "copy-mode-match-style", Style),
@@ -682,7 +690,7 @@ mod tests {
         for opt in TOP.iter().chain(STATUS).chain(THEME) {
             assert!(known.iter().any(|k| k == opt.option), "{} is not a lif-core option", opt.option);
         }
-        let server = ["buffer-limit", "copy-command", "escape-time", "exit-empty", "set-clipboard"];
+        let server = ["buffer-limit", "copy-command", "escape-time", "exit-empty", "set-clipboard", "tmux-compat"];
         for opt in TOP {
             assert_eq!(opt.server, server.contains(&opt.option), "{}", opt.option);
         }

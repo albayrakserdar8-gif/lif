@@ -160,6 +160,10 @@ fn apply_profile(c: &mut OuterCaps, name: &str) {
         modern(c);
         c.osc52_read = true;
         c.sgr_pixel_mouse = true;
+    } else if n.starts_with("lif") {
+        // lif inside a lif pane (`TERM_PROGRAM=lif`, XTVERSION "lif(...)"):
+        // it passes all of these on to its own terminal.
+        modern(c);
     } else if has("alacritty") || has("contour") {
         modern(c);
     } else if has("iterm") {

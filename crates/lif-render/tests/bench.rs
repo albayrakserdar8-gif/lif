@@ -135,6 +135,7 @@ fn bench_frames() {
                 selection: None,
                 matches: &[],
                 indicator: None,
+                base: Default::default(),
             }];
             let mut scene = Scene::new(Size::new(COLS, ROWS), &panes);
             scene.status = Some(StatusBar {
@@ -252,6 +253,7 @@ fn bench_frames() {
             selection: None,
                 matches: &[],
             indicator: None,
+            base: Default::default(),
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
         let mut r = Renderer::new(caps());
@@ -279,6 +281,7 @@ fn bench_frames() {
             selection: None,
                 matches: &[],
             indicator: None,
+            base: Default::default(),
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
         let mut total = Duration::ZERO;
@@ -303,6 +306,7 @@ fn bench_frames() {
             selection: None,
                 matches: &[],
             indicator: None,
+            base: Default::default(),
         }];
         let scene = Scene::new(Size::new(COLS, ROWS), &panes);
         let mut total = Duration::ZERO;
@@ -353,6 +357,7 @@ fn bench_frames() {
                     selection: None,
                 matches: &[],
                     indicator: None,
+                    base: Default::default(),
                 })
                 .collect();
             let mut scene = Scene::new(Size::new(COLS, ROWS), &panes);

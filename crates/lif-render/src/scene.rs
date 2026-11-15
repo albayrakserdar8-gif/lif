@@ -167,6 +167,22 @@ pub struct ScenePane<'a> {
     pub matches: &'a [MatchSpan],
     /// Right-aligned on the pane's first row, e.g. `[12/340]`.
     pub indicator: Option<&'a str>,
+    /// Colors for cells that use the terminal's default foreground or
+    /// background (tmux's `window-style` / `window-active-style`);
+    /// `Style::default()` leaves them alone.
+    pub base: Style,
+}
+
+/// A line drawn over border cells: a pane's `pane-border-format` on the
+/// border above or below it. Cells of the line that do not fall on a border
+/// are not drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct BorderLabel<'a> {
+    pub x: u16,
+    pub y: u16,
+    /// At most this many cells.
+    pub width: u16,
+    pub line: &'a StyledLine,
 }
 
 /// Turns a (pane index, hyperlink id) found in a frame cell into its URI.
@@ -186,6 +202,8 @@ pub struct Scene<'a> {
     pub theme: Theme,
     /// Hyperlink resolution; without it cells are drawn without links.
     pub links: Option<LinkLookup<'a>>,
+    /// Pane border lines (`pane-border-status`).
+    pub labels: &'a [BorderLabel<'a>],
 }
 
 impl<'a> Scene<'a> {
@@ -198,6 +216,7 @@ impl<'a> Scene<'a> {
             cursor: Cursor::default(),
             theme: Theme::default(),
             links: None,
+            labels: &[],
         }
     }
 

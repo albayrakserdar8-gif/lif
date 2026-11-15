@@ -51,4 +51,17 @@ First version.
   diagnostics and suggestions; `lif check-config`, `lif print-config` and
   `lif migrate-tmux-conf`.
 - Benchmark harness comparing lif with tmux and zellij (`bench/`).
+- Claude Code support (docs/claude-code.md): `set-option -p` and
+  `show-options -p` (window options per pane), `select-pane -T` and the
+  prefix `T` binding, `pane-border-status` / `pane-border-format` lines,
+  `window-style` / `window-active-style`, `set-titles` /
+  `set-titles-string`, `allow-passthrough` (tmux's `ESC P tmux;` wrapper is
+  unwrapped), `load-buffer` (from a file or standard input, `-w` for the
+  clipboard) and `save-buffer`; lif's own `tmux-compat` option (`TMUX` and
+  `TMUX_PANE` in new panes) and `lif install-tmux-shim` (a `tmux` that is
+  lif inside lif panes and the real tmux elsewhere), so Claude Code's agent
+  teams open their teammates in lif panes. Protocol: new client message
+  `Stdin`.
+- `pane_current_path` falls back to the OSC 7 directory as a path (it was
+  the raw `file://` URL).
 - Tested on macOS on Apple Silicon only.

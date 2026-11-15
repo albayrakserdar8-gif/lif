@@ -67,6 +67,7 @@ pub(crate) struct Server {
     pub(crate) due: Vec<(ClientId, bool)>,
     pub(crate) refreshed: Vec<PaneId>,
     pub(crate) scene_scratch: Vec<ScenePane<'static>>,
+    pub(crate) label_scratch: Vec<lif_render::BorderLabel<'static>>,
     /// Reused id lists, so a loop iteration allocates nothing.
     pub(crate) scratch_panes: Vec<PaneId>,
     pub(crate) scratch_clients: Vec<ClientId>,
@@ -141,6 +142,7 @@ impl Server {
             due: Vec::new(),
             refreshed: Vec::new(),
             scene_scratch: Vec::new(),
+            label_scratch: Vec::new(),
             scratch_panes: Vec::new(),
             scratch_clients: Vec::new(),
             scratch_views: Vec::new(),
@@ -679,7 +681,7 @@ impl Server {
                 }
                 ClientMsg::Hello(_) => hello,
                 _ if !hello => true,
-                ClientMsg::Command { .. } => attached,
+                ClientMsg::Command { .. } | ClientMsg::Stdin(_) => attached,
                 ClientMsg::Resize { .. } | ClientMsg::Detach => false,
                 ClientMsg::Input(_) | ClientMsg::Suspend | ClientMsg::Resume { .. } => !attached,
                 ClientMsg::UseTty { .. } => !attached || !tty_held,
@@ -692,6 +694,11 @@ impl Server {
             match msg {
                 ClientMsg::Hello(h) => self.hello(id, h),
                 ClientMsg::Command { argv } => self.command(id, argv),
+                ClientMsg::Stdin(data) => {
+                    if let Some(c) = self.rt.clients.get_mut(&id) {
+                        c.stdin = Some(data);
+                    }
+                }
                 ClientMsg::Input(bytes) => self.client_input(id, &bytes, now),
                 ClientMsg::Resize { size, pixels: _ } => self.client_size(id, size),
                 ClientMsg::Detach => {
@@ -886,7 +893,9 @@ impl Server {
 
     fn command(&mut self, id: ClientId, argv: Vec<String>) {
         let was_attached = self.rt.clients.get(&id).is_some_and(|c| c.att.is_some());
+        self.rt.cmd_stdin = self.rt.clients.get_mut(&id).and_then(|c| c.stdin.take());
         let result = lif_core::parse_list(&argv).and_then(|list| self.run_commands(Some(id), &list));
+        self.rt.cmd_stdin = None;
         let Some(c) = self.rt.clients.get_mut(&id) else { return };
         let attached_now = c.att.is_some() && !was_attached;
         match result {
@@ -1133,6 +1142,7 @@ fn client_msg_name(m: &ClientMsg) -> &'static str {
     match m {
         ClientMsg::Hello(_) => "Hello",
         ClientMsg::Command { .. } => "Command",
+        ClientMsg::Stdin(_) => "Stdin",
         ClientMsg::Input(_) => "Input",
         ClientMsg::Resize { .. } => "Resize",
         ClientMsg::Detach => "Detach",

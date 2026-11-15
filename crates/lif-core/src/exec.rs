@@ -504,6 +504,8 @@ impl Model {
                 ok()
             }
             "set-buffer" => self.cmd_set_buffer(a),
+            "load-buffer" => self.cmd_load_buffer(a, ctx, host),
+            "save-buffer" => self.cmd_save_buffer(a, ctx, host),
             "set-option" => self.cmd_set_option(a, a.has('w'), ctx, host),
             "set-window-option" => self.cmd_set_option(a, true, ctx, host),
             "show-buffer" => {
@@ -933,7 +935,7 @@ impl Model {
         );
         self.panes.insert(
             pid,
-            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point },
+            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None },
         );
         let spec = self.spawn_spec(pid, wid, sid, command, cwd, psize, client, false);
         if let Err(e) = host.spawn_pane(&spec) {
@@ -1531,7 +1533,7 @@ impl Model {
             return err(format!("create pane failed: {e}"));
         }
         let point = self.tick();
-        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point });
+        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None });
         let w = self.windows.get_mut(&wid).expect("window");
         let pos = w.panes.iter().position(|p| *p == target).expect("target in window");
         w.panes.insert(if before { pos } else { pos + 1 }, pid);
@@ -1551,6 +1553,14 @@ impl Model {
     fn cmd_select_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let (wid, p) = (need_window(&f)?, need_pane(&f)?);
+        if let Some(title) = a.get('T') {
+            // tmux 3.8 sets the title and selects nothing else.
+            let title: String = title.chars().filter(|c| !c.is_control()).collect();
+            self.panes.get_mut(&p).expect("pane").title = Some(title);
+            host.redraw(Redraw::Window(wid));
+            host.redraw(Redraw::Status(f.s));
+            return ok();
+        }
         if a.has('l') {
             let last = self.last_pane_of(wid).ok_or_else(|| CmdError::new("no last pane"))?;
             self.select_pane_zoom(wid, last, a.has('Z'), host);
@@ -2120,6 +2130,82 @@ impl Model {
         ok()
     }
 
+    fn cmd_load_buffer(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let path = a.value(0).unwrap_or("");
+        let data = if path == "-" {
+            host.command_stdin().unwrap_or_default()
+        } else {
+            host.read_file(ctx.client, path).map_err(CmdError)?
+        };
+        if a.has('w') && self.gopt("set-clipboard").as_num() != 0 {
+            host.set_clipboard(&data);
+        }
+        self.set_buffer(a.get('b'), data);
+        ok()
+    }
+
+    fn cmd_save_buffer(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let i = self.buffer_index(a.get('b'))?;
+        let path = a.value(0).unwrap_or("");
+        let data = self.buffers[i].data.clone();
+        if path == "-" {
+            return text(String::from_utf8_lossy(&data).into_owned());
+        }
+        host.write_file(ctx.client, path, &data, a.has('a')).map_err(CmdError)?;
+        ok()
+    }
+
+    /// `show-options -p`: the options set on one pane.
+    fn cmd_show_pane_options(&mut self, a: &Args, ctx: &CmdContext) -> R {
+        let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+        let set = &self.panes[&need_pane(&f)?].options;
+        let only = a.value(0);
+        let def = match only {
+            Some(n) if !n.starts_with('@') => match options::find(n) {
+                Ok(d) => Some(d),
+                Err(_) if a.has('q') => return ok(),
+                Err(e) => return err(e),
+            },
+            _ => None,
+        };
+        let mut out = String::new();
+        let mut line = |name: &str, value: String| {
+            if a.has('v') {
+                out.push_str(&value);
+            } else {
+                out.push_str(name);
+                out.push(' ');
+                out.push_str(&escape_arg(&value));
+            }
+            out.push('\n');
+        };
+        match (only, def) {
+            (Some(n), None) => {
+                if let Some(v) = set.user(n) {
+                    line(n, v.to_string());
+                } else if !a.has('q') {
+                    return err(format!("invalid option: {n}"));
+                }
+            }
+            (Some(_), Some(d)) => {
+                if let Some(v) = set.get(d.name) {
+                    line(d.name, options::value_text(d, v));
+                }
+            }
+            (None, _) => {
+                for (n, v) in set.iter() {
+                    if let Some(d) = options::DEFS.iter().find(|d| d.name == n) {
+                        line(n, options::value_text(d, v));
+                    }
+                }
+                for (n, v) in set.user_iter() {
+                    line(n, v.to_string());
+                }
+            }
+        }
+        text(out)
+    }
+
     // ----- keys and options --------------------------------------------------
 
     fn cmd_bind(&mut self, a: &Args) -> R {
@@ -2171,7 +2257,60 @@ impl Model {
         text(out)
     }
 
+    /// `set-option -p`: a window option (or user option) for one pane.
+    fn cmd_set_pane_option(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let name = a.value(0).unwrap_or("");
+        let def = if name.starts_with('@') {
+            None
+        } else {
+            match options::find(name) {
+                Ok(d) if d.scope == Scope::Window => Some(d),
+                Ok(d) => return err(format!("not a pane option: {}", d.name)),
+                Err(_) if a.has('q') => return ok(),
+                Err(e) => return err(e),
+            }
+        };
+        let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+        let (wid, p) = (need_window(&f)?, need_pane(&f)?);
+        let value: Option<String> = match (a.strings(1).into_iter().next(), a.has('F')) {
+            (Some(v), true) => Some(self.expand_found(&f, ctx, &*host, &v)),
+            (v, _) => v,
+        };
+        match def {
+            None => {
+                let set = &mut self.panes.get_mut(&p).expect("pane").options;
+                if a.has('u') {
+                    set.unset_user(name);
+                } else {
+                    if a.has('o') && set.user(name).is_some() {
+                        return err(format!("already set: {name}"));
+                    }
+                    let old = if a.has('a') { set.user(name).unwrap_or("").to_string() } else { String::new() };
+                    set.set_user(name, old + &value.unwrap_or_default());
+                }
+            }
+            Some(def) => {
+                if a.has('u') {
+                    self.panes.get_mut(&p).expect("pane").options.unset(def.name);
+                } else {
+                    if a.has('o') && self.panes[&p].options.get(def.name).is_some() {
+                        return err(format!("already set: {}", def.name));
+                    }
+                    let cur = self.popt(p, def.name).clone();
+                    let v = options::parse_value(def, &cur, value.as_deref(), a.has('a')).map_err(CmdError)?;
+                    self.panes.get_mut(&p).expect("pane").options.set(def.name, v);
+                }
+            }
+        }
+        host.redraw(Redraw::Window(wid));
+        host.redraw(Redraw::Session(f.s));
+        ok()
+    }
+
     fn cmd_set_option(&mut self, a: &Args, window_flag: bool, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        if a.has('p') {
+            return self.cmd_set_pane_option(a, ctx, host);
+        }
         let name = a.value(0).unwrap_or("");
         let value: Option<String> = a.strings(1).into_iter().next();
         let global = a.has('g');
@@ -2271,6 +2410,9 @@ impl Model {
 
     fn cmd_show_options(&mut self, a: &Args, window_flag: bool, ctx: &CmdContext) -> R {
         let global = a.has('g');
+        if a.has('p') && !global {
+            return self.cmd_show_pane_options(a, ctx);
+        }
         let only = a.value(0);
         let def = match only {
             Some(n) if !n.starts_with('@') => match options::find(n) {

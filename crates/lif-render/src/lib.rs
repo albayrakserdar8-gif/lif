@@ -37,7 +37,7 @@ mod text;
 pub use layout::border_glyph;
 pub use render::Renderer;
 pub use scene::{
-    LinkLookup, MatchSpan, Message, Scene, ScenePane, Selection, SelectionKind, StatusBar,
+    BorderLabel, LinkLookup, MatchSpan, Message, Scene, ScenePane, Selection, SelectionKind, StatusBar,
     StatusPosition, Theme, pane_cursor,
 };
 pub use sgr::rgb_to_256;

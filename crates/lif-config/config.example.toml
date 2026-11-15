@@ -148,6 +148,26 @@ other-pane-height = 0
 # Most columns the tiled layout uses (0: no limit).
 tiled-layout-max-columns = 0
 
+# A line on each pane's border with its pane-border-format: "off", "top" or
+# "bottom". The window gives up one row for it.
+pane-border-status = "off"
+pane-border-format = '#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'
+
+# Set the outer terminal's title (to set-titles-string, a format).
+set-titles = false
+set-titles-string = '#S:#I:#W - "#T"'
+
+# ------------------------------------------------- programs that know tmux ---
+
+# Unwrap tmux's passthrough escape (ESC P tmux; ... ESC \) for programs in
+# panes: "off", "on" or "all" (same as on).
+allow-passthrough = "off"
+
+# Give new panes TMUX and TMUX_PANE (pointing at lif) for programs that only
+# know tmux, such as Claude Code's agent teams; implies allow-passthrough.
+# See docs/claude-code.md.
+tmux-compat = false
+
 # ---------------------------------------------------------- status line -----
 
 [status]
@@ -202,6 +222,10 @@ selection = "bg=yellow,fg=black"
 message = "bg=yellow,fg=black"
 match = "bg=cyan,fg=black"
 current-match = "bg=magenta,fg=black"
+# Default colors of pane contents, and of the active pane's (tmux's
+# window-style and window-active-style).
+pane = "default"
+active-pane = "default"
 
 # ---------------------------------------------------------- key bindings ----
 

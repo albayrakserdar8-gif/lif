@@ -164,6 +164,11 @@ pub struct Pane {
     pub(crate) dead: bool,
     pub(crate) exit_status: Option<i32>,
     pub(crate) active_point: u64,
+    /// Window options set for this pane only (`set -p`).
+    pub(crate) options: OptionSet,
+    /// Title set by `select-pane -T`; a title the program sets later
+    /// replaces it, as in tmux.
+    pub(crate) title: Option<String>,
 }
 
 impl Pane {
@@ -290,6 +295,21 @@ pub struct ClientView {
     pub status_row: Option<u16>,
     /// Size of the window (may differ from the client's area).
     pub window_size: Size,
+    /// Where each pane's `pane-border-format` line goes (`pane-border-status`).
+    pub border_status: BorderStatus,
+}
+
+/// `pane-border-status`: a line with each pane's `pane-border-format` on
+/// the border above or below it. The window gives up one row for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderStatus {
+    /// No border lines (the default).
+    #[default]
+    Off,
+    /// On the border above each pane.
+    Top,
+    /// On the border below each pane.
+    Bottom,
 }
 
 /// The whole server state that is not I/O.
@@ -462,6 +482,13 @@ impl Model {
         local.or_else(|| global.get(name)).unwrap_or_else(|| panic!("option {name} not defined"))
     }
 
+    /// A window option as it applies to one pane: the pane's own value
+    /// (`set -p`) if it has one, else the window's.
+    pub(crate) fn popt(&self, p: PaneId, name: &str) -> &Value {
+        let Some(pane) = self.panes.get(&p) else { return self.wopt(None, name) };
+        pane.options.get(name).unwrap_or_else(|| self.wopt(Some(pane.window), name))
+    }
+
     pub(crate) fn sopt(&self, s: Option<SessionId>, name: &str) -> &Value {
         self.opt_value(name, Scope::Session, s, None)
     }
@@ -563,7 +590,7 @@ impl Model {
         if policy == 2 {
             return None;
         }
-        let sl = self.status_lines(sid);
+        let sl = self.status_lines(sid) + (self.border_status(wid) != BorderStatus::Off) as u16;
         let sizes: Vec<(u64, Size)> = self
             .clients
             .values()
@@ -965,7 +992,7 @@ impl Model {
     pub fn pane_exited(&mut self, pane: PaneId, status: Option<i32>, host: &mut dyn Host) {
         let Some(p) = self.panes.get(&pane) else { return };
         let wid = p.window;
-        let remain = self.wopt(Some(wid), "remain-on-exit").as_num();
+        let remain = self.popt(pane, "remain-on-exit").as_num();
         if remain == 1 || (remain == 2 && status != Some(0)) {
             let p = self.panes.get_mut(&pane).expect("pane");
             p.dead = true;
@@ -1065,7 +1092,8 @@ impl Model {
         let w = self.windows.get(&s.current)?;
         let status = self.status_lines(sid) > 0;
         let top = status && self.sopt(Some(sid), "status-position").as_num() == 0;
-        let dy = top as u16;
+        let border_status = self.border_status(Some(w.id));
+        let dy = top as u16 + (border_status == BorderStatus::Top) as u16;
         let Geometry { panes, borders } = w.layout.geometry();
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.cols, r.rows);
         let status_row = status.then(|| if top { 0 } else { c.info.size.rows.saturating_sub(1) });
@@ -1078,7 +1106,64 @@ impl Model {
             borders: borders.into_iter().map(shift).collect(),
             status_row,
             window_size: w.size,
+            border_status,
         })
+    }
+
+    /// `pane-border-status` of a window (the global value for `None`).
+    pub(crate) fn border_status(&self, wid: Option<WindowId>) -> BorderStatus {
+        match self.wopt(wid, "pane-border-status").as_num() {
+            1 => BorderStatus::Top,
+            2 => BorderStatus::Bottom,
+            _ => BorderStatus::Off,
+        }
+    }
+
+    /// The `pane-border-format` line of `pane`, `width` cells at most, in
+    /// the pane's border style (the active one for the active pane).
+    pub fn pane_border_line(&self, pane: PaneId, width: u16, host: &dyn Host, now: WallClock) -> StyledLine {
+        let Some(p) = self.panes.get(&pane) else { return StyledLine::new() };
+        let Some(w) = self.windows.get(&p.window) else { return StyledLine::new() };
+        let active = w.active == pane;
+        let base = status::parse_style(self.popt(pane, if active { "pane-active-border-style" } else { "pane-border-style" }).as_str());
+        let ctx = self.fctx(host, Some(w.session), Some(w.id), Some(pane), None, now);
+        let text = format::expand(self.popt(pane, "pane-border-format").as_str(), &ctx);
+        status::label(&text, base, width as usize)
+    }
+
+    /// A window option (or user option) as it applies to `pane`, as text.
+    pub fn pane_option_text(&self, pane: PaneId, name: &str) -> Option<String> {
+        let p = self.panes.get(&pane)?;
+        if name.starts_with('@') {
+            return p.options.user(name).map(str::to_string).or_else(|| {
+                let sid = self.windows.get(&p.window).map(|w| w.session);
+                self.user_option(name, sid, Some(p.window)).map(str::to_string)
+            });
+        }
+        let def = options::DEFS.iter().find(|d| d.name == name && d.scope == Scope::Window)?;
+        Some(options::value_text(def, self.popt(pane, def.name)))
+    }
+
+    /// The program in `pane` set its title: it replaces one set with
+    /// `select-pane -T`, as in tmux.
+    pub fn pane_title_reset(&mut self, pane: PaneId) {
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.title = None;
+        }
+    }
+
+    /// The outer terminal's title for clients of `session` (`set-titles`,
+    /// `set-titles-string`), or `None` when `set-titles` is off.
+    pub fn titles_string(&self, session: SessionId, host: &dyn Host, now: WallClock) -> Option<String> {
+        let sid = Some(session);
+        if !self.sopt(sid, "set-titles").as_flag() {
+            return None;
+        }
+        let s = self.sessions.get(&session)?;
+        let w = self.windows.get(&s.current)?;
+        let ctx = self.fctx(host, sid, Some(w.id), Some(w.active), None, now);
+        let text = format::expand_time(self.sopt(sid, "set-titles-string").as_str(), &ctx);
+        Some(text.chars().filter(|c| !c.is_control()).collect())
     }
 
     /// The status line of `session` for a client `width` cells wide, in
@@ -1194,6 +1279,7 @@ impl Model {
             scrollback_bytes: self.sopt(Some(session), "scrollback-bytes").as_num() as usize,
             client,
             respawn,
+            tmux_compat: self.gopt("tmux-compat").as_flag(),
         }
     }
 }
@@ -1307,7 +1393,11 @@ impl Vars for Fctx<'_> {
             return match rest {
                 "index" => m.pane_index(p.id).map(|i| i.to_string()),
                 "id" => Some(p.id.to_string()),
-                "title" => Some(if info.title.is_empty() { m.hostname.clone() } else { info.title.to_string() }),
+                "title" => Some(match &p.title {
+                    Some(t) => t.clone(),
+                    None if info.title.is_empty() => m.hostname.clone(),
+                    None => info.title.to_string(),
+                }),
                 "current_command" => Some(info.current_command.to_string()),
                 "current_path" => Some(info.current_path.to_string()),
                 "width" => Some(p.size.cols.to_string()),

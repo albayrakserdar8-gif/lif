@@ -125,6 +125,12 @@ Value types used below:
 | `other-pane-width` | size | `0` | Width of the other panes in `main-vertical` (0: what is left). | `other-pane-width` |
 | `other-pane-height` | size | `0` | Height of the other panes in `main-horizontal`. | `other-pane-height` |
 | `tiled-layout-max-columns` | integer | `0` | Most columns the `tiled` layout uses (0: no limit). | `tiled-layout-max-columns` |
+| `pane-border-status` | choice: `"off"`, `"top"`, `"bottom"` | `"off"` | A line with each pane's `pane-border-format` on the border above or below it; the window gives up one row for it. | `pane-border-status` |
+| `pane-border-format` | string | `'#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'` | What that line shows (a format; `#[...]` styles work). | `pane-border-format` |
+| `set-titles` | bool | `false` | Set the outer terminal's title. | `set-titles` |
+| `set-titles-string` | string | `'#S:#I:#W - "#T"'` | The title, a format. | `set-titles-string` |
+| `allow-passthrough` | choice: `"off"`, `"on"`, `"all"` | `"off"` | Unwrap tmux's passthrough escape (`ESC P tmux; ... ESC \`) from programs; the wrapped clipboard writes and notifications then reach the outer terminal. | `allow-passthrough` |
+| `tmux-compat` | bool | `false` | New panes get `TMUX` and `TMUX_PANE` pointing at lif, and passthrough is unwrapped, for programs that only know tmux (see [claude-code.md](claude-code.md)). | `tmux-compat` (lif only) |
 
 `status = false` (or `true`) at the top level is accepted as a shortcut for
 `[status] enabled`, unless the file also has a `[status]` section (TOML
@@ -176,6 +182,8 @@ interface, one key per element.
 | `message` | `"bg=yellow,fg=black"` | Messages and prompts | `message-style` |
 | `match` | `"bg=cyan,fg=black"` | Copy-mode search matches | `copy-mode-match-style` |
 | `current-match` | `"bg=magenta,fg=black"` | The match under the cursor | `copy-mode-current-match-style` |
+| `pane` | `"default"` | Default colors of pane contents (only `fg` and `bg` are used) | `window-style` |
+| `active-pane` | `"default"` | The same for the active pane, when not `"default"` | `window-active-style` |
 
 A style is either a table or a tmux style string; both are equivalent:
 
