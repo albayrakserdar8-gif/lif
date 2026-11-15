@@ -381,6 +381,8 @@ pub(crate) fn open_fd_count() -> usize {
 /// whose kernel record includes its terminal's foreground group: one
 /// proc_pidinfo call on macOS, one pread of /proc/<pid>/stat on Linux.
 pub(crate) struct TtyOwner {
+    // (Linux keeps the process's stat file open instead.)
+    #[cfg(not(target_os = "linux"))]
     pid: u32,
     rdev: u64,
     #[cfg(target_os = "linux")]
@@ -398,7 +400,7 @@ impl TtyOwner {
             // SAFETY: valid NUL-terminated path.
             let fd = cvt(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) })?;
             // SAFETY: a fresh fd nothing else owns.
-            TtyOwner { pid, rdev, stat: unsafe { OwnedFd::from_raw_fd(fd) } }
+            TtyOwner { rdev, stat: unsafe { OwnedFd::from_raw_fd(fd) } }
         };
         #[cfg(not(target_os = "linux"))]
         let owner = TtyOwner { pid, rdev };

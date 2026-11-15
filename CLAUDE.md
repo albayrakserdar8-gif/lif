@@ -13,9 +13,9 @@ A terminal multiplexer that keeps tmux's commands, flags, targets, formats,
 default key bindings (prefix `C-b`) and error messages, with a TOML config
 instead of `.tmux.conf`. Its reason to exist is speed and a small footprint:
 one server thread, one mio event loop, libghostty-vt as the terminal engine,
-a diff renderer that skips frames instead of queueing output. Version 0.2.0,
-tested on macOS / Apple Silicon only (Linux paths exist but have never been
-built).
+a diff renderer that skips frames instead of queueing output. Version 0.3.0,
+tested on macOS / Apple Silicon only (Linux builds by cross compiling, see
+below, but has never been run).
 
 tmux 3.8 is the behavioral reference. When unsure how something should
 behave, check what tmux does (`tmux -L scratch -f /dev/null ...` on a private
@@ -116,9 +116,9 @@ pane (kitty or legacy) -> PTY.
 
 | Crate | Where to look |
 |---|---|
-| `lif` | `src/main.rs` CLI parsing and socket choice, `src/start.rs` daemonize and server start; `tests/` end-to-end suites (`basic`, `cli`, `config`, `copy`, `features`, `files`, `jobs`, `latency`, `more`, `scripting`, `server_limits`, `stress`, `stress_fuzz`, `window_index`) |
-| `lif-server` | `server.rs` event loop and deadlines (`next_deadline`), `pane.rs` PTY reading with budgets, `client.rs` attached clients and direct tty I/O, `frame.rs` frame scheduling (8 ms pacing, immediate echo frames), `host.rs` implements `lif-core`'s `Host` trait, `job.rs` shell commands for `run-shell` / `if-shell` / `#()`, `input.rs`, `mode.rs` copy mode glue, `prompt.rs`, `panic.rs` panic hook that kills pane groups |
-| `lif-core` | Pure model: `model.rs` sessions/windows/panes, `cmd/` command lexer and table, `exec.rs`, `queue.rs` commands that wait (`run-shell`, `if-shell`, `wait-for`) and `#()`, `hooks.rs`, `environ.rs`, `target.rs`, `format.rs` (`#{...}`), `options.rs`, `bindings.rs`, `layout.rs`, `status.rs` |
+| `lif` | `src/main.rs` CLI parsing and socket choice, `src/start.rs` daemonize and server start; `tests/` end-to-end suites (`basic`, `choose`, `cli`, `commands`, `config`, `copy`, `features`, `files`, `jobs`, `latency`, `more`, `overlay`, `scripting`, `server_limits`, `stress`, `stress_fuzz`, `window_index`) |
+| `lif-server` | `server.rs` event loop and deadlines (`next_deadline`), `pane.rs` PTY reading with budgets, `client.rs` attached clients and direct tty I/O, `frame.rs` frame scheduling (8 ms pacing, immediate echo frames), `host.rs` implements `lif-core`'s `Host` trait, `job.rs` shell commands for `run-shell` / `if-shell` / `#()`, `choose.rs` chooser modes in a pane, `overlay.rs` popups and menus (a popup is a pane only the server knows), `clock.rs`, `pipe.rs` `copy-pipe` and `pipe-pane`, `input.rs`, `mode.rs` copy mode glue, `prompt.rs`, `panic.rs` panic hook that kills pane groups |
+| `lif-core` | Pure model: `model.rs` sessions/windows/panes, `cmd/` command lexer and table, `exec.rs`, `queue.rs` commands that wait (`run-shell`, `if-shell`, `wait-for`) and `#()`, `hooks.rs`, `environ.rs`, `choose.rs` (chooser lists and keys), `overlay.rs` (popup and menu geometry, menu state), `target.rs`, `format.rs` (`#{...}`), `options.rs`, `bindings.rs`, `layout.rs`, `status.rs` |
 | `lif-vt` | `VtEngine` trait (`lib.rs`, a contract: do not change without being asked) and the libghostty backend (`ghostty.rs`, `ghostty/`) |
 | `lif-pty` | `pty.rs` open/fork/exec (resets signals in the child), `spawn.rs` login-shell argv (`-sh`), `reaper.rs` |
 | `lif-input` | Byte parser for the outer terminal: keys, mouse, kitty protocol, query replies (`probe.rs`) |
@@ -144,6 +144,26 @@ The libghostty-rs API source is under
   `lif-core` limits and `server_limits.rs` tests).
 - Optimizations need before/after numbers (hyperfine, `bench/run.sh --only ...`,
   or the crate `bench.rs` tests) in the report.
+
+## Linux (cross-check only)
+
+Nothing on this machine runs Linux, so Linux is checked by cross compiling.
+Homebrew's rustc has only the host target; use the rustup toolchain, which
+has `aarch64-unknown-linux-gnu` installed, and its own build directory:
+
+```sh
+export PATH=$(dirname $(rustup which rustc --toolchain stable)):/opt/homebrew/bin:$PATH
+export CARGO_TARGET_DIR=/Volumes/extssd/Development/lif/target-linux
+cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
+cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$PWD/tools/zigcc-aarch64-linux.sh \
+  cargo build -p lif --target aarch64-unknown-linux-gnu      # links an ELF binary
+```
+
+That toolchain's clippy is newer than Homebrew's and has more lints; code
+must pass both. A change to `cfg(target_os)` code is not done until this
+check passes. Running the tests on Linux needs a VM or container, which is
+not installed.
 
 ## Benchmarks
 

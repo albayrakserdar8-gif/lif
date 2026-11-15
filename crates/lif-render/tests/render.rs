@@ -456,8 +456,8 @@ fn hyperlinks_and_downgrade() {
             ..Style::default()
         },
     );
-    for x in 0..4 {
-        f.rows[0].cells[x].link = 1;
+    for c in &mut f.rows[0].cells[..4] {
+        c.link = 1;
     }
     put(
         &mut f,

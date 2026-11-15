@@ -62,6 +62,8 @@ pub(crate) enum WaitKey {
 pub(crate) enum Then {
     /// Nothing (a timer, a channel).
     Nothing,
+    /// `display-popup`: the status it closed with is the list's.
+    Status,
     /// `run-shell`: its output is the command's, a failure sets the status.
     Shell { command: String },
     /// `run-shell -d`: the delay is over, start the command.
@@ -248,6 +250,7 @@ impl Model {
         let Work { mut rest, ctx, mut out, mut status, waited, muted } = work;
         let nested = self.q.depth > 0;
         let waited = waited && !nested;
+        self.clock = ctx.now.unix_secs;
         let was_muted = self.hooks.muted;
         let muted = muted || was_muted;
         self.hooks.muted = muted;
@@ -352,12 +355,12 @@ impl Model {
         self.q.parked.len()
     }
 
-    fn next_job(&mut self) -> u64 {
+    pub(crate) fn next_job(&mut self) -> u64 {
         self.q.next_id += 1;
         self.q.next_id
     }
 
-    fn check_park(&self) -> Result<(), CmdError> {
+    pub(crate) fn check_park(&self) -> Result<(), CmdError> {
         if self.q.parked.len() >= MAX_PARKED {
             return Err(CmdError(format!("too many waiting commands ({MAX_PARKED})")));
         }
@@ -377,6 +380,7 @@ impl Model {
         let mut error = None;
         match std::mem::replace(&mut run.then, Then::Nothing) {
             Then::Nothing => {}
+            Then::Status => run.status = crate::overlay::popup_status(status),
             Then::Shell { command } => {
                 let text = String::from_utf8_lossy(output);
                 run.out.push_str(&text);

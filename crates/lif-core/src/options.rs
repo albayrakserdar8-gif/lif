@@ -85,6 +85,8 @@ pub(crate) static DEFS: &[Def] = &[
     d("base-index", Session, Number(0, MAXI), "0"),
     d("bell-action", Session, Choice(&["none", "any", "current", "other"]), "any"),
     d("buffer-limit", Server, Number(1, MAXI), "50"),
+    d("clock-mode-colour", Window, Str, "blue"),
+    d("clock-mode-style", Window, Choice(&["12", "24"]), "24"),
     d("copy-command", Server, Str, ""),
     d("copy-mode-current-match-style", Window, Str, "bg=magenta,fg=black"),
     d("copy-mode-match-style", Window, Str, "bg=cyan,fg=black"),

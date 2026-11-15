@@ -27,6 +27,7 @@
 #![warn(missing_docs)]
 
 pub mod bindings;
+mod choose;
 pub mod cmd;
 mod environ;
 mod exec;
@@ -37,6 +38,7 @@ pub mod ids;
 pub mod keys;
 pub mod layout;
 mod model;
+mod overlay;
 pub mod options;
 mod queue;
 pub(crate) mod status;
@@ -50,7 +52,9 @@ pub use host::{
     CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, JobSpec, JobStatus, LinePos, PaneInfo,
     PaneInput, Prompt, Redraw, SpawnCommand, SpawnSpec,
 };
+pub use choose::{ChooseItem, ChooseKind, ChooseLine, ChooseOutcome, ChooseScreen, ChooseSpec, ChooseState, MAX_CHOOSE_ITEMS, Preview};
 pub use hooks::hook_names;
+pub use overlay::{BorderLines, MAX_MENU_ITEMS, MenuItem, MenuOutcome, MenuState, PopupClose, PopupSpec};
 pub use queue::Finished;
 pub use ids::{ClientId, PaneId, SessionId, WindowId};
 pub use keys::KeyCode;

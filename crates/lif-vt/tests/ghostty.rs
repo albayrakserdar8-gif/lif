@@ -720,10 +720,10 @@ fn rows_of_scrollback_and_screen() {
     assert!(r.cells.iter().all(|c| *c == lif_types::Cell::BLANK));
     // The screen rows read the same as the frame.
     let f = frame(&mut v);
-    for y in 0..3 {
+    for (y, row) in f.rows.iter().enumerate().take(3) {
         let mut r = lif_types::FrameRow::default();
         v.row(3 + y, &mut r);
-        assert_eq!(r.cells, f.rows[y].cells, "row {y}");
+        assert_eq!(r.cells, row.cells, "row {y}");
     }
 }
 

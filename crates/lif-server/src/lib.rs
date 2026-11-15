@@ -16,12 +16,15 @@
 
 #[macro_use]
 mod log;
+mod choose;
 mod client;
+mod clock;
 mod frame;
 mod host;
 mod input;
 mod job;
 pub mod mode;
+mod overlay;
 mod pane;
 mod panic;
 mod passthrough;

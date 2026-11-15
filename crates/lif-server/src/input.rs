@@ -88,7 +88,118 @@ impl Server {
         self.rt.write_pane(pane, &b);
     }
 
+    /// A key while a popup or menu is up: it is theirs. Returns false if
+    /// there is none.
+    fn overlay_key(&mut self, id: ClientId, key: &KeyEvent) -> bool {
+        use crate::overlay::Overlay;
+        let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return false };
+        let pressed = key.action != KeyAction::Release && !matches!(key.key, Key::Modifier(_));
+        match a.overlay.as_mut() {
+            None => false,
+            Some(Overlay::Menu(m)) => {
+                if pressed {
+                    let outcome = m.state.key(key);
+                    self.menu_outcome(id, outcome);
+                }
+                true
+            }
+            Some(Overlay::Popup(p)) => {
+                let (pane, exited, any_key) = (p.pane, p.exited, p.any_key);
+                if !exited {
+                    self.key_to_pane(id, pane, key);
+                } else if pressed {
+                    // What the program left stays until Escape or C-c
+                    // (any key with -k), as in tmux.
+                    let ctrl_c = key.key == Key::Char('c') && key.mods.contains(Mods::CTRL);
+                    if any_key || key.key == Key::Escape || ctrl_c {
+                        self.rt.end_overlay(id, 0);
+                        self.after_model();
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Carry out what a key or click on `id`'s menu led to.
+    fn menu_outcome(&mut self, id: ClientId, outcome: lif_core::MenuOutcome) {
+        use crate::overlay::Overlay;
+        use lif_core::MenuOutcome;
+        match outcome {
+            MenuOutcome::None => {}
+            MenuOutcome::Redraw => {
+                if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut())
+                    && let Some(Overlay::Menu(m)) = a.overlay.as_mut()
+                {
+                    let s = &m.state;
+                    m.frame = crate::overlay::menu_frame(s, lif_core::parse_style(&s.style), crate::host::menu_selected(s), crate::host::menu_border(s));
+                    a.needs_frame = true;
+                }
+            }
+            MenuOutcome::Close | MenuOutcome::Run(_) => {
+                let pane = match self.rt.clients.get(&id).and_then(|c| c.att.as_ref()).and_then(|a| a.overlay.as_ref()) {
+                    Some(Overlay::Menu(m)) => m.state.pane,
+                    _ => None,
+                };
+                self.rt.end_overlay(id, 0);
+                if let MenuOutcome::Run(command) = outcome
+                    && !command.trim().is_empty()
+                {
+                    // The item's command, for the pane the menu was
+                    // opened for.
+                    let r = lif_core::parse_string(&command).and_then(|list| self.run_commands_in(Some(id), pane, &list));
+                    match r {
+                        Ok(o) => self.show_output(id, &o.stdout),
+                        Err(e) => {
+                            let d = self.display_time();
+                            self.rt.show_message(id, &e.to_string(), d);
+                        }
+                    }
+                }
+                self.sync_views();
+            }
+        }
+    }
+
+    /// The mouse while a popup or menu is up. Returns false if there is
+    /// none.
+    fn overlay_mouse(&mut self, id: ClientId, m: &MouseEvent) -> bool {
+        use crate::overlay::Overlay;
+        let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return false };
+        match a.overlay.as_mut() {
+            None => false,
+            Some(Overlay::Menu(menu)) => {
+                let click = m.action == MouseAction::Press && m.button == Some(MouseButton::Left);
+                let moved = m.action == MouseAction::Motion;
+                if click || moved {
+                    let outcome = menu.state.mouse(m.cell.x, m.cell.y, click);
+                    self.menu_outcome(id, outcome);
+                }
+                true
+            }
+            Some(Overlay::Popup(p)) => {
+                let (pane, r) = (p.pane, p.inner);
+                let inside = m.cell.x >= r.x && m.cell.x < r.right() && m.cell.y >= r.y && m.cell.y < r.bottom();
+                // Its program gets the mouse if it asked for it; clicks
+                // beside the popup do nothing.
+                if inside
+                    && let Some(pr) = self.rt.panes.get_mut(&pane)
+                    && pr.engine.modes().mouse_tracking
+                {
+                    let local = MouseEvent { cell: Pos { x: m.cell.x - r.x, y: m.cell.y - r.y }, ..*m };
+                    let mut b = Vec::new();
+                    pr.engine.encode_mouse(&local, &mut b);
+                    self.rt.write_input(pane, &b);
+                }
+                true
+            }
+        }
+    }
+
     fn key(&mut self, id: ClientId, key: &KeyEvent, now: Instant) {
+        if self.overlay_key(id, key) {
+            return;
+        }
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
         if let Some(mut p) = a.prompt.take() {
             match p.key(key, &mut self.rt.prompt_history) {
@@ -181,6 +292,10 @@ impl Server {
     fn key_to_pane(&mut self, client: ClientId, pane: PaneId, key: &KeyEvent) {
         if self.rt.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
             self.key_to_mode(client, pane, key);
+            return;
+        }
+        // select-pane -d: nothing typed reaches the program.
+        if self.model.pane_input_off(pane) {
             return;
         }
         // synchronize-panes: the window's other panes get the key too,
@@ -322,6 +437,86 @@ impl Server {
         vi
     }
 
+    /// Set up the choosers commands asked for, and give the open ones a
+    /// list that matches the model again. Called after every model call;
+    /// costs two empty checks when no chooser is open.
+    pub(crate) fn sync_choosers(&mut self) {
+        if !self.rt.pending_choose.is_empty() {
+            for (client, pane, spec) in std::mem::take(&mut self.rt.pending_choose) {
+                let now = crate::sys::wall_clock();
+                let items = self.model.choose_items(&spec, Some(client), now, &self.rt);
+                let start = self.model.choose_start(spec.kind, client);
+                let zoomed = spec.zoomed;
+                let state = lif_core::ChooseState::new(spec, items, start.as_deref());
+                let Some(p) = self.rt.panes.get_mut(&pane) else { continue };
+                if state.is_empty() {
+                    // Nothing to choose from (no buffers): tmux opens an
+                    // empty mode; lif does not open one.
+                    self.model.chooser_closed(pane, zoomed, &mut self.rt);
+                    continue;
+                }
+                p.leave_mode();
+                p.mode = Some(Box::new(crate::choose::ChoosePane::new(state, client, p.engine.size())));
+                if !self.rt.chooser_panes.contains(&pane) {
+                    self.rt.chooser_panes.push(pane);
+                }
+                self.model.pane_changed(pane, &mut self.rt);
+                self.rt.views_stale = true;
+                self.rt.mark_all(true);
+            }
+        }
+        if self.rt.chooser_panes.is_empty() {
+            return;
+        }
+        let panes = std::mem::take(&mut self.rt.chooser_panes);
+        for pane in &panes {
+            self.rebuild_chooser(*pane);
+        }
+        self.rt.chooser_panes = panes;
+        let rt = &mut self.rt;
+        rt.chooser_panes.retain(|p| rt.panes.get_mut(p).is_some_and(|p| p.mode.as_deref_mut().is_some_and(|m| m.chooser().is_some())));
+    }
+
+    /// A new list for the chooser in `pane`, if it has one; a chooser
+    /// with nothing left to list ends.
+    fn rebuild_chooser(&mut self, pane: PaneId) {
+        let Some(c) = self.rt.panes.get_mut(&pane).and_then(|p| p.mode.as_deref_mut()?.chooser()) else { return };
+        let (spec, client) = (c.state.spec().clone(), c.client);
+        let items = self.model.choose_items(&spec, Some(client), crate::sys::wall_clock(), &self.rt);
+        let Some(c) = self.rt.panes.get_mut(&pane).and_then(|p| p.mode.as_deref_mut()?.chooser()) else { return };
+        c.state.set_items(items);
+        c.mark_dirty();
+        if c.state.is_empty() {
+            self.mode_action(None, pane, ModeAction::Exit);
+        }
+    }
+
+    /// Draw the choosers whose state or size changed, before a frame.
+    pub(crate) fn refresh_choosers(&mut self) {
+        if self.rt.chooser_panes.is_empty() {
+            return;
+        }
+        for i in 0..self.rt.chooser_panes.len() {
+            let pane = self.rt.chooser_panes[i];
+            let Some(p) = self.rt.panes.get_mut(&pane) else { continue };
+            let size = p.engine.size();
+            if !p.mode.as_deref_mut().and_then(|m| m.chooser()).is_some_and(|c| c.needs_draw(size)) {
+                continue;
+            }
+            let selected = lif_core::parse_style(&self.model.pane_option_text(pane, "mode-style").unwrap_or_default());
+            // The mode comes out of its pane while it draws: the preview
+            // reads the other panes.
+            let Some(mut mode) = self.rt.panes.get_mut(&pane).and_then(|p| p.mode.take()) else { continue };
+            if let Some(c) = mode.chooser() {
+                c.draw(size, &self.rt.panes, selected);
+            }
+            if let Some(p) = self.rt.panes.get_mut(&pane) {
+                p.mode = Some(mode);
+            }
+            self.rt.mark_all(false);
+        }
+    }
+
     /// Carry out what a mode asked for. `client` is who caused it, if
     /// anyone: prompts and messages go there (or to every client showing
     /// the pane).
@@ -329,8 +524,15 @@ impl Server {
         match action {
             ModeAction::None | ModeAction::Redraw => {}
             ModeAction::Exit => {
+                let mut zoomed = None;
                 if let Some(p) = self.rt.panes.get_mut(&pane) {
+                    zoomed = p.mode.as_deref_mut().and_then(|m| m.chooser()).map(|c| c.state.spec().zoomed);
                     p.leave_mode();
+                }
+                if let Some(z) = zoomed {
+                    self.model.chooser_closed(pane, z, &mut self.rt);
+                    self.rt.views_stale = true;
+                    self.rt.mark_all(true);
                 }
                 for c in self.rt.clients.values_mut() {
                     if let Some(a) = c.att.as_mut() {
@@ -391,6 +593,30 @@ impl Server {
                 }
             }
             ModeAction::Searching => {}
+            ModeAction::Run { commands, exit } => {
+                // A chooser's choices are its client's commands, whoever
+                // pressed the key.
+                let owner = self.rt.panes.get_mut(&pane).and_then(|p| p.mode.as_deref_mut()?.chooser().map(|c| c.client));
+                if exit {
+                    self.mode_action(client, pane, ModeAction::Exit);
+                }
+                let who = owner.or(client).filter(|c| self.rt.clients.get(c).is_some_and(|c| c.att.is_some()));
+                if let Some(c) = who {
+                    for command in &commands {
+                        self.run_string(c, command);
+                    }
+                }
+                return;
+            }
+            ModeAction::Ask { label, single_key } => {
+                for c in self.mode_clients(client, pane) {
+                    if let Some(a) = self.rt.clients.get_mut(&c).and_then(|c| c.att.as_mut()) {
+                        a.prompt = Some(PromptState::ask(pane, &label, single_key));
+                        a.needs_frame = true;
+                    }
+                }
+            }
+            ModeAction::Rebuild => self.rebuild_chooser(pane),
         }
         if let Some(p) = self.rt.panes.get_mut(&pane) {
             let (searching, scroll) = p.mode.as_deref().map_or((false, false), |m| (m.searching(), m.autoscroll_active()));
@@ -459,6 +685,9 @@ impl Server {
     // ----- mouse ---------------------------------------------------------
 
     fn mouse(&mut self, id: ClientId, m: &MouseEvent, now: std::time::Instant) {
+        if self.overlay_mouse(id, m) {
+            return;
+        }
         let now_ms = self.now_ms(now);
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
         let (x, y) = (m.cell.x, m.cell.y);
@@ -691,7 +920,28 @@ impl Server {
         if a.prompt.is_some() {
             return;
         }
-        let Some(pane) = a.view.as_ref().map(|v| v.active_pane) else { return };
+        // A paste goes to a popup's program; a menu takes none.
+        let over = match a.overlay.as_ref() {
+            Some(crate::overlay::Overlay::Popup(p)) => Some((!p.exited).then_some(p.pane)),
+            Some(crate::overlay::Overlay::Menu(_)) => Some(None),
+            None => None,
+        };
+        let pane = match over {
+            Some(None) => {
+                a.paste = None;
+                return;
+            }
+            Some(Some(p)) => p,
+            None => match a.view.as_ref().map(|v| v.active_pane) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        if self.model.pane_input_off(pane) {
+            a.paste = None;
+            return;
+        }
+        let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
         a.paste = Some(pane);
         a.paste_dropping = false;
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };

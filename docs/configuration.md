@@ -113,6 +113,8 @@ Value types used below:
 | `escape-time` | integer (ms) | `5` | How long a lone Escape from a terminal using the legacy key encoding waits for the rest of a sequence (Alt+key, arrows); 0 never waits. With the kitty keyboard protocol (enabled when the terminal supports it) Escape never waits. tmux's default is 10. | `escape-time` |
 | `exit-empty` | bool | `true` | Stop the server when the last session closes. | `exit-empty` |
 | `buffer-limit` | integer (from 1) | `50` | How many automatically named paste buffers are kept. | `buffer-limit` |
+| `clock-mode-colour` | string | `"blue"` | Color of the clock of `clock-mode`. | `clock-mode-colour` |
+| `clock-mode-style` | choice: `"12"`, `"24"` | `"24"` | 12- or 24-hour clock. | `clock-mode-style` |
 | `detach-on-destroy` | choice: `"off"`, `"on"`, `"no-detached"`, `"previous"`, `"next"` | `"on"` | What attached clients do when their session is destroyed: detach, or switch to another session. | `detach-on-destroy` |
 | `base-index` | integer | `0` | Number of the first window. | `base-index` |
 | `pane-base-index` | integer (0-65535) | `0` | Number of the first pane. | `pane-base-index` |

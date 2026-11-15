@@ -47,6 +47,19 @@ struct TestHost {
     fail_jobs: bool,
     /// Panes whose history was cleared.
     cleared: Vec<PaneId>,
+    /// Choosers asked for.
+    choosers: Vec<(ClientId, PaneId, ChooseSpec)>,
+    /// `pipe-pane` commands, by pane, and every start and stop in order.
+    pipes: HashMap<PaneId, String>,
+    pipe_calls: Vec<(PaneId, Option<String>)>,
+    /// Popups and menus opened, and whether a client has one up.
+    popups: Vec<(ClientId, PopupSpec)>,
+    menus: Vec<(ClientId, MenuState)>,
+    overlay_up: bool,
+    overlays_closed: u32,
+    /// Panes put into clock mode.
+    clocks: Vec<PaneId>,
+    history: Vec<String>,
 }
 
 impl Host for TestHost {
@@ -72,6 +85,38 @@ impl Host for TestHost {
     }
     fn clear_history(&mut self, pane: PaneId) {
         self.cleared.push(pane);
+    }
+    fn clock_mode(&mut self, pane: PaneId) {
+        self.clocks.push(pane);
+    }
+    fn popup(&mut self, client: ClientId, spec: PopupSpec) -> Result<(), String> {
+        self.popups.push((client, spec));
+        Ok(())
+    }
+    fn menu(&mut self, client: ClientId, menu: MenuState) -> Result<(), String> {
+        self.menus.push((client, menu));
+        Ok(())
+    }
+    fn has_overlay(&self, _client: ClientId) -> bool {
+        self.overlay_up
+    }
+    fn close_overlay(&mut self, _client: ClientId) {
+        self.overlays_closed += 1;
+    }
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, _cwd: &str) -> Result<(), String> {
+        self.pipe_calls.push((pane, command.map(str::to_string)));
+        match command {
+            Some(c) => self.pipes.insert(pane, c.to_string()),
+            None => self.pipes.remove(&pane),
+        };
+        Ok(())
+    }
+    fn prompt_history(&mut self, clear: bool) -> Vec<String> {
+        if clear { std::mem::take(&mut self.history) } else { self.history.clone() }
+    }
+    fn choose(&mut self, client: ClientId, pane: PaneId, spec: ChooseSpec) -> Result<(), String> {
+        self.choosers.push((client, pane, spec));
+        Ok(())
     }
     fn kill_pane(&mut self, pane: PaneId) {
         self.killed.push(pane);
@@ -100,6 +145,7 @@ impl Host for TestHost {
             history_size: 0,
             history_bytes: 0,
             in_mode: self.in_mode.contains(&pane),
+            pipe: self.pipes.contains_key(&pane),
         }
     }
     fn capture_pane(&self, pane: PaneId, range: CaptureRange) -> String {
@@ -1940,4 +1986,435 @@ fn new_window_from_inside_a_pane_takes_a_free_index() {
     t.ctx = CmdContext { client: Some(c), pane: Some(PaneId(0)), now: NOW };
     assert_eq!(t.ok("new-window -d -P"), "a:1.0\n");
     assert_eq!(t.err("new-window -d -t a:0"), "create window failed: index 0 in use");
+}
+
+// ----- chooser modes (layout and keys read off tmux 3.8's screen) ---------
+
+fn key(name: &str) -> KeyEvent {
+    KeyCode::parse(name).unwrap_or_else(|| panic!("key {name}")).to_event()
+}
+
+impl T {
+    /// Runs a chooser command for an attached client and opens its mode.
+    fn chooser(&mut self, cmd: &str) -> ChooseState {
+        self.ok(cmd);
+        let (client, _, spec) = self.h.choosers.pop().expect("a chooser");
+        let items = self.m.choose_items(&spec, Some(client), NOW, &self.h);
+        let start = self.m.choose_start(spec.kind, client);
+        ChooseState::new(spec, items, start.as_deref())
+    }
+
+    fn rebuild(&mut self, s: &mut ChooseState) {
+        let items = self.m.choose_items(s.spec(), None, NOW, &self.h);
+        s.set_items(items);
+    }
+}
+
+fn lines(s: &mut ChooseState) -> Vec<String> {
+    s.screen(80, 24).lines.into_iter().map(|l| format!("{}{}", if l.selected { ">" } else { " " }, l.text)).collect()
+}
+
+fn tree_setup() -> (T, ClientId) {
+    let mut t = T::with_session();
+    t.ok("new-window -d -n second ; split-window -d -t a:0 ; new -d -s b");
+    let c = t.attach_client(1, 80, 24);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach -t a");
+    t.h.titles.insert(PaneId(0), "vim".into());
+    (t, c)
+}
+
+#[test]
+fn choose_tree_lists_sessions_windows_and_panes() {
+    let (mut t, c) = tree_setup();
+    assert_eq!(t.err("choose-tree -O bogus"), "invalid sort order: bogus");
+    let mut s = t.chooser("choose-tree");
+    assert_eq!(
+        lines(&mut s),
+        [
+            " (0) - a: 2 windows (attached)",
+            " (1) ├─→ - 0: zsh*",
+            ">(2) │   ├─→ 0: zsh*: \"vim\"",
+            " (3) │   └─→ 1: zsh: \"box.local\"",
+            " (4) └─→ - 1: second: \"box.local\"",
+            " (5)     └─→ 0: zsh*: \"box.local\"",
+            " (6) - b: 1 windows",
+            " (7) └─→ - 0: zsh*: \"box.local\"",
+            " (8)     └─→ 0: zsh*: \"box.local\"",
+        ],
+        "everything open, the client's pane selected"
+    );
+    // -s and -w start collapsed, on the nearest line that is shown.
+    let mut s = t.chooser("choose-tree -s");
+    assert_eq!(lines(&mut s), [">(0) + a: 2 windows (attached)", " (1) + b: 1 windows"]);
+    let mut s = t.chooser("choose-tree -w");
+    assert_eq!(
+        lines(&mut s),
+        [
+            " (0) - a: 2 windows (attached)",
+            ">(1) ├─→ + 0: zsh*",
+            " (2) └─→ + 1: second: \"box.local\"",
+            " (3) - b: 1 windows",
+            " (4) └─→ + 0: zsh*: \"box.local\""
+        ]
+    );
+    // The screen: half the pane for a short list, a box with a preview.
+    let scr = s.screen(80, 23);
+    assert_eq!((scr.list_rows, scr.title.as_deref()), (11, Some("0 (sort: index) (view: preview)")));
+    assert_eq!(scr.preview, Preview::Panes(vec![(PaneId(0), "0:vim".into()), (PaneId(2), "1:box.local".into())]));
+    assert_eq!(s.screen(80, 11).title, None, "no preview in a small pane");
+    // Moving, expanding, collapsing.
+    assert_eq!(s.key(&key("Down")), ChooseOutcome::Redraw);
+    assert_eq!(s.key(&key("Right")), ChooseOutcome::Redraw);
+    assert_eq!(lines(&mut s)[2..4], [">(2) └─→ - 1: second: \"box.local\"", " (3)     └─→ 0: zsh*: \"box.local\""]);
+    s.key(&key("Down"));
+    s.key(&key("Left"));
+    assert_eq!(lines(&mut s)[2], ">(2) └─→ - 1: second: \"box.local\"", "left on a leaf goes to its parent");
+    s.key(&key("M--"));
+    assert_eq!(lines(&mut s), [">(0) + a: 2 windows (attached)", " (1) + b: 1 windows"]);
+    s.key(&key("Up"));
+    assert_eq!(lines(&mut s)[1], ">(1) + b: 1 windows", "one step up from the top wraps");
+    // Choosing: Enter, or the shortcut on the line.
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Choose("switch-client -t '=b:'".into()));
+    assert_eq!(s.key(&key("0")), ChooseOutcome::Choose("switch-client -t '=a:'".into()));
+    s.key(&key("M-+"));
+    assert_eq!(s.key(&key("3")), ChooseOutcome::Choose("switch-client -t '=a:0.%2'".into()));
+    assert_eq!(s.key(&key("q")), ChooseOutcome::Exit);
+    // A template of the caller's.
+    let mut s = t.chooser("choose-tree -s 'kill-session -t \"%%\"'");
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Choose("kill-session -t \"=a:\"".into()));
+    let _ = c;
+}
+
+#[test]
+fn choose_tree_tags_kills_searches_and_filters() {
+    let (mut t, _) = tree_setup();
+    let mut s = t.chooser("choose-tree -w");
+    // x asks, y kills, the list follows the model.
+    assert_eq!(s.key(&key("x")), ChooseOutcome::Prompt { label: "Kill window 0?".into() });
+    assert!(s.confirming());
+    assert_eq!(s.prompt_accept("n"), ChooseOutcome::Redraw);
+    s.key(&key("x"));
+    let ChooseOutcome::Run(cmds) = s.prompt_accept("y") else { panic!("not run") };
+    assert_eq!(cmds, ["kill-window -t @0"]);
+    t.ok(&cmds[0]);
+    t.rebuild(&mut s);
+    assert_eq!(lines(&mut s), [" (0) - a: 1 windows (attached)", ">(1) └─→ + 1: second*: \"box.local\"", " (2) - b: 1 windows", " (3) └─→ + 0: zsh*: \"box.local\""]);
+    // Tags: t tags and moves on, X kills the tagged, : runs a command for each.
+    s.key(&key("t"));
+    assert_eq!(lines(&mut s)[1..3], [" (1) └─→ + 1*: second*: \"box.local\"", ">(2) - b: 1 windows"]);
+    s.key(&key("t"));
+    assert_eq!(s.key(&key(":")), ChooseOutcome::Prompt { label: "(2 tagged)".into() });
+    assert_eq!(s.prompt_accept("display -p '%%'"), ChooseOutcome::Run(vec!["display -p '=a:1.'".into(), "display -p '=b:'".into()]));
+    assert_eq!(s.key(&key("X")), ChooseOutcome::Prompt { label: "Kill 2 tagged?".into() });
+    assert_eq!(s.prompt_cancel(), ChooseOutcome::Redraw);
+    s.key(&key("T"));
+    assert_eq!(s.key(&key(":")), ChooseOutcome::Prompt { label: "(current)".into() });
+    s.prompt_cancel();
+    // Search: the next line that contains it, opening what hides it.
+    assert_eq!(s.key(&key("C-s")), ChooseOutcome::Prompt { label: "(search)".into() });
+    assert_eq!(s.prompt_accept("SECOND"), ChooseOutcome::Redraw);
+    assert_eq!(lines(&mut s)[1], ">(1) └─→ + 1: second*: \"box.local\"");
+    assert_eq!(s.key(&key("n")), ChooseOutcome::Redraw, "the only match again");
+    // Sort order and reverse ask for a new list.
+    assert_eq!(s.key(&key("O")), ChooseOutcome::Rebuild);
+    assert_eq!(s.spec().sort, 1);
+    assert_eq!(s.key(&key("r")), ChooseOutcome::Rebuild);
+    t.rebuild(&mut s);
+    assert_eq!(lines(&mut s)[0], " (0) - b: 1 windows", "by name, reversed");
+    assert_eq!(s.screen(80, 23).title.as_deref(), Some("1 (sort: name, reversed) (view: preview)"));
+    // A filter; one that leaves nothing is ignored.
+    assert_eq!(s.key(&key("f")), ChooseOutcome::Prompt { label: "(filter)".into() });
+    assert_eq!(s.prompt_accept("#{==:#{session_name},a}"), ChooseOutcome::Rebuild);
+    t.rebuild(&mut s);
+    assert_eq!(lines(&mut s), [" (0) - a: 1 windows (attached)", ">(1) └─→ + 1: second*: \"box.local\""]);
+    s.key(&key("f"));
+    s.prompt_accept("0");
+    t.rebuild(&mut s);
+    assert_eq!(lines(&mut s).len(), 4);
+    assert_eq!(s.key(&key("c")), ChooseOutcome::Rebuild);
+    // The mouse: a click selects, a double click chooses, the wheel moves.
+    assert_eq!(s.mouse(Some(0), false, 0), ChooseOutcome::Redraw);
+    assert!(matches!(s.mouse(Some(0), true, 0), ChooseOutcome::Choose(_)));
+    assert_eq!(s.mouse(None, false, 1), ChooseOutcome::Redraw);
+    assert_eq!(s.mouse(Some(20), false, 0), ChooseOutcome::None, "below the list");
+    // Everything gone: nothing left to show.
+    t.ok("kill-session -t b ; kill-session -t a");
+    t.rebuild(&mut s);
+    assert!(s.is_empty());
+}
+
+#[test]
+fn choose_buffer_client_and_find_window() {
+    let (mut t, c) = tree_setup();
+    t.ok("set-buffer -b named 'hello world' ; set-buffer 'second buffer'");
+    let mut s = t.chooser("choose-buffer");
+    assert_eq!(lines(&mut s), [">(0) buffer0000: 21:50: second buffer", " (1) named: 21:50: hello world"]);
+    let scr = s.screen(80, 23);
+    assert_eq!(scr.title.as_deref(), Some("buffer0000 (sort: creation)"));
+    assert_eq!(scr.preview, Preview::Text("second buffer".into()));
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Choose("paste-buffer -p -b 'buffer0000'".into()));
+    s.key(&key("Down"));
+    assert_eq!(s.key(&key("d")), ChooseOutcome::Run(vec!["delete-buffer -b 'named'".into()]));
+    assert_eq!(s.key(&key("O")), ChooseOutcome::Rebuild);
+    t.rebuild(&mut s);
+    assert_eq!(lines(&mut s)[0], " (0) buffer0000: 21:50: second buffer", "by name");
+    // Clients: the attached ones.
+    let mut s = t.chooser("choose-client");
+    assert_eq!(lines(&mut s), [">(0) /dev/ttys001: 21:50: session a"]);
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Choose("detach-client -t '/dev/ttys001'".into()));
+    assert_eq!(s.key(&key("x")), ChooseOutcome::Run(vec!["detach-client -P -t '/dev/ttys001'".into()]));
+    assert_eq!(s.key(&key("z")), ChooseOutcome::Run(vec!["suspend-client -t '/dev/ttys001'".into()]));
+    // find-window: the tree with the windows that match (name, title,
+    // visible text); no match shows everything, as tmux does.
+    let mut s = t.chooser("find-window sec");
+    assert_eq!(lines(&mut s), [">(0) - a: 2 windows (attached)", " (1) └─→ - 1: second: \"box.local\"", " (2)     └─→ 0: zsh*: \"box.local\""]);
+    s.key(&key("Down"));
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Choose("switch-client -t '=a:1.'".into()));
+    let mut s = t.chooser("find-window -T vim");
+    assert_eq!(lines(&mut s)[1], " (1) └─→ - 0: zsh*");
+    let mut s = t.chooser("find-window -N vim");
+    assert_eq!(lines(&mut s).len(), 9, "no window is named vim");
+    let mut s = t.chooser("find-window -i -C CAPTURED");
+    assert_eq!(lines(&mut s).len(), 9, "every pane's text matches");
+    assert_eq!(t.err("find-window -r x"), "find-window -r is not supported: lif matches with shell patterns");
+    // -Z zooms the pane for the mode, and only then is there a zoom to undo.
+    t.ok("choose-tree -Z -t a:0.0");
+    let (_, pane, spec) = t.h.choosers.pop().unwrap();
+    assert!(spec.zoomed);
+    assert_eq!(t.ok("display -p -t a:0 '#{window_zoomed_flag}'"), "1\n");
+    t.m.chooser_closed(pane, spec.zoomed, &mut t.h);
+    assert_eq!(t.ok("display -p -t a:0 '#{window_zoomed_flag}'"), "0\n");
+    t.ok("choose-tree -Z -t a:1.0");
+    assert!(!t.h.choosers.pop().unwrap().2.zoomed, "one pane: nothing to zoom");
+    // Without a client there is nobody to show it to.
+    t.m.client_disconnect(c, &mut t.h);
+    t.ctx = CmdContext::none(NOW);
+    assert_eq!(t.err("choose-tree"), "no clients");
+}
+
+// ----- the smaller commands of 0.3 (tmux 3.8 checked) ---------------------
+
+#[test]
+fn split_window_full_size() {
+    // Sizes as tmux 3.8 gives them for the same commands (in a window one
+    // row higher: this session has no client, so no status line).
+    let mut t = T::with_session();
+    t.ok("split-window -d -h ; split-window -d -f");
+    let fmt = "list-panes -F '#{pane_index} #{pane_left},#{pane_top} #{pane_width}x#{pane_height}'";
+    assert_eq!(t.ok(fmt), "0 0,0 40x12\n1 41,0 39x12\n2 0,13 80x11\n");
+    t.ok("split-window -d -f -h -b -l 10");
+    assert_eq!(t.ok(fmt), "0 0,0 10x24\n1 11,0 34x12\n2 46,0 34x12\n3 11,13 69x11\n");
+    // A root split the same way takes the pane as one more child.
+    let mut t = T::with_session();
+    t.ok("split-window -d -h ; split-window -d -h -f -l 20");
+    assert_eq!(t.ok(fmt), "0 0,0 29x24\n1 30,0 29x24\n2 60,0 20x24\n");
+    t.ok("new -d -s tiny -x 80 -y 2");
+    assert_eq!(t.err("split-window -f -t tiny"), t.err("split-window -t tiny"));
+}
+
+#[test]
+fn resize_and_respawn_window() {
+    let mut t = T::with_session();
+    t.ok("new-window -d");
+    t.ok("resize-window -t a:1 -x 100 -y 30");
+    assert_eq!(t.ok("display -p -t a:1 '#{window_width}x#{window_height}'"), "100x30\n");
+    assert_eq!(t.ok("show -w -t a:1 window-size"), "window-size manual\n");
+    assert_eq!(t.ok("show -w -t a:0 window-size"), "", "only that window");
+    t.ok("resize-window -t a:1 -L 5 ; resize-window -t a:1 -D");
+    assert_eq!(t.ok("display -p -t a:1 '#{window_width}x#{window_height}'"), "95x31\n");
+    t.ok("resize-window -t a:1 -R 3 ; resize-window -t a:1 -U 11");
+    assert_eq!(t.ok("display -p -t a:1 '#{window_width}x#{window_height}'"), "98x20\n");
+    assert_eq!(t.err("resize-window -t a:1 -x 5000000"), "width too large");
+    assert_eq!(t.err("resize-window -t a:1 -y 0"), "height too small");
+    assert_eq!(t.err("resize-window -t a:1 -U x"), "adjustment invalid");
+    // A client's size does not move a manual window; -A takes the largest client's.
+    let c = t.attach_client(1, 120, 40);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach -t a");
+    assert_eq!(t.ok("display -p -t a:1 '#{window_width}x#{window_height}'"), "98x20\n");
+    t.ok("resize-window -t a:1 -A");
+    assert_eq!(t.ok("display -p -t a:1 '#{window_width}x#{window_height}'"), "120x39\n");
+    // respawn-window: one pane again, running the new command.
+    t.ok("split-window -d -t a:1 ; split-window -d -t a:1");
+    assert_eq!(t.err("respawn-window -t a:1"), "respawn window failed: window a:1 still active");
+    let spawned = t.h.spawned.len();
+    t.ok("respawn-window -k -c /tmp -e A=1 -t a:1 'echo again'");
+    assert_eq!(t.ok("list-panes -t a:1 -F '#{pane_id} #{pane_start_command} #{pane_start_path}'"), "%1 echo again /tmp\n");
+    assert_eq!(t.h.spawned.len(), spawned + 1);
+    let spec = t.h.spawned.last().unwrap();
+    assert!(spec.respawn && spec.env.last() == Some(&("A".to_string(), Some("1".to_string()))));
+    assert_eq!(t.h.killed.len(), 3, "two panes closed, the first one's process replaced");
+}
+
+#[test]
+fn pipe_pane_input_off_clock_and_prompt_history() {
+    let mut t = T::with_session();
+    t.ok("pipe-pane 'cat > #{session_name}.log'");
+    assert_eq!(t.h.pipes[&PaneId(0)], "cat > a.log", "the command is a format");
+    assert_eq!(t.ok("display -p '#{pane_pipe}'"), "1\n");
+    // -o toggles: with a pipe open it only closes it.
+    t.ok("pipe-pane -o 'cat > other'");
+    assert_eq!(t.ok("display -p '#{pane_pipe}'"), "0\n");
+    t.ok("pipe-pane -o 'cat > other'");
+    assert_eq!(t.h.pipes[&PaneId(0)], "cat > other");
+    // A new command replaces the old one; no command stops it.
+    t.h.pipe_calls.clear();
+    t.ok("pipe-pane 'cat > third'");
+    assert_eq!(t.h.pipe_calls, [(PaneId(0), None), (PaneId(0), Some("cat > third".into()))]);
+    t.ok("pipe-pane");
+    assert!(t.h.pipes.is_empty());
+    assert!(t.err("pipe-pane -I x").starts_with("pipe-pane -I is not supported"));
+    // select-pane -d and -e.
+    assert_eq!(t.ok("display -p '#{pane_input_off}'"), "0\n");
+    t.ok("split-window -d ; select-pane -d -t %1");
+    assert!(t.m.pane_input_off(PaneId(1)) && !t.m.pane_input_off(PaneId(0)));
+    assert_eq!(t.ok("display -p -t %1 '#{pane_input_off} #{pane_active}'"), "1 0\n", "nothing is selected");
+    t.ok("select-pane -e -t %1");
+    assert!(!t.m.pane_input_off(PaneId(1)));
+    // clock-mode and the prompt history go to the host.
+    t.ok("clock-mode -t %1");
+    assert_eq!(t.h.clocks, [PaneId(1)]);
+    assert_eq!(t.ok("show-prompt-history"), "History for command:\n\n\nHistory for search:\n\n\n");
+    t.h.history = vec!["display hi".into(), "ls".into()];
+    assert_eq!(t.ok("show-prompt-history -T command"), "History for command:\n\n1: display hi\n2: ls\n\n");
+    assert_eq!(t.ok("showphist -T search"), "History for search:\n\n\n");
+    assert_eq!(t.err("show-prompt-history -T bogus"), "invalid type: bogus");
+    t.ok("clear-prompt-history -T search");
+    assert_eq!(t.h.history.len(), 2, "another type's history stays");
+    t.ok("clearphist");
+    assert!(t.h.history.is_empty());
+    // The default bindings have tmux's notes.
+    assert_eq!(t.ok("list-keys -1N c"), "C-b c Create a new window\n");
+    assert_eq!(t.ok("list-keys -1N t"), "C-b t Show a clock\n");
+}
+
+// ----- popups and menus (geometry and statuses read off tmux 3.8) ---------
+
+fn overlay_setup() -> (T, ClientId) {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 24);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach -t a");
+    (t, c)
+}
+
+#[test]
+fn display_popup_places_and_waits() {
+    let (mut t, c) = overlay_setup();
+    let rect = |t: &mut T, cmd: &str| {
+        t.park(cmd);
+        let r = t.h.popups.last().unwrap().1.rect;
+        (r.x, r.y, r.cols, r.rows)
+    };
+    // Half the screen, tmux's centre (one up and left of the middle).
+    assert_eq!(rect(&mut t, "display-popup"), (19, 5, 40, 12));
+    assert_eq!(rect(&mut t, "display-popup -w 20 -h 6"), (29, 8, 20, 6));
+    assert_eq!(rect(&mut t, "display-popup -w 21 -h 7"), (29, 7, 21, 7));
+    // -y is the row below the popup; R the right edge, S the status line.
+    assert_eq!(rect(&mut t, "display-popup -w 30 -h 8 -x 5 -y 12"), (5, 4, 30, 8));
+    assert_eq!(rect(&mut t, "display-popup -w 50% -h 50% -x R -y S"), (40, 11, 40, 12));
+    assert_eq!(rect(&mut t, "display-popup -w 20 -h 5 -x 0 -y 0"), (0, 0, 20, 5), "moved to fit");
+    assert_eq!(rect(&mut t, "display-popup -w 20 -h 5 -x 70 -y 40"), (60, 19, 20, 5));
+    assert_eq!(rect(&mut t, "display-popup -w 20 -h 5 -x P -y P"), (0, 18, 20, 5), "by the pane");
+    assert_eq!(t.err("display-popup -w 0"), "width too small");
+    assert_eq!(t.err("display-popup -w 500 -h 500"), "height too large");
+    assert_eq!(t.err("display-popup -w 500"), "width too large");
+    assert_eq!(t.err("display-popup -x left"), "invalid position: left");
+    assert_eq!(t.err("display-popup -b wavy"), "invalid border lines: wavy");
+    assert_eq!(t.err("display-popup -t nosuch"), "can't find pane: nosuch");
+    // What the host gets.
+    t.h.popups.clear();
+    t.ok("setenv -g FROM global");
+    t.park("display-popup -E -b rounded -T ' #{session_name} ' -d /tmp -e A=1 -s bg=blue -S fg=red 'make test' ; display -p after");
+    let (client, p) = t.h.popups.pop().unwrap();
+    assert_eq!(client, c);
+    assert_eq!((p.border, p.title.as_str(), p.close, p.any_key), (BorderLines::Rounded, " a ", PopupClose::OnExit, false));
+    assert_eq!((p.cwd.as_str(), p.style.as_str(), p.border_style.as_str()), ("/tmp", "bg=blue", "fg=red"));
+    assert_eq!(p.command, SpawnCommand::Shell { shell: "/bin/zsh".into(), command: "make test".into() });
+    assert_eq!(p.env, [("FROM".to_string(), Some("global".to_string())), ("A".to_string(), Some("1".to_string()))]);
+    assert_eq!((p.session, p.pane), (SessionId(0), PaneId(0)));
+    // The list waits for the popup; its program's status is the client's.
+    assert!(!t.m.has_finished());
+    t.m.job_done(p.id, JobStatus::Exited(3), b"", NOW, &mut t.h);
+    let f = t.m.take_finished().pop().unwrap();
+    assert_eq!((f.stdout.as_str(), f.status, f.waited), ("after\n", 3, true));
+    t.park("display-popup -EE -B -k");
+    let p = &t.h.popups.last().unwrap().1;
+    assert_eq!((p.border, p.close, p.any_key), (BorderLines::None, PopupClose::OnSuccess, true));
+    assert_eq!(p.command, SpawnCommand::LoginShell { shell: "/bin/zsh".into() });
+    // One at a time; -C closes.
+    t.h.overlay_up = true;
+    let n = t.h.popups.len();
+    assert_eq!(t.ok("display-popup 'second'"), "");
+    assert_eq!(t.h.popups.len(), n, "a second popup is not opened");
+    t.ok("display-popup -C");
+    assert_eq!(t.h.overlays_closed, 1);
+    // Nobody to show it to.
+    t.h.overlay_up = false;
+    t.m.client_disconnect(c, &mut t.h);
+    t.ctx = CmdContext::none(NOW);
+    assert_eq!(t.err("display-popup"), "no clients");
+}
+
+#[test]
+fn display_menu_items_keys_and_mouse() {
+    let (mut t, c) = overlay_setup();
+    assert_eq!(t.err("display-menu a"), "not enough arguments");
+    assert_eq!(t.err("display-menu a b"), "not enough arguments");
+    assert_eq!(t.err("display-menu a NotAKey c"), "unknown key: NotAKey");
+    t.ok("display-menu -T '#[align=centre]Title' First f 'display -p first' 'Second item' s 'display -p second' '' '-Disabled' d 'display d' '#{?pane_dead,Hidden,}' h '' Last '' 'display -p last'");
+    let (client, mut m) = t.h.menus.pop().unwrap();
+    assert_eq!(client, c);
+    // tmux's layout: the title, names and keys in columns, a separator.
+    assert_eq!(m.title, "Title");
+    assert_eq!(
+        m.lines(),
+        [Some(" First       (f) ".into()), Some(" Second item (s) ".into()), None, Some(" Disabled        ".into()), Some(" Last            ".into())]
+    );
+    assert_eq!((m.rect.x, m.rect.y, m.rect.cols, m.rect.rows), (30, 7, 19, 7), "centred as tmux centres it");
+    assert_eq!(m.selected, Some(0), "opened by a command: the first item");
+    // Down skips the separator and the disabled item, and wraps.
+    assert_eq!(m.key(&key("Down")), MenuOutcome::Redraw);
+    assert_eq!(m.key(&key("Down")), MenuOutcome::Redraw);
+    assert_eq!(m.selected, Some(4));
+    assert_eq!(m.key(&key("Down")), MenuOutcome::Redraw);
+    assert_eq!(m.selected, Some(0));
+    assert_eq!(m.key(&key("Up")), MenuOutcome::Redraw);
+    assert_eq!(m.selected, Some(4));
+    assert_eq!(m.key(&key("Enter")), MenuOutcome::Run("display -p last".into()));
+    // An item's key chooses it; a disabled item's does nothing.
+    assert_eq!(m.key(&key("s")), MenuOutcome::Run("display -p second".into()));
+    assert_eq!(m.key(&key("d")), MenuOutcome::None);
+    assert_eq!(m.key(&key("x")), MenuOutcome::None);
+    assert_eq!(m.key(&key("q")), MenuOutcome::Close);
+    assert_eq!(m.key(&key("Escape")), MenuOutcome::Close);
+    // The mouse: over an item selects, a click chooses, a click outside closes.
+    assert_eq!(m.mouse(32, 9, false), MenuOutcome::Redraw);
+    assert_eq!(m.selected, Some(1));
+    assert_eq!(m.mouse(32, 9, false), MenuOutcome::None);
+    assert_eq!(m.mouse(32, 10, true), MenuOutcome::None, "the separator");
+    assert_eq!(m.mouse(32, 8, true), MenuOutcome::Run("display -p first".into()));
+    assert_eq!(m.mouse(2, 2, false), MenuOutcome::None);
+    assert_eq!(m.mouse(2, 2, true), MenuOutcome::Close);
+    // Positions and the starting choice.
+    t.ok("display-menu -x 3 -y 10 -C 1 A a '' B b ''");
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!((m.rect.x, m.rect.y, m.rect.cols, m.rect.rows, m.selected), (3, 6, 9, 4, Some(1)));
+    t.ok("display-menu -x R -y S -C - Only o ''");
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!((m.rect.x, m.rect.y, m.selected), (68, 20, None));
+    // Separators never lead, trail or double; nothing to show opens nothing.
+    t.ok("display-menu '' A a '' '' '' B b '' ''");
+    assert_eq!(t.h.menus.pop().unwrap().1.lines().len(), 3);
+    t.ok("display-menu '#{?pane_dead,x,}' a ''");
+    assert!(t.h.menus.is_empty());
+    // The default menus open.
+    let list = t.m.bindings().lookup(bindings::PREFIX_TABLE, &key("<")).unwrap().commands.clone();
+    t.m.execute_list(&list, &t.ctx, &mut t.h).unwrap();
+    let m = t.h.menus.pop().unwrap().1;
+    assert_eq!(m.title, "0:zsh");
+    assert_eq!(m.lines()[0].as_deref(), Some(" Swap Left      "), "one window: nothing to swap with, so no key");
+    assert!(matches!(&m.items[0], MenuItem::Entry { enabled: false, .. }));
+    assert_eq!(m.lines()[3].as_deref(), Some(" Kill       (X) "));
 }

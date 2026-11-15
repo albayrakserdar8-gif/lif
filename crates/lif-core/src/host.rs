@@ -170,6 +170,8 @@ pub struct PaneInfo<'a> {
     pub history_bytes: usize,
     /// The pane shows copy mode (or another mode) instead of its program.
     pub in_mode: bool,
+    /// `pipe-pane` is piping the pane's output to a command.
+    pub pipe: bool,
 }
 
 /// A line position for `capture-pane -S/-E`.
@@ -353,6 +355,70 @@ pub trait Host {
     fn start_timer(&mut self, id: u64, delay_ms: u64) -> Result<(), String> {
         let _ = (id, delay_ms);
         Err("timers are not supported here".into())
+    }
+
+    /// `choose-tree`, `choose-buffer`, `choose-client`, `find-window`:
+    /// put `pane` into the chooser mode `spec` describes, for `client`
+    /// (whose commands the choices run as). The host builds the list with
+    /// [`Model::choose_items`](crate::Model::choose_items) after this call
+    /// returns, and calls
+    /// [`Model::chooser_closed`](crate::Model::chooser_closed) when the
+    /// mode ends.
+    fn choose(&mut self, client: ClientId, pane: PaneId, spec: crate::choose::ChooseSpec) -> Result<(), String> {
+        let _ = (client, pane, spec);
+        Err("chooser modes are not supported here".into())
+    }
+
+    /// `display-popup`: open a popup on `client`'s screen and run its
+    /// program. When it closes, report it with
+    /// [`Model::job_done`](crate::Model::job_done) (`spec.id`).
+    fn popup(&mut self, client: ClientId, spec: crate::overlay::PopupSpec) -> Result<(), String> {
+        let _ = (client, spec);
+        Err("popups are not supported here".into())
+    }
+
+    /// `display-menu`: show a menu on `client`'s screen. Its keys and
+    /// clicks go to [`MenuState`](crate::MenuState); the command it gives
+    /// runs for the client, with `menu.pane` as the current pane.
+    fn menu(&mut self, client: ClientId, menu: crate::overlay::MenuState) -> Result<(), String> {
+        let _ = (client, menu);
+        Err("menus are not supported here".into())
+    }
+
+    /// Whether `client` has a popup or menu up.
+    fn has_overlay(&self, client: ClientId) -> bool {
+        let _ = client;
+        false
+    }
+
+    /// `display-popup -C`: close `client`'s popup or menu, if any.
+    fn close_overlay(&mut self, client: ClientId) {
+        let _ = client;
+    }
+
+    /// `clock-mode`: show a large clock in the pane until a key is
+    /// pressed there.
+    fn clock_mode(&mut self, pane: PaneId) {
+        let _ = pane;
+    }
+
+    /// `pipe-pane`: from now on, also write what the program in `pane`
+    /// prints to the standard input of `command` (`/bin/sh -c`, started
+    /// in `cwd`); `None` stops a pipe. A pane has at most one: a new
+    /// command replaces the old.
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str) -> Result<(), String> {
+        let _ = (pane, cwd);
+        match command {
+            Some(c) => Err(format!("{c}: shell commands are not supported here")),
+            None => Ok(()),
+        }
+    }
+
+    /// `show-prompt-history` / `clear-prompt-history`: what was typed at
+    /// the command prompt, oldest first; `clear` forgets it.
+    fn prompt_history(&mut self, clear: bool) -> Vec<String> {
+        let _ = clear;
+        Vec::new()
     }
 
     /// `clear-history`: drop the pane's scrollback (and leave any mode it

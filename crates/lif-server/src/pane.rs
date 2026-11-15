@@ -85,6 +85,8 @@ pub(crate) struct PaneRt {
     /// Output arrived since the last name check (a program may have started).
     pub(crate) output_seen: bool,
     pub(crate) mode: Option<Box<dyn PaneMode>>,
+    /// `pipe-pane`: the command that also gets the pane's output.
+    pub(crate) pipe: Option<crate::pipe::PanePipe>,
     /// The mode's search runs: step it once per loop turn.
     pub(crate) searching: bool,
     /// Who started the mode's current search (its messages go there).
@@ -168,6 +170,7 @@ impl PaneRt {
             name_recheck: None,
             output_seen: false,
             mode: None,
+            pipe: None,
             searching: false,
             search_client: None,
             search_rows: lif_copy::DEFAULT_SEARCH_STEP_ROWS,
@@ -264,6 +267,9 @@ impl PaneRt {
                         u.feed(&buf[..filled], &mut |b| engine.feed(b));
                     }
                     None => self.engine.feed(&buf[..filled]),
+                }
+                if let Some(pipe) = self.pipe.as_mut() {
+                    pipe.push(&buf[..filled]);
                 }
                 res.bytes += filled;
             }

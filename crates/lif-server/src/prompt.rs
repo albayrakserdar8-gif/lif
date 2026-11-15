@@ -71,6 +71,16 @@ impl PromptState {
         s
     }
 
+    /// A question a pane's mode asks (a chooser's search, filter, command
+    /// or confirmation); the answer goes back to the mode.
+    pub(crate) fn ask(pane: PaneId, label: &str, single_key: bool) -> Self {
+        let mut s = PromptState::copy(pane, label, String::new(), false);
+        if let Prompt::Command { single_key: k, .. } = &mut s.prompt {
+            *k = single_key;
+        }
+        s
+    }
+
     /// The pane of a copy-mode prompt.
     pub(crate) fn copy_pane(&self) -> Option<PaneId> {
         self.copy.map(|c| c.pane)
@@ -198,6 +208,16 @@ impl PromptState {
     fn copy_key(&mut self, c: CopyPrompt, key: &KeyEvent, history: &mut Vec<String>) -> PromptAction {
         let ctrl = key.mods.contains(Mods::CTRL);
         let line = |s: &Self| s.line.iter().collect::<String>();
+        // A yes-or-no question: the first key is the answer.
+        if let Prompt::Command { single_key: true, .. } = &self.prompt {
+            let text = key_text(key);
+            return match key.key {
+                Key::Escape => PromptAction::CopyCancel(c.pane),
+                Key::Char('c') | Key::Char('g') if ctrl => PromptAction::CopyCancel(c.pane),
+                _ if text.is_empty() => PromptAction::Continue,
+                _ => PromptAction::CopyAccept(c.pane, text),
+            };
+        }
         match key.key {
             Key::Escape => return PromptAction::CopyCancel(c.pane),
             Key::Char('c') | Key::Char('g') if ctrl => return PromptAction::CopyCancel(c.pane),

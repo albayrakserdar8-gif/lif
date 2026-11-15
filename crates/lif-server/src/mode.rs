@@ -121,6 +121,14 @@ pub enum ModeAction {
     /// A search is under way: call [`PaneMode::search_step`] once per turn
     /// of the event loop, polling with a zero timeout in between.
     Searching,
+    /// Run these commands for the mode's client, after leaving the mode
+    /// if `exit` (a chooser's choice).
+    Run { commands: Vec<String>, exit: bool },
+    /// Ask on the status line and give the answer to
+    /// [`PaneMode::prompt_accept`]; `single_key`: one key answers.
+    Ask { label: String, single_key: bool },
+    /// The mode's list is out of date: build it again from the model.
+    Rebuild,
 }
 
 impl From<Outcome> for ModeAction {
@@ -190,6 +198,14 @@ pub trait PaneMode {
     fn clear_frame_dirty(&mut self);
     /// Leaving: put the viewport back on live output.
     fn leave(&mut self, ctx: &mut ModeCtx<'_>);
+    /// The clock, if that is what this is.
+    fn clock(&mut self) -> Option<&mut crate::clock::ClockPane> {
+        None
+    }
+    /// The chooser mode, if that is what this is.
+    fn chooser(&mut self) -> Option<&mut crate::choose::ChoosePane> {
+        None
+    }
 }
 
 /// Text shown by view mode, laid out at the pane's width.

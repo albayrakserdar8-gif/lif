@@ -40,6 +40,8 @@ pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
 pub(crate) const TTY_TOKEN: usize = 4 << 32;
 /// The stdin of a `copy-pipe` command (`crate::pipe`).
 pub(crate) const PIPE_TOKEN: usize = 8 << 32;
+/// The stdin of a `pipe-pane` command, by pane.
+pub(crate) const PANE_PIPE_TOKEN: usize = 32 << 32;
 /// The output of a shell command (`crate::job`).
 pub(crate) const JOB_TOKEN: usize = 16 << 32;
 
@@ -99,10 +101,39 @@ pub(crate) struct Rt {
     /// Shell commands running for the model, by token (`JOB_TOKEN | n`).
     pub(crate) jobs: HashMap<u32, crate::job::Job>,
     pub(crate) next_job: u32,
+    /// Choosers asked for during a model call (`Host::choose`), set up
+    /// after it: the list comes from the model.
+    pub(crate) pending_choose: Vec<(ClientId, PaneId, lif_core::ChooseSpec)>,
+    /// Panes that are (or were) in a chooser mode; the ones that still
+    /// are get a new list after every model call. Empty nearly always.
+    pub(crate) chooser_panes: Vec<PaneId>,
+    /// Panes that are (or were) in clock mode, and when their clocks next
+    /// change (the next minute): set only while one shows a clock.
+    pub(crate) clock_panes: Vec<PaneId>,
+    pub(crate) clock_deadline: Option<std::time::Instant>,
+    /// Popups: their hidden pane, client and waiting job. A popup whose
+    /// client lost it (detached, closed it) is ended in `sweep_popups`.
+    pub(crate) popups: Vec<(PaneId, ClientId, u64)>,
+    pub(crate) next_popup: u32,
+    /// Popups that closed, for the model: (job, exit status).
+    pub(crate) popups_done: Vec<(u64, i32)>,
+    /// While a popup's program is spawned: the pane it was opened for,
+    /// which is its `LIF_PANE`.
+    popup_for: Option<PaneId>,
     /// `run-shell -d` delays: when, and the model's id.
     pub(crate) job_timers: Vec<(std::time::Instant, u64)>,
     /// The RLIMIT_NOFILE soft limit (0: unknown).
     pub(crate) fd_limit: usize,
+}
+
+/// The style of a menu's selected line: `-H`, or tmux's default look
+/// (black on yellow).
+pub(crate) fn menu_selected(menu: &lif_core::MenuState) -> lif_types::Style {
+    lif_core::parse_style(if menu.selected_style.is_empty() { "bg=yellow,fg=black" } else { &menu.selected_style })
+}
+
+pub(crate) fn menu_border(menu: &lif_core::MenuState) -> lif_types::Style {
+    lif_core::parse_style(if menu.border_style.is_empty() { &menu.style } else { &menu.border_style })
 }
 
 pub(crate) fn pane_token(p: PaneId) -> Token {
@@ -152,6 +183,14 @@ impl Rt {
             jobs: HashMap::new(),
             next_job: 0,
             job_timers: Vec::new(),
+            clock_panes: Vec::new(),
+            clock_deadline: None,
+            popups: Vec::new(),
+            next_popup: 0,
+            popups_done: Vec::new(),
+            popup_for: None,
+            pending_choose: Vec::new(),
+            chooser_panes: Vec::new(),
             fd_limit: 0,
         }
     }
@@ -180,6 +219,23 @@ impl Rt {
             crate::sys::kill_group(pid, libc::SIGKILL);
             false
         });
+    }
+
+    /// Take `client`'s popup or menu down. A popup's program is killed
+    /// and the commands waiting for it get `status`.
+    pub(crate) fn end_overlay(&mut self, client: ClientId, status: i32) {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
+        let Some(overlay) = a.overlay.take() else { return };
+        log!("overlay of client {client} ends, status {status}");
+        a.needs_frame = true;
+        // What it covered is drawn again.
+        a.renderer.invalidate();
+        if let crate::overlay::Overlay::Popup(p) = overlay {
+            self.popups.retain(|x| x.0 != p.pane);
+            self.popups_done.push((p.job, status));
+            lif_core::Host::kill_pane(self, p.pane);
+            self.views_stale = true;
+        }
     }
 
     /// `copy-pipe`: run `command` with `data` on its stdin, in `cwd`.
@@ -483,12 +539,12 @@ impl Rt {
         set("TERM_PROGRAM", "lif".into());
         set("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION").into());
         set("LIF", format!("{},{},{}", self.socket, self.server_pid, spec.session.0));
-        set("LIF_PANE", spec.pane.to_string());
+        set("LIF_PANE", self.popup_for.unwrap_or(spec.pane).to_string());
         if spec.tmux_compat {
             // What tmux sets, pointing at lif's socket: programs that only
             // know tmux run `tmux` (lif, see `install-tmux-shim`) with it.
             set("TMUX", format!("{},{},{}", self.socket, self.server_pid, spec.session.0));
-            set("TMUX_PANE", spec.pane.to_string());
+            set("TMUX_PANE", self.popup_for.unwrap_or(spec.pane).to_string());
         }
         if let SpawnCommand::LoginShell { shell } = &spec.command {
             set("SHELL", shell.clone());
@@ -524,6 +580,7 @@ impl Rt {
             prompt: None,
             prompt_line: StyledLine::new(),
             display_panes: None,
+            overlay: None,
             mouse: (false, false),
             mouse_opt: false,
             drag: None,
@@ -768,6 +825,120 @@ impl Host for Rt {
         Ok(())
     }
 
+    fn choose(&mut self, client: ClientId, pane: PaneId, spec: lif_core::ChooseSpec) -> Result<(), String> {
+        if !self.panes.contains_key(&pane) {
+            return Err(format!("can't find pane: {pane}"));
+        }
+        self.pending_choose.retain(|c| c.1 != pane);
+        self.pending_choose.push((client, pane, spec));
+        Ok(())
+    }
+
+    fn has_overlay(&self, client: ClientId) -> bool {
+        self.clients.get(&client).and_then(|c| c.att.as_ref()).is_some_and(|a| a.overlay.is_some())
+    }
+
+    fn close_overlay(&mut self, client: ClientId) {
+        self.end_overlay(client, 0);
+    }
+
+    fn popup(&mut self, client: ClientId, spec: lif_core::PopupSpec) -> Result<(), String> {
+        use crate::overlay::{Overlay, POPUP_PANE_BASE, POPUP_SCROLLBACK_BYTES, Popup, box_frame};
+        if !self.clients.get(&client).is_some_and(|c| c.att.is_some()) {
+            return Err("no clients".into());
+        }
+        let bordered = spec.border != lif_core::BorderLines::None;
+        let r = spec.rect;
+        let inner = if bordered { lif_types::Rect::new(r.x + 1, r.y + 1, r.cols - 2, r.rows - 2) } else { r };
+        self.next_popup = self.next_popup.wrapping_add(1) % 0x0FFF_0000;
+        let pane = PaneId(POPUP_PANE_BASE + self.next_popup);
+        let fill = lif_core::parse_style(&spec.style);
+        let border_style = if spec.border_style.is_empty() { fill } else { lif_core::parse_style(&spec.border_style) };
+        let pane_spec = SpawnSpec {
+            pane,
+            window: spec.window,
+            session: spec.session,
+            command: spec.command,
+            cwd: spec.cwd,
+            size: inner.size(),
+            history_limit: 0,
+            scrollback_bytes: POPUP_SCROLLBACK_BYTES,
+            client: Some(client),
+            respawn: false,
+            tmux_compat: spec.tmux_compat,
+            env: spec.env,
+        };
+        self.popup_for = Some(spec.pane);
+        let spawned = self.spawn_pane(&pane_spec);
+        self.popup_for = None;
+        spawned?;
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.base_style = fill;
+        }
+        let border = bordered.then(|| box_frame(r.size(), spec.border, &spec.title, border_style, fill));
+        let popup = Popup { pane, rect: r, inner, border, job: spec.id, close: spec.close, any_key: spec.any_key, exited: false };
+        if let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) {
+            a.overlay = Some(Overlay::Popup(popup));
+        }
+        self.popups.push((pane, client, spec.id));
+        self.views_stale = true;
+        self.mark_all(false);
+        Ok(())
+    }
+
+    fn menu(&mut self, client: ClientId, menu: lif_core::MenuState) -> Result<(), String> {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return Err("no clients".into()) };
+        let frame = crate::overlay::menu_frame(&menu, lif_core::parse_style(&menu.style), menu_selected(&menu), menu_border(&menu));
+        a.overlay = Some(crate::overlay::Overlay::Menu(crate::overlay::Menu { state: menu, frame }));
+        a.needs_frame = true;
+        Ok(())
+    }
+
+    fn clock_mode(&mut self, pane: PaneId) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        p.leave_mode();
+        p.mode = Some(Box::new(crate::clock::ClockPane::new(p.engine.size())));
+        if !self.clock_panes.contains(&pane) {
+            self.clock_panes.push(pane);
+        }
+        // Drawn (and its deadline set) before the next frame.
+        self.clock_deadline = Some(std::time::Instant::now());
+        self.mode_changed.push(pane);
+        self.views_stale = true;
+        self.mark_all(true);
+    }
+
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str) -> Result<(), String> {
+        let Some(p) = self.panes.get_mut(&pane) else { return Err(format!("can't find pane: {pane}")) };
+        if let Some(mut old) = p.pipe.take() {
+            let _ = self.registry.deregister(&mut old.tx);
+            log!("pipe-pane: pane {pane}: pid {} closed, {} bytes not piped", old.pid, old.dropped);
+        }
+        let Some(command) = command else { return Ok(()) };
+        if self.fd_limit > 0 {
+            let open = crate::sys::open_fd_count();
+            if open + crate::FD_RESERVE >= self.fd_limit {
+                return Err(format!("cannot run {command}: {open} of {} file descriptors in use", self.fd_limit));
+            }
+        }
+        let dir = (!cwd.is_empty()).then(|| std::path::Path::new(cwd));
+        let mut pipe = crate::pipe::spawn_pane_pipe(command, dir).map_err(|e| format!("{command}: {e}"))?;
+        self.reaper.watch(pipe.pid);
+        // Edge-triggered: an event comes when a full pipe has room again.
+        self.registry
+            .register(&mut pipe.tx, Token(PANE_PIPE_TOKEN | pane.0 as usize), Interest::WRITABLE)
+            .map_err(|e| format!("{command}: {e}"))?;
+        log!("pipe-pane: pane {pane}: pid {}: {command}", pipe.pid);
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.pipe = Some(pipe);
+        }
+        Ok(())
+    }
+
+    fn prompt_history(&mut self, clear: bool) -> Vec<String> {
+        if clear { std::mem::take(&mut self.prompt_history) } else { self.prompt_history.clone() }
+    }
+
     fn clear_history(&mut self, pane: PaneId) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         if p.mode.is_some() {
@@ -791,6 +962,10 @@ impl Host for Rt {
     fn kill_pane(&mut self, pane: PaneId) {
         let Some(mut p) = self.panes.remove(&pane) else { return };
         log!("pane {pane} killed");
+        // Its pipe-pane command sees the end of its input.
+        if let Some(mut pipe) = p.pipe.take() {
+            let _ = self.registry.deregister(&mut pipe.tx);
+        }
         if let Some(pty) = p.pty.take() {
             let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
             let _ = self.registry.deregister(&mut SourceFd(&fd));
@@ -875,6 +1050,7 @@ impl Host for Rt {
             history_size: p.engine.scrollback_rows(),
             history_bytes: p.engine.memory().resident_bytes,
             in_mode: p.mode.is_some(),
+            pipe: p.pipe.is_some(),
         }
     }
 

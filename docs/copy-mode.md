@@ -165,7 +165,7 @@ looked up in the copy-mode key table, as if typed: with vi keys,
 ## Default key tables
 
 Generated from `lif list-keys -T copy-mode-vi` and `lif list-keys -T copy-mode`
-(lif 0.2.0). Change them in the `[keys.copy-mode-vi]` and `[keys.copy-mode]`
+(lif 0.3.0). Change them in the `[keys.copy-mode-vi]` and `[keys.copy-mode]`
 sections of the configuration file or with `bind-key -T`.
 
 ### copy-mode-vi (mode-keys vi)

@@ -390,7 +390,7 @@ q = "copy-mode -q"
     assert_eq!(bound(&m, ROOT_TABLE, "M-Left"), Some((false, None, "select-pane -L".into())));
     assert_eq!(bound(&m, "copy-mode-vi", "q"), Some((false, None, "copy-mode -q".into())));
     // Untouched defaults stay.
-    assert_eq!(bound(&m, PREFIX_TABLE, "c"), Some((false, None, "new-window".into())));
+    assert_eq!(bound(&m, PREFIX_TABLE, "c"), Some((false, Some("Create a new window".into()), "new-window".into())));
 }
 
 #[test]
@@ -594,7 +594,7 @@ fn bad_command_strings_point_at_the_value() {
         "2:7: error: key `|` in [keys]: unknown command `splt-window`, did you mean `split-window`?"
     );
     assert_eq!(diag("[keys]\nx =   \"kill-pane -Q\""), "2:7: error: key `x` in [keys]: command kill-pane: unknown flag -Q");
-    assert_eq!(diag("[keys]\nx = \"choose-tree\""), "2:5: error: key `x` in [keys]: unsupported command: choose-tree");
+    assert_eq!(diag("[keys]\nx = \"customize-mode\""), "2:5: error: key `x` in [keys]: unsupported command: customize-mode");
     assert_eq!(diag("[keys]\nx = \"split-window ; { \""), "2:5: error: key `x` in [keys]: syntax error: missing }");
     assert_eq!(diag("[keys]\nx = \"  # only a comment\""), "2:5: error: key `x` in [keys]: empty command");
     assert_eq!(
@@ -681,6 +681,8 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g automatic-rename on",
         "set-option -g automatic-rename-format \"#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}\"",
         "set-option -g remain-on-exit off",
+        "set-option -g clock-mode-colour blue",
+        "set-option -g clock-mode-style 24",
         "set-option -g synchronize-panes off",
         "set-option -g bell-action any",
         "set-option -g visual-bell off",

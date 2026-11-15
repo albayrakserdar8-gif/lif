@@ -244,6 +244,8 @@ impl Model {
             }
             "detach-client" => self.cmd_detach(a, ctx, host),
             "display-message" => self.cmd_display(a, ctx, host),
+            "display-menu" => self.cmd_display_menu(a, ctx, host),
+            "display-popup" => self.cmd_display_popup(a, ctx, host),
             "display-panes" => {
                 let cid = self.attached_client(ctx, a.get('t'))?;
                 let sid = self.clients[&cid].session;
@@ -259,6 +261,45 @@ impl Model {
             "suspend-client" => {
                 let cid = self.attached_client(ctx, a.get('t'))?;
                 host.suspend_client(cid).map(|()| CmdOutput::default()).map_err(CmdError)
+            }
+            "choose-buffer" => self.cmd_choose(a, crate::choose::ChooseKind::Buffers, ctx, host),
+            "choose-client" => self.cmd_choose(a, crate::choose::ChooseKind::Clients, ctx, host),
+            "choose-tree" => self.cmd_choose(a, crate::choose::ChooseKind::Tree, ctx, host),
+            "find-window" => self.cmd_find_window(a, ctx, host),
+            "clock-mode" => {
+                let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+                host.clock_mode(need_pane(&f)?);
+                ok()
+            }
+            "pipe-pane" => self.cmd_pipe_pane(a, ctx, host),
+            "resize-window" => self.cmd_resize_window(a, ctx, host),
+            "respawn-window" => self.cmd_respawn_window(a, ctx, host),
+            "show-prompt-history" | "clear-prompt-history" => {
+                // lif keeps one history, the command prompt's; tmux's other
+                // types are accepted and empty.
+                let kind = a.get('T');
+                if let Some(t) = kind
+                    && !matches!(t, "command" | "search" | "target" | "window-target")
+                {
+                    return err(format!("invalid type: {t}"));
+                }
+                let clear = cmd.name() == "clear-prompt-history";
+                let wanted = |t: &str| kind.is_none_or(|k| k == t);
+                let history = if wanted("command") { host.prompt_history(clear) } else { Vec::new() };
+                if clear {
+                    return ok();
+                }
+                let mut out = String::new();
+                for t in ["command", "search"].into_iter().filter(|t| wanted(t)) {
+                    out.push_str(&format!("History for {t}:\n\n"));
+                    if t == "command" {
+                        for (i, line) in history.iter().enumerate() {
+                            out.push_str(&format!("{}: {line}\n", i + 1));
+                        }
+                    }
+                    out.push('\n');
+                }
+                text(out)
             }
             "clear-history" => {
                 let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
@@ -602,7 +643,7 @@ impl Model {
         match name {
             Some(n) => {
                 self.buffers.retain(|b| b.name != n);
-                self.buffers.insert(0, PasteBuffer { name: n.to_string(), data, automatic: false });
+                self.buffers.insert(0, PasteBuffer { name: n.to_string(), data, automatic: false, created: self.clock });
             }
             None => {
                 // The counter wraps after 2^32 copies; skip names still in
@@ -614,7 +655,7 @@ impl Model {
                         break n;
                     }
                 };
-                self.buffers.insert(0, PasteBuffer { name, data, automatic: true });
+                self.buffers.insert(0, PasteBuffer { name, data, automatic: true, created: self.clock });
                 let limit = self.gopt("buffer-limit").as_num().max(1) as usize;
                 let mut auto = 0;
                 self.buffers.retain(|b| {
@@ -630,7 +671,7 @@ impl Model {
 
     // ----- helpers -----------------------------------------------------
 
-    fn expand_found(&self, f: &Found, ctx: &CmdContext, host: &dyn Host, fmt: &str) -> String {
+    pub(crate) fn expand_found(&self, f: &Found, ctx: &CmdContext, host: &dyn Host, fmt: &str) -> String {
         format::expand(fmt, &self.fctx(host, Some(f.s), f.w, f.p, ctx.client, ctx.now))
     }
 
@@ -902,7 +943,7 @@ impl Model {
 
     /// Default directory for a new window / session: the client's when it is
     /// not attached, else the session's.
-    fn default_cwd(&self, ctx: &CmdContext, sid: Option<SessionId>) -> String {
+    pub(crate) fn default_cwd(&self, ctx: &CmdContext, sid: Option<SessionId>) -> String {
         if let Some(c) = ctx.client.and_then(|c| self.clients.get(&c))
             && c.session.is_none()
             && !c.info.cwd.is_empty()
@@ -968,7 +1009,7 @@ impl Model {
         );
         self.panes.insert(
             pid,
-            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default() },
+            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default(), input_off: false },
         );
         let mut spec = self.spawn_spec(pid, wid, sid, command, cwd, psize, client, false);
         spec.env.extend(env);
@@ -1552,7 +1593,10 @@ impl Model {
         let pid = self.alloc_pane()?;
         let was_zoomed = self.windows.get_mut(&wid).expect("window").layout.unzoom();
         let saved = self.windows[&wid].layout.clone();
-        if let Err(e) = self.windows.get_mut(&wid).expect("window").layout.split(target, pid, axis, size, before) {
+        let full = a.has('f');
+        let layout = &mut self.windows.get_mut(&wid).expect("window").layout;
+        let split = if full { layout.split_full(pid, axis, size, before) } else { layout.split(target, pid, axis, size, before) };
+        if let Err(e) = split {
             if was_zoomed {
                 self.windows.get_mut(&wid).expect("window").layout.zoom(target);
             }
@@ -1571,10 +1615,18 @@ impl Model {
             return err(format!("create pane failed: {e}"));
         }
         let point = self.tick();
-        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default() });
+        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default(), input_off: false });
         let w = self.windows.get_mut(&wid).expect("window");
         let pos = w.panes.iter().position(|p| *p == target).expect("target in window");
-        w.panes.insert(if before { pos } else { pos + 1 }, pid);
+        // A full-size pane is first or last in the window, as it is in
+        // the layout.
+        let at = match (full, before) {
+            (true, true) => 0,
+            (true, false) => w.panes.len(),
+            (false, true) => pos,
+            (false, false) => pos + 1,
+        };
+        w.panes.insert(at, pid);
         if !a.has('d') {
             self.set_active_pane(wid, pid, host);
         }
@@ -1597,6 +1649,11 @@ impl Model {
             self.panes.get_mut(&p).expect("pane").title = Some(title);
             host.redraw(Redraw::Window(wid));
             host.redraw(Redraw::Status(f.s));
+            return ok();
+        }
+        if a.has('d') || a.has('e') {
+            // Input off or on; nothing is selected (tmux 3.8).
+            self.panes.get_mut(&p).expect("pane").input_off = a.has('d');
             return ok();
         }
         if a.has('l') {
@@ -1912,6 +1969,131 @@ impl Model {
         host.redraw(Redraw::Session(dst.s));
         self.last_found.set(Some(Found { s: dst.s, w: Some(dw), p: Some(p), idx: None }));
         ok()
+    }
+
+    fn cmd_pipe_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+        let p = need_pane(&f)?;
+        if a.has('I') {
+            return err("pipe-pane -I is not supported: lif pipes a pane's output, not a command's into it");
+        }
+        let piping = host.pane_info(p).pipe;
+        // The old pipe goes first, whatever comes next (tmux 3.8).
+        host.pipe_pane(p, None, "").map_err(CmdError)?;
+        let Some(command) = a.value(0).filter(|c| !c.is_empty()) else { return ok() };
+        // -o: a key that toggles; with a pipe open it only closes it.
+        if a.has('o') && piping {
+            return ok();
+        }
+        let command = self.expand_found(&f, ctx, &*host, command);
+        let cwd = self.default_cwd(ctx, Some(f.s));
+        host.pipe_pane(p, Some(&command), &cwd).map_err(CmdError)?;
+        ok()
+    }
+
+    /// `resize-window`: the window gets the size asked for and keeps it
+    /// (`window-size` becomes `manual` for it), as in tmux.
+    fn cmd_resize_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let f = self.find_target(ctx, a.get('t'), Kind::Window, Flags::default())?;
+        let wid = need_window(&f)?;
+        let adjust = match a.value(0) {
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) if n >= 1 && n <= crate::MAX_WINDOW_DIM as u32 => n,
+                _ => return err("adjustment invalid"),
+            },
+            None => 1,
+        };
+        let dim = |flag: char, what: &str| -> Result<Option<u32>, CmdError> {
+            match a.get(flag) {
+                None => Ok(None),
+                Some(v) => match v.parse::<u64>() {
+                    Ok(0) => err(format!("{what} too small")),
+                    Ok(n) if n > crate::MAX_WINDOW_DIM as u64 => err(format!("{what} too large")),
+                    Ok(n) => Ok(Some(n as u32)),
+                    Err(_) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => err(format!("{what} too large")),
+                    Err(_) => err(format!("{what} invalid")),
+                },
+            }
+        };
+        let (x, y) = (dim('x', "width")?, dim('y', "height")?);
+        let cur = self.windows[&wid].size;
+        let (mut w, mut h) = (x.unwrap_or(cur.cols as u32), y.unwrap_or(cur.rows as u32));
+        if a.has('L') {
+            w = w.saturating_sub(adjust);
+        } else if a.has('R') {
+            w += adjust;
+        } else if a.has('U') {
+            h = h.saturating_sub(adjust);
+        } else if a.has('D') {
+            h += adjust;
+        }
+        if a.has('A') || a.has('a') {
+            // The largest or smallest client of the window's session.
+            let sl = self.status_lines(f.s) + (self.border_status(Some(wid)) != crate::model::BorderStatus::Off) as u16;
+            let sizes: Vec<Size> = self
+                .clients
+                .values()
+                .filter(|c| c.session == Some(f.s) && !c.info.size.is_empty())
+                .map(|c| Size::new(c.info.size.cols.max(1), c.info.size.rows.saturating_sub(sl).max(1)))
+                .collect();
+            if !sizes.is_empty() {
+                let pick = |v: &mut dyn Iterator<Item = u16>| if a.has('A') { v.max() } else { v.min() };
+                w = pick(&mut sizes.iter().map(|s| s.cols)).unwrap_or(cur.cols) as u32;
+                h = pick(&mut sizes.iter().map(|s| s.rows)).unwrap_or(cur.rows) as u32;
+            }
+        }
+        let max = crate::MAX_WINDOW_DIM as u32;
+        let size = crate::clamp_size(Size::new(w.clamp(1, max) as u16, h.clamp(1, max) as u16));
+        let def = options::DEFS.iter().find(|d| d.name == "window-size").expect("window-size");
+        let manual = options::parse_value(def, &Value::Choice(0), Some("manual"), false).map_err(CmdError)?;
+        self.windows.get_mut(&wid).expect("window").options.set("window-size", manual);
+        self.resize_window(wid, size, host);
+        host.redraw(Redraw::Session(f.s));
+        ok()
+    }
+
+    /// `respawn-window`: the window goes back to one pane running a new
+    /// command (its first pane, respawned).
+    fn cmd_respawn_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let f = self.find_target(ctx, a.get('t'), Kind::Window, Flags::default())?;
+        let wid = need_window(&f)?;
+        let panes = self.windows[&wid].panes.clone();
+        if !a.has('k') && panes.iter().any(|p| !self.panes[p].dead) {
+            let s = &self.sessions[&f.s].name;
+            return err(format!("respawn window failed: window {s}:{} still active", self.windows[&wid].index));
+        }
+        let first = panes[0];
+        for p in &panes[1..] {
+            self.remove_pane(*p, true, host);
+        }
+        let args = a.strings(0);
+        let command = if args.is_empty() { self.panes[&first].command.clone() } else { self.spawn_command(f.s, &args) };
+        let start = self.panes[&first].cwd.clone();
+        let found = Found { p: Some(first), ..f };
+        let cwd = self.cwd_arg(a, Some(&found), ctx, &*host, start);
+        host.kill_pane(first);
+        let size = self.panes[&first].size;
+        let mut spec = self.spawn_spec(first, wid, f.s, command.clone(), cwd.clone(), size, ctx.client, true);
+        spec.env.extend(crate::environ::flag_env(a));
+        let r = host.spawn_pane(&spec);
+        let pane = self.panes.get_mut(&first).expect("pane");
+        let out = match r {
+            Ok(()) => {
+                pane.dead = false;
+                pane.exit_status = None;
+                pane.command = command;
+                pane.cwd = cwd;
+                ok()
+            }
+            Err(e) => {
+                pane.dead = true;
+                err(format!("respawn window failed: {e}"))
+            }
+        };
+        self.update_window_name(wid, &*host);
+        host.redraw(Redraw::Window(wid));
+        host.redraw(Redraw::Status(f.s));
+        out
     }
 
     fn cmd_respawn(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
@@ -2256,7 +2438,7 @@ impl Model {
             let name = self.buffers[i].name.clone();
             let automatic = self.buffers[i].automatic;
             self.buffers.remove(i);
-            self.buffers.insert(0, PasteBuffer { name, data: bytes, automatic });
+            self.buffers.insert(0, PasteBuffer { name, data: bytes, automatic, created: self.clock });
             return ok();
         }
         self.set_buffer(a.get('b'), bytes);

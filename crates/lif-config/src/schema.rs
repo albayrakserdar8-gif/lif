@@ -69,6 +69,8 @@ pub(crate) static TOP: &[Opt] = &[
     o("base-index", "base-index", Int),
     o("bell-action", "bell-action", Choice(&["none", "any", "current", "other"])),
     srv("buffer-limit", Int),
+    o("clock-mode-colour", "clock-mode-colour", Str),
+    o("clock-mode-style", "clock-mode-style", Choice(&["12", "24"])),
     srv("copy-command", Str),
     o("default-command", "default-command", Str),
     o("default-shell", "default-shell", Str),

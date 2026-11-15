@@ -658,6 +658,43 @@ impl Layout {
         Ok(())
     }
 
+    /// Put `new` beside everything else, across the whole window
+    /// (`split-window -f`): below or right of the rest, or with `before`
+    /// above or left of it.
+    pub fn split_full(&mut self, new: PaneId, axis: Axis, size: SplitSize, before: bool) -> Result<(), LayoutError> {
+        let (sx, sy) = (self.root.sx, self.root.sy);
+        let saved = self.root.along(axis);
+        let least = self.root.min_along(axis);
+        if saved < least + 1 + PANE_MINIMUM {
+            return Err(LayoutError::NoSpace);
+        }
+        let new_size = match size {
+            SplitSize::Half => saved.div_ceil(2) - 1,
+            SplitSize::Cells(n) => n,
+            SplitSize::Percent(p) => (saved as u64 * p as u64 / 100) as u32,
+        }
+        .clamp(PANE_MINIMUM, saved - 1 - least);
+        let mut new_cell = Cell::leaf(new, sx, sy);
+        new_cell.set_along(axis, new_size);
+        self.zoomed = None;
+        let mut old = std::mem::replace(&mut self.root, Cell::leaf(new, sx, sy));
+        old.fit(axis, saved - 1 - new_size);
+        let children = match old.node {
+            // A root already split this way takes the pane as one more
+            // child, so the tree stays as tmux would have it.
+            Node::Split(a, mut ch) if a == axis => {
+                ch.insert(if before { 0 } else { ch.len() }, new_cell);
+                ch
+            }
+            node => {
+                let old = Cell { sx: old.sx, sy: old.sy, node };
+                if before { vec![new_cell, old] } else { vec![old, new_cell] }
+            }
+        };
+        self.root = Cell { sx, sy, node: Node::Split(axis, children) };
+        Ok(())
+    }
+
     /// Remove `pane`; its space goes to the next sibling (the previous one if
     /// it was last), as tmux 3.8 does. Returns false if the pane is the only
     /// one (the caller removes the window instead) or not in the layout.

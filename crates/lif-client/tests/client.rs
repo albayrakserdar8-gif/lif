@@ -40,7 +40,9 @@ impl Pty {
         let (mut m, mut s) = (-1, -1);
         let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: cols * 8, ws_ypixel: rows * 16 };
         // SAFETY: valid out pointers; null name and termios mean defaults.
-        let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut::<libc::termios>(), &mut ws) };
+        // (A raw pointer for the size: macOS declares it mutable, Linux
+        // const.)
+        let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut::<libc::termios>(), &raw mut ws) };
         assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
         // SAFETY: fresh fds owned by nobody else.
         let pty = unsafe { Pty { master: OwnedFd::from_raw_fd(m), slave: OwnedFd::from_raw_fd(s) } };

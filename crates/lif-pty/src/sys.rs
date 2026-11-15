@@ -1,8 +1,14 @@
 //! Thin wrappers over the libc calls this crate needs, per platform.
 
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString};
+// (Linux reads the foreground process from /proc, without these.)
+#[cfg(not(target_os = "linux"))]
+use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(not(target_os = "linux"))]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 

@@ -70,6 +70,8 @@ pub(crate) struct Drag {
 }
 
 pub(crate) struct Attached {
+    /// A popup or menu over the panes: it takes the keys while it is up.
+    pub(crate) overlay: Option<crate::overlay::Overlay>,
     pub(crate) session: SessionId,
     pub(crate) parser: InputParser,
     pub(crate) probe: CapsProbe,

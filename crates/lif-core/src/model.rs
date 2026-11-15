@@ -173,6 +173,8 @@ pub struct Pane {
     /// replaces it, as in tmux.
     pub(crate) title: Option<String>,
     pub(crate) hooks: crate::hooks::HookSet,
+    /// `select-pane -d`: what clients type does not reach the program.
+    pub(crate) input_off: bool,
 }
 
 impl Pane {
@@ -242,6 +244,8 @@ pub struct PasteBuffer {
     /// Named automatically (`bufferNNNN`); only these count against
     /// `buffer-limit`.
     pub automatic: bool,
+    /// When it was made (Unix seconds, as of the last command run).
+    pub created: i64,
 }
 
 /// Who runs a command, for default targets.
@@ -357,6 +361,9 @@ pub struct Model {
     pub(crate) environ: crate::environ::Environ,
     /// What the command being run last resolved a target to.
     pub(crate) last_found: std::cell::Cell<Option<crate::target::Found>>,
+    /// The time the last command list ran at (Unix seconds): the model
+    /// reads no clock, and paste buffers want a creation time.
+    pub(crate) clock: i64,
 }
 
 /// The largest window index: `base-index`'s maximum, tmux's INT_MAX. Every
@@ -402,6 +409,7 @@ impl Model {
             hooks: Default::default(),
             environ: Default::default(),
             last_found: Default::default(),
+            clock: 0,
         }
     }
 
@@ -1189,6 +1197,12 @@ impl Model {
         Some(options::value_text(def, self.popt(pane, def.name)))
     }
 
+    /// `select-pane -d` turned the pane's input off: what clients type
+    /// or paste there is dropped.
+    pub fn pane_input_off(&self, pane: PaneId) -> bool {
+        self.panes.get(&pane).is_some_and(|p| p.input_off)
+    }
+
     /// The panes that get what is typed into `pane` as well, appended to
     /// `out`: with `synchronize-panes` on for `pane`, the other live
     /// panes of its window that have it on too. Whether one of them is in
@@ -1499,7 +1513,9 @@ impl Vars for Fctx<'_> {
                 "at_right" => flag(rect.is_some_and(|r| r.right() == wsize.cols)),
                 "at_bottom" => flag(rect.is_some_and(|r| r.bottom() == wsize.rows)),
                 "format" => flag(true),
-                "marked" | "marked_set" | "input_off" | "pipe" => flag(false),
+                "input_off" => flag(p.input_off),
+                "pipe" => flag(info.pipe),
+                "marked" | "marked_set" => flag(false),
                 _ => None,
             };
         }

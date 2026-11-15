@@ -81,6 +81,7 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     (",", false, "command-prompt -I \"#W\" { rename-window \"%%\" }"),
     ("-", false, "delete-buffer"),
     (".", false, "command-prompt { move-window -t \"%%\" }"),
+    ("/", false, "command-prompt -k -p key { list-keys -1N \"%%\" }"),
     ("0", false, "select-window -t :=0"),
     ("1", false, "select-window -t :=1"),
     ("2", false, "select-window -t :=2"),
@@ -93,7 +94,19 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     ("9", false, "select-window -t :=9"),
     (":", false, "command-prompt"),
     (";", false, "last-pane"),
+    (
+        "<",
+        false,
+        "display-menu -T \"#[align=centre]#{window_index}:#{window_name}\" -x W -y W \"#{?#{>:#{session_windows},1},,-}Swap Left\" l { swap-window -t :-1 } \"#{?#{>:#{session_windows},1},,-}Swap Right\" r { swap-window -t :+1 } '' Kill X { kill-window } Respawn R { respawn-window -k } Rename n { command-prompt -F -I \"#W\" { rename-window -t \"#{window_id}\" \"%%\" } } '' \"New After\" w { new-window -a } \"New At End\" W { new-window }",
+    ),
+    ("=", false, "choose-buffer -Z"),
+    (
+        ">",
+        false,
+        "display-menu -T \"#[align=centre]#{pane_index} (#{pane_id})\" -x P -y P \"#{?pane_in_mode,Go To Top,}\" < { send-keys -X history-top } \"#{?pane_in_mode,Go To Bottom,}\" > { send-keys -X history-bottom } '' \"#{?pane_in_mode,,Paste}\" p { paste-buffer } '' \"Horizontal Split\" h { split-window -h } \"Vertical Split\" v { split-window -v } '' \"#{?#{>:#{window_panes},1},,-}Swap Up\" u { swap-pane -U } \"#{?#{>:#{window_panes},1},,-}Swap Down\" d { swap-pane -D } '' Kill X { kill-pane } Respawn R { respawn-pane -k } \"#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}\" z { resize-pane -Z }",
+    ),
     ("?", false, "list-keys"),
+    ("D", false, "choose-client -Z"),
     ("E", false, "select-layout -E"),
     ("L", false, "switch-client -l"),
     ("T", false, "command-prompt -I \"#T\" { select-pane -T \"%%\" }"),
@@ -101,6 +114,7 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     ("]", false, "paste-buffer -p"),
     ("c", false, "new-window"),
     ("d", false, "detach-client"),
+    ("f", false, "command-prompt { find-window -Z \"%%\" }"),
     ("i", false, "display-message"),
     ("l", false, "last-window"),
     ("n", false, "next-window"),
@@ -108,9 +122,13 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
     ("p", false, "previous-window"),
     ("q", false, "display-panes"),
     ("r", false, "refresh-client"),
+    ("s", false, "choose-tree -Zs"),
+    ("t", false, "clock-mode"),
+    ("w", false, "choose-tree -Zw"),
     ("x", false, "confirm-before -p \"kill-pane #P? (y/n)\" kill-pane"),
     ("z", false, "resize-pane -Z"),
     ("{", false, "swap-pane -U"),
+    ("~", false, "show-messages"),
     ("}", false, "swap-pane -D"),
     ("PPage", false, "copy-mode -u"),
     ("Up", true, "select-pane -U"),
@@ -146,6 +164,91 @@ pub const COPY_MODE_VI_TABLE: &str = "copy-mode-vi";
 /// `tmux list-keys -T copy-mode-vi` prints it, without the mouse bindings
 /// (copy mode handles the mouse itself) and `C-[` (the same key as Escape).
 ///
+/// tmux 3.8's notes for the default prefix bindings (`list-keys -N`), by
+/// key.
+const NOTES: &[(&str, &str)] = &[
+    ("<", "Display window menu"),
+    (">", "Display pane menu"),
+    ("Space", "Select next layout"),
+    ("!", "Break pane to a new window"),
+    ("\"", "Split window vertically"),
+    ("#", "List all paste buffers"),
+    ("$", "Rename current session"),
+    ("%", "Split window horizontally"),
+    ("&", "Kill current window"),
+    ("'", "Prompt for window index to select"),
+    ("(", "Switch to previous client"),
+    (")", "Switch to next client"),
+    (",", "Rename current window"),
+    ("-", "Delete the most recent paste buffer"),
+    (".", "Move the current window"),
+    ("/", "Describe key binding"),
+    ("0", "Select window 0"),
+    ("1", "Select window 1"),
+    ("2", "Select window 2"),
+    ("3", "Select window 3"),
+    ("4", "Select window 4"),
+    ("5", "Select window 5"),
+    ("6", "Select window 6"),
+    ("7", "Select window 7"),
+    ("8", "Select window 8"),
+    ("9", "Select window 9"),
+    (":", "Prompt for a command"),
+    (";", "Move to the previously active pane"),
+    ("=", "Choose a paste buffer from a list"),
+    ("?", "List key bindings"),
+    ("D", "Choose and detach a client from a list"),
+    ("E", "Spread panes out evenly"),
+    ("L", "Switch to the last client"),
+    ("T", "Change the pane title"),
+    ("[", "Enter copy mode"),
+    ("]", "Paste the most recent paste buffer"),
+    ("c", "Create a new window"),
+    ("d", "Detach the current client"),
+    ("f", "Search for a pane"),
+    ("i", "Display window information"),
+    ("l", "Select the previously current window"),
+    ("n", "Select the next window"),
+    ("o", "Select the next pane"),
+    ("p", "Select the previous window"),
+    ("q", "Display pane numbers"),
+    ("r", "Redraw the current client"),
+    ("s", "Choose a session from a list"),
+    ("t", "Show a clock"),
+    ("w", "Choose a window from a list"),
+    ("x", "Kill the active pane"),
+    ("z", "Zoom the active pane"),
+    ("{", "Swap the active pane with the pane above"),
+    ("}", "Swap the active pane with the pane below"),
+    ("~", "Show messages"),
+    ("PPage", "Enter copy mode and scroll up"),
+    ("Up", "Select the pane above the active pane"),
+    ("Down", "Select the pane below the active pane"),
+    ("Left", "Select the pane to the left of the active pane"),
+    ("Right", "Select the pane to the right of the active pane"),
+    ("M-1", "Set the even-horizontal layout"),
+    ("M-2", "Set the even-vertical layout"),
+    ("M-3", "Set the main-horizontal layout"),
+    ("M-4", "Set the main-vertical layout"),
+    ("M-5", "Select the tiled layout"),
+    ("M-6", "Set the main-horizontal-mirrored layout"),
+    ("M-7", "Set the main-vertical-mirrored layout"),
+    ("M-n", "Select the next window with an alert"),
+    ("M-o", "Rotate through the panes in reverse"),
+    ("M-p", "Select the previous window with an alert"),
+    ("M-Up", "Resize the pane up by 5"),
+    ("M-Down", "Resize the pane down by 5"),
+    ("M-Left", "Resize the pane left by 5"),
+    ("M-Right", "Resize the pane right by 5"),
+    ("C-b", "Send the prefix key"),
+    ("C-o", "Rotate through the panes"),
+    ("C-z", "Suspend the current client"),
+    ("C-Up", "Resize the pane up"),
+    ("C-Down", "Resize the pane down"),
+    ("C-Left", "Resize the pane left"),
+    ("C-Right", "Resize the pane right"),
+];
+
 /// This and [`COPY_MODE_DEFAULTS`] are the only definition of copy mode's
 /// default keys: [`KeyBindings::with_defaults`] loads them into the model,
 /// where `bind-key -T`, `unbind-key -T`, `list-keys -T` and the
@@ -320,9 +423,11 @@ impl KeyBindings {
     pub fn with_defaults() -> Self {
         let mut b = Self::new();
         for (key, repeat, cmd) in DEFAULTS {
-            let key = KeyCode::parse(key).unwrap_or_else(|| panic!("bad default key {key}"));
+            KeyCode::parse(key).unwrap_or_else(|| panic!("bad default key {key}"));
             let commands = parse_string(cmd).unwrap_or_else(|e| panic!("bad default binding {cmd}: {e}"));
-            b.bind(PREFIX_TABLE, Binding { key, repeat: *repeat, note: None, commands });
+            let raw = *key;
+            let note = NOTES.iter().find(|(k, _)| *k == raw).map(|(_, n)| n.to_string());
+            b.bind(PREFIX_TABLE, Binding { key: KeyCode::parse(raw).expect("checked"), repeat: *repeat, note, commands });
         }
         b.copy_pending = [true, true];
         b

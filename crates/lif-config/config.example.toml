@@ -125,6 +125,10 @@ automatic-rename-format = "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane
 # a non-zero exit status).
 remain-on-exit = "off"
 
+# The clock of clock-mode (prefix t): its color, and "24" or "12" hours.
+clock-mode-colour = "blue"
+clock-mode-style = "24"
+
 # Type into every pane of a window at once (tmux's synchronize-panes; most
 # people turn it on for one window: "set -w synchronize-panes on").
 synchronize-panes = false

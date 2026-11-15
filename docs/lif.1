@@ -208,12 +208,83 @@ Copy the text of a pane into a buffer, or print it with -p. -S and -E choose
 lines (negative numbers are history, - is the start or end), -J joins
 wrapped lines, -e keeps colors and attributes, -N keeps trailing spaces.
 .It Xo
+.Ic choose-buffer
+.Op Fl NrZ
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl O Ar sort-order
+.Op Fl t Ar target-pane
+.Op Ar template
+.Xc
+Put a pane into buffer mode: a list of the paste buffers with a preview of
+the selected one.
+Enter runs
+.Ar template
+with %% replaced by the buffer's name (default: paste it); p and P paste, d
+and D delete, the selected buffer or the tagged ones.
+The other keys and the flags are those of choose-tree; the sort orders are
+creation, name and size.
+.It Xo
+.Ic choose-client
+.Op Fl NrZ
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl O Ar sort-order
+.Op Fl t Ar target-pane
+.Op Ar template
+.Xc
+Put a pane into client mode: a list of the attached clients.
+Enter runs
+.Ar template
+(default: detach the client); d and D detach, x and X detach and hang up, z
+and Z suspend.
+The sort orders are name, size, creation and activity.
+.It Xo
+.Ic choose-tree
+.Op Fl NrswZ
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl O Ar sort-order
+.Op Fl t Ar target-pane
+.Op Ar template
+.Xc
+Put a pane into tree mode: sessions, their windows and their panes, one on
+each line, with a preview of the selected one below.
+-s starts with sessions collapsed, -w with windows collapsed, -Z zooms the
+pane, -N starts without the preview, -f shows only the items a format is
+true for, -O sets the sort order (index, name or activity) and -r reverses
+it.
+Enter, or the shortcut shown on a line, runs
+.Ar template
+with %% replaced by the target (default: switch to it).
+Up, Down, PPage, NPage, Home and End move; Right and Left (or + and -)
+expand and collapse; t tags, T untags all, C-t tags all; C-s searches and n
+and N repeat; f asks for a filter and c clears it; O changes the sort
+order and r reverses it; v toggles the preview; H returns to the starting
+item; x kills the selected item and X the tagged ones after a y; : runs a
+command for each tagged item; q leaves.
+The command needs an attached client.
+.It Xo
 .Ic clear-history Pq Ic clearhist
 .Op Fl H
 .Op Fl t Ar target-pane
 .Xc
 Remove the pane's scrollback; the screen stays.
 A pane in copy mode leaves it. -H changes nothing.
+.It Xo
+.Ic clear-prompt-history Pq Ic clearphist
+.Op Fl T Ar prompt-type
+.Xc
+Forget what was typed at the command prompt.
+.It Xo
+.Ic clock-mode
+.Op Fl t Ar target-pane
+.Xc
+Show a large clock in the pane until a key is pressed there.
+.Ic clock-mode-style
+(12 or 24) and
+.Ic clock-mode-colour
+set how it looks.
 .It Xo
 .Ic command-prompt
 .Op Fl 1FkNP
@@ -261,6 +332,30 @@ of a session, -a all other clients.
 -P also sends SIGHUP to the parent process of each detached client (usually
 the shell that started it).
 .It Xo
+.Ic display-menu Pq Ic menu
+.Op Fl MO
+.Op Fl b Ar border-lines
+.Op Fl c Ar target-client
+.Op Fl C Ar starting-choice
+.Op Fl H Ar selected-style
+.Op Fl s Ar style
+.Op Fl S Ar border-style
+.Op Fl t Ar target-pane
+.Op Fl T Ar title
+.Op Fl x Ar position
+.Op Fl y Ar position
+.Ar name key command Ar ...
+.Xc
+Show a menu on a client's screen: one item for each
+.Ar name ,
+.Ar key
+and
+.Ar command .
+An empty name is a separator; a name starting with - cannot be chosen.
+Up and Down move, Enter or the item's key runs its command for the target
+pane, q or Escape closes the menu; the mouse selects and chooses too.
+Positions are as for display-popup.
+.It Xo
 .Ic display-message Pq Ic display
 .Op Fl lp
 .Op Fl c Ar target-client
@@ -272,6 +367,34 @@ the shell that started it).
 Show a message on the status line, or print it with -p. The message is a
 format.
 .It Xo
+.Ic display-popup Pq Ic popup
+.Op Fl BCEk
+.Op Fl b Ar border-lines
+.Op Fl c Ar target-client
+.Op Fl d Ar start-directory
+.Op Fl e Ar environment
+.Op Fl h Ar height
+.Op Fl s Ar style
+.Op Fl S Ar border-style
+.Op Fl t Ar target-pane
+.Op Fl T Ar title
+.Op Fl w Ar width
+.Op Fl x Ar position
+.Op Fl y Ar position
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Run a program in a popup over a client's panes; the command waits until
+the popup closes.
+-w and -h set its size in cells or N% (default: half the screen), -x its
+left column and -y the row below it; a position may also be C (centre), R
+(right edge), P (the target pane) or S (next to the status line).
+With -E the popup closes when the program exits and the program's status
+is the command's; with -EE only on status 0.
+Otherwise it stays until Escape or C-c (any key with -k).
+-C closes the popup that is open. -B draws no border, -b picks its lines
+(single, rounded, double, heavy, simple, padded, none), -T sets a title.
+While it is open every key goes to its program.
+.It Xo
 .Ic display-panes Pq Ic displayp
 .Op Fl N
 .Op Fl d Ar duration
@@ -282,6 +405,16 @@ Show pane numbers; typing one selects that pane (or runs template with %%
 replaced by its id).
 With -N keys are not looked at and the numbers stay up for the whole
 duration.
+.It Xo
+.Ic find-window Pq Ic findw
+.Op Fl CiNTZ
+.Op Fl t Ar target-pane
+.Ar match-string
+.Xc
+Open tree mode with the windows that match
+.Ar match-string ,
+a shell pattern looked for in window names (-N), pane titles (-T) and
+visible pane contents (-C); all three by default. -i ignores case.
 .It Xo
 .Ic has-session Pq Ic has
 .Op Fl t Ar target-session
@@ -481,6 +614,22 @@ Select the next window (-a: the next with an alert).
 Paste a buffer into a pane. -p uses bracketed paste if the program asked for
 it, -d deletes the buffer, -r keeps line feeds, -s sets the separator.
 .It Xo
+.Ic pipe-pane Pq Ic pipep
+.Op Fl \&Oo
+.Op Fl t Ar target-pane
+.Op Ar shell-command
+.Xc
+From now on also write what the program in the pane prints to the standard
+input of
+.Ar shell-command
+(a format, run with
+.Pa /bin/sh ) ;
+without a command, stop.
+A pane has one pipe: a new command replaces the old.
+With -o a pipe that is open is only closed, so one key can toggle it.
+At most 1 MiB waits for a command that reads slowly; output beyond that is
+not piped.
+.It Xo
 .Ic previous-layout Pq Ic prevl
 .Op Fl t Ar target-window
 .Xc
@@ -519,6 +668,23 @@ Rename a window (this turns automatic-rename off for it).
 Resize a pane by adjustment cells in a direction, to -x/-y cells or a
 percentage, or toggle zoom with -Z.
 .It Xo
+.Ic resize-window Pq Ic resizew
+.Op Fl aADLRU
+.Op Fl x Ar width
+.Op Fl y Ar height
+.Op Fl t Ar target-window
+.Op Ar adjustment
+.Xc
+Give a window a size of its own; it keeps it
+.Po
+.Ic window-size
+becomes manual for it
+.Pc .
+-x and -y set the size, -L, -R, -U and -D change it by
+.Ar adjustment
+(default 1), -A makes it as large as the largest client of its session and
+-a as small as the smallest.
+.It Xo
 .Ic respawn-pane Pq Ic respawnp
 .Op Fl k
 .Op Fl c Ar start-directory
@@ -528,6 +694,16 @@ percentage, or toggle zoom with -Z.
 .Xc
 Start a new process in a pane whose program has exited (-k: kill the running
 one first). The scrollback is kept.
+.It Xo
+.Ic respawn-window Pq Ic respawnw
+.Op Fl k
+.Op Fl c Ar start-directory
+.Op Fl e Ar environment
+.Op Fl t Ar target-window
+.Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
+.Xc
+Close all panes of a window but the first and start a new program in that
+one; -k if any of them is still running.
 .It Xo
 .Ic rotate-window Pq Ic rotatew
 .Op Fl DUZ
@@ -574,13 +750,14 @@ layout string. -E spreads panes evenly, -n and -p step through presets, -o
 undoes the last layout change.
 .It Xo
 .Ic select-pane Pq Ic selectp
-.Op Fl DLlRUZ
+.Op Fl DdeLlRUZ
 .Op Fl T Ar title
 .Op Fl t Ar target-pane
 .Xc
 Make a pane active, or the pane in a direction with -L, -R, -U, -D; -l
 selects the last pane. -T sets the pane's title and selects nothing; a
-title the program sets later replaces it.
+title the program sets later replaces it. -d turns the pane's input off
+(what clients type and paste there is dropped) and -e on again.
 .It Xo
 .Ic select-window Pq Ic selectw
 .Op Fl lnpT
@@ -710,6 +887,11 @@ Print the message log, which includes configuration file errors.
 .Xc
 Show options; -v values only.
 .It Xo
+.Ic show-prompt-history Pq Ic showphist
+.Op Fl T Ar prompt-type
+.Xc
+Print what was typed at the command prompt.
+.It Xo
 .Ic show-window-options Pq Ic showw
 .Op Fl gv
 .Op Fl t Ar target-window
@@ -734,7 +916,7 @@ shell continues it with
 .Ic fg .
 .It Xo
 .Ic split-window Pq Ic splitw
-.Op Fl bdhPvZ
+.Op Fl bdfhPvZ
 .Op Fl c Ar start-directory
 .Op Fl e Ar environment
 .Op Fl F Ar format
@@ -744,7 +926,8 @@ shell continues it with
 .Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
 .Xc
 Split a pane: -h side by side, -v (default) top and bottom; -l size in cells
-or N%, -p percentage, -b before, -d without selecting it, -Z zoomed, -c
+or N%, -p percentage, -b before, -f across the whole window, -d without
+selecting it, -Z zoomed, -c
 working directory, -e
 .Ar VARIABLE=value
 a variable for the new pane, -P print the new pane (format with -F).
@@ -799,26 +982,14 @@ The other
 .Xr tmux 1
 commands are recognized and fail with
 .Dq unsupported command :
-.Ic choose-buffer ,
-.Ic choose-client ,
-.Ic choose-tree ,
-.Ic clear-prompt-history ,
-.Ic clock-mode ,
 .Ic customize-mode ,
-.Ic display-menu ,
-.Ic display-popup ,
-.Ic find-window ,
 .Ic link-window ,
 .Ic lock-client ,
 .Ic lock-server ,
 .Ic lock-session ,
 .Ic move-pane ,
 .Ic new-pane ,
-.Ic pipe-pane ,
-.Ic resize-window ,
-.Ic respawn-window ,
 .Ic server-access ,
-.Ic show-prompt-history ,
 .Ic switch-mode ,
 .Ic unlink-window .
 .Sh KEY BINDINGS

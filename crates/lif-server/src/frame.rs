@@ -94,6 +94,11 @@ impl Server {
                 a.msg_style = msg_style;
                 a.status_stale = true;
             }
+            let mut view = view;
+            // A popup's terminal is one more pane of the view, on top.
+            if let Some(crate::overlay::Overlay::Popup(p)) = &a.overlay {
+                view.panes.push((p.pane, p.inner));
+            }
             a.view = Some(view);
             a.active_pane = Some(new);
             a.needs_frame = true;
@@ -117,6 +122,10 @@ impl Server {
         let compat = self.model.option_text("tmux-compat", None, None).as_deref() == Some("on");
         for p in self.rt.panes.values_mut() {
             let id = p.id;
+            // A popup's pane has its own style and no options.
+            if id.0 >= crate::overlay::POPUP_PANE_BASE {
+                continue;
+            }
             let pass = compat || self.model.pane_option_text(id, "allow-passthrough").is_some_and(|v| v != "off");
             if pass != p.passthrough.is_some() {
                 p.passthrough = pass.then(Default::default);
@@ -338,6 +347,11 @@ impl Server {
                 continue;
             }
             draw_client(&self.rt.panes, c, is_due.is_some(), &mut scratch, &mut self.label_scratch);
+            // (Rendered or remembered as skipped: either way its dirty
+            // rows are accounted for.)
+            if let Some(o) = c.att.as_mut().and_then(|a| a.overlay.as_mut()) {
+                o.clear_dirty();
+            }
             if let Some(full) = is_due {
                 if full && let Some(a) = c.att.as_mut() {
                     a.needs_frame = false;
@@ -537,9 +551,32 @@ fn draw_client(
             return;
         };
         let mut active_cursor = Cursor::default();
+        let popup = match &a.overlay {
+            Some(crate::overlay::Overlay::Popup(p)) => Some(p),
+            _ => None,
+        };
         for (i, (pid, rect)) in view.panes.iter().enumerate() {
             let Some(p) = panes.get(pid) else { continue };
             let Some(rect) = clip(*rect, size) else { continue };
+            if let Some(pp) = popup.filter(|pp| pp.pane == *pid) {
+                // The popup: its border first, its terminal over that,
+                // and the cursor is its program's.
+                if let (Some(f), Some(r)) = (pp.border.as_ref(), clip(pp.rect, size)) {
+                    sp.push(ScenePane {
+                        id: crate::overlay::BORDER_SCENE_ID,
+                        rect: r,
+                        frame: f,
+                        active: false,
+                        selection: None,
+                        matches: &[],
+                        indicator: None,
+                        base: lif_types::Style::default(),
+                    });
+                }
+                active_cursor = pane_cursor(rect, &p.frame);
+                sp.push(ScenePane { id: pid.0 as u64, rect, frame: &p.frame, active: false, selection: None, matches: &[], indicator: None, base: p.base_style });
+                continue;
+            }
             let label = a.display_panes.as_ref().and_then(|d| d.labels.get(i)).map(|(_, l)| l.as_str());
             let mode = p.mode.as_deref();
             let ov = mode.map(|m| m.overlays());
@@ -566,6 +603,22 @@ fn draw_client(
                 indicator,
                 base: p.base_style,
             });
+        }
+        if let Some(crate::overlay::Overlay::Menu(m)) = &a.overlay
+            && let Some(r) = clip(m.state.rect, size)
+        {
+            sp.push(ScenePane {
+                id: crate::overlay::MENU_SCENE_ID,
+                rect: r,
+                frame: &m.frame,
+                active: false,
+                selection: None,
+                matches: &[],
+                indicator: None,
+                base: lif_types::Style::default(),
+            });
+            // A menu has no cursor.
+            active_cursor = Cursor::default();
         }
         let status = view.status_row.filter(|r| *r < size.rows).map(|row| StatusBar {
             line: &a.status,

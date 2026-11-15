@@ -96,7 +96,7 @@ What the backend runs, all of which lif implements: `new-session`,
 `pane-active-border-style`, `pane-border-format`), `set-option -w
 pane-border-status`, `select-pane -T`, `respawn-pane -k`, `kill-pane`,
 `has-session`, `kill-session`, `show-options -g prefix`,
-`load-buffer -w -` and `tmux -V` (answered `tmux 3.8 (lif 0.2.0)`).
+`load-buffer -w -` and `tmux -V` (answered `tmux 3.8 (lif 0.3.0)`).
 `crates/lif/tests/claude_compat.rs` runs the same sequences.
 
 ### Differences from tmux you may notice
@@ -106,5 +106,5 @@ pane-border-status`, `select-pane -T`, `respawn-pane -k`, `kill-pane`,
 - `select-pane -T` takes the title as given; tmux expands formats in it.
 - Programs that see `$TMUX` treat lif as tmux. Most only use it to decide
   how to wrap escape sequences, which lif unwraps; a program that needs a
-  tmux feature lif lacks (control mode, popups, `pipe-pane`) fails with
+  tmux feature lif lacks (control mode, floating panes) fails with
   `unsupported command: NAME`.

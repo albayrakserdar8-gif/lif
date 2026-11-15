@@ -8,7 +8,7 @@ scripts know about tmux works unchanged. It is a single-threaded Rust server
 built on Ghostty's terminal engine (libghostty-vt), aimed at high output
 throughput, low idle cost and a small self-contained binary.
 
-Status: version 0.2.0. Enough of tmux is implemented for daily use; the list of
+Status: version 0.3.0. Enough of tmux is implemented for daily use; the list of
 what is missing is below and in [docs/tmux-migration.md](docs/tmux-migration.md).
 
 ## Benchmarks
@@ -103,7 +103,7 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
 
 ## Same as tmux
 
-- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (62 of
+- Prefix `C-b`, and tmux 3.8's default bindings for the commands lif has (71 of
   tmux's 93 default prefix bindings are identical; the rest are listed in the
   migration guide). The copy-mode tables (`copy-mode`, `copy-mode-vi`) are
   tmux 3.8's, minus the mouse entries and emacs `L`.
@@ -122,12 +122,20 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   commands (`set-environment`, `show-environment`, `-e` on the commands
   that create panes), with tmux's output and messages.
 - Option names, scopes (`-s`, `-g`, `-w`, `-p`, per session, window and
-  pane) and the defaults of the 68 tmux options lif has (except
+  pane) and the defaults of the 70 tmux options lif has (except
   `escape-time`, `history-limit` and `pane-border-format`), plus user
   options (`@name`).
 - Layouts: `even-horizontal`, `even-vertical`, `main-horizontal`,
   `main-vertical`, their `-mirrored` variants, `tiled`, and tmux layout
   strings in `#{window_layout}`.
+- The chooser modes: `choose-tree` (`C-b s`, `C-b w`), `choose-buffer`
+  (`C-b =`), `choose-client` (`C-b D`) and `find-window` (`C-b f`), with
+  tmux's list, tree, preview and keys.
+- `pipe-pane`, `clock-mode` (`C-b t`), `resize-window`, `respawn-window`,
+  `split-window -f`, `select-pane -d`/`-e`, the prompt history commands, and
+  tmux's notes on the default keys (`C-b /` describes a key).
+- Popups and menus: `display-popup` (sizes, positions, borders, `-E`,
+  the exit status) and `display-menu`, with `C-b <` and `C-b >`.
 - A server per socket, started by the first client, sessions surviving detach.
 
 ## Deliberately different
@@ -205,15 +213,13 @@ tmux: `lif install-tmux-shim` and `tmux-compat = true` make lif answer for
 Checked against the command table and by running each one (they fail with
 `unsupported command: NAME`):
 
-- `pipe-pane`.
-- Popups and menus (`display-popup`, `display-menu`), floating panes
-  (`new-pane`, `move-pane`).
-- Tree and chooser modes: `choose-tree`, `choose-buffer`, `choose-client`,
-  `customize-mode`, `find-window`, `clock-mode`, `switch-mode`.
+- Floating panes (`new-pane`, `move-pane`), mouse bindings (and so
+  right-click menus).
+- `customize-mode`, `switch-mode`.
 - Session groups and linked windows (`new-session -t`, `link-window`,
-  `unlink-window`), `resize-window`, `respawn-window`.
-- Locking, `server-access`, prompt history.
-- Control mode (`-C`), marked panes, most of tmux's 204 options (lif has 68
+  `unlink-window`).
+- Locking, `server-access`.
+- Control mode (`-C`), marked panes, most of tmux's 204 options (lif has 70
   of them, plus 3 of its own).
 - Images (sixel, kitty graphics), Windows. Plugins are untested: TPM is
   loaded from `.tmux.conf` with `run`, and lif's configuration file has
@@ -298,8 +304,11 @@ the documented default file. Full reference: [docs/configuration.md](docs/config
 
 - **macOS on Apple Silicon (arm64)**: the only platform it has been built,
   tested and benchmarked on.
-- **Linux**: the code has Linux paths (epoll, `/proc`, PTY handling) but has
-  not been built or run there. Expect problems.
+- **Linux**: it builds. The workspace is checked, linted (clippy with
+  `-D warnings`) and linked for `aarch64-unknown-linux-gnu` by cross
+  compiling from macOS (libghostty-vt included; zig is the linker), but
+  the binary and the tests have never been run on Linux. Expect problems
+  in the Linux-only paths (epoll, `/proc`, PTY handling).
 - Other Unix systems: untested. Windows: not supported.
 
 ## License

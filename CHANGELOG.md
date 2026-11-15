@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+- Chooser modes: `choose-tree` (`C-b s`, `C-b w`), `choose-buffer`
+  (`C-b =`), `choose-client` (`C-b D`) and `find-window` (`C-b f`), with
+  tmux 3.8's list, tree, preview box, keys (move, expand, tag, search,
+  filter, sort, kill, run a command for the tagged items), shortcuts and
+  mouse. The list follows the server while it is open.
+- Popups and menus: `display-popup` (tmux's sizes, positions and
+  borders; `-E` and the program's exit status; the command waits for it)
+  and `display-menu` (keys and mouse), with `C-b <` and `C-b >`. A popup's
+  program is a pane only the server knows, so its lifetime follows the
+  ordinary pane paths; the renderer is unchanged.
+- Fixed: a pane's exit status could be lost (reported as a failure) when
+  the end of its output was read before the process was reaped
+  (issues/0003).
+- `pipe-pane` (`-o`): a pane's output also goes to a shell command; a
+  command that reads slowly never holds the pane (1 MiB waits, the rest is
+  not piped).
+- `clock-mode` (`C-b t`) with `clock-mode-style` and `clock-mode-colour`;
+  its deadline exists only while a pane shows a clock.
+- `resize-window`, `respawn-window`, `show-prompt-history`,
+  `clear-prompt-history`, `split-window -f`, `select-pane -d` / `-e`
+  (`#{pane_input_off}`), `#{pane_pipe}`.
+- The default prefix bindings have tmux's notes (`list-keys -N`), and
+  `C-b /`, `C-b ~` are bound as in tmux.
+- Paste buffers remember when they were made (shown by `choose-buffer`).
+- Linux: the workspace is checked, linted and linked for
+  `aarch64-unknown-linux-gnu` by cross compiling from macOS
+  (`tools/zigcc-aarch64-linux.sh` makes zig the linker). It has still not
+  been run there.
+- Model interface: `Host::choose`, `Host::popup`, `Host::menu`,
+  `Host::pipe_pane`, `Host::clock_mode`, `Host::prompt_history`,
+  `Model::choose_items`, `Model::chooser_closed`, `ChooseState`,
+  `MenuState`, `PaneInfo::pipe`. 82 of tmux 3.8's 92 commands now exist.
+
 ## 0.2.0 (unreleased)
 
 Scripting: lif runs shell commands and hooks. 70 of tmux 3.8's 92 commands

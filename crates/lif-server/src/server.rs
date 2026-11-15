@@ -16,7 +16,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::ServerOptions;
 use crate::client::{CLIENT_READ_BUDGET, ClientRt, TermOut, Tty};
-use crate::host::{CLIENT_TOKEN, JOB_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
+use crate::host::{CLIENT_TOKEN, JOB_TOKEN, PANE_PIPE_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
 use crate::sys::{self, SignalPipe};
 
 const LISTENER: Token = Token(0);
@@ -247,6 +247,7 @@ impl Server {
             LISTENER => self.accept(),
             REAPER => self.reap(now),
             SIGNALS => self.handle_signals(),
+            Token(t) if t & PANE_PIPE_TOKEN != 0 => self.pane_pipe_writable(PaneId((t & 0xffff_ffff) as u32)),
             Token(t) if t & JOB_TOKEN != 0 => self.read_job((t & 0xffff_ffff) as u32),
             Token(t) if t & PIPE_TOKEN != 0 => self.rt.pipe_writable((t & 0xffff_ffff) as u32),
             Token(t) if t & TTY_TOKEN != 0 => {
@@ -308,10 +309,13 @@ impl Server {
                 self.read_job(t);
             }
         }
+        self.sweep_popups();
         self.job_timers(now);
         self.rt.kill_overdue(now);
         self.timers(now);
         self.step_searches();
+        self.refresh_clocks(now);
+        self.refresh_choosers();
         self.sync_views();
         self.frame_tick(now);
         self.remove_dead_clients();
@@ -379,6 +383,7 @@ impl Server {
             return Some(now);
         }
         min(self.rt.job_timers.iter().map(|t| t.0).min());
+        min(self.rt.clock_deadline);
         d
     }
 
@@ -545,6 +550,10 @@ impl Server {
     pub(crate) fn read_pane(&mut self, id: PaneId, now: Instant, budget: usize) {
         let Some(p) = self.rt.panes.get_mut(&id) else { return };
         let r = p.read(&mut self.read_buf, budget);
+        if p.pipe.as_ref().is_some_and(|x| x.dead) {
+            self.close_dead_pipe(id);
+        }
+        let Some(p) = self.rt.panes.get_mut(&id) else { return };
         if r.bytes > 0 {
             p.echo_bytes = p.echo_bytes.saturating_add(r.bytes);
             p.compact_at = Some(now + crate::COMPACT_AFTER);
@@ -595,7 +604,7 @@ impl Server {
     fn reap(&mut self, now: Instant) {
         for (pid, status) in self.rt.reaper.reap() {
             self.rt.child_reaped(pid);
-            let Some(id) = self.rt.pids.remove(&pid) else {
+            let Some(&id) = self.rt.pids.get(&pid) else {
                 self.job_exited(pid, status);
                 continue;
             };
@@ -603,7 +612,11 @@ impl Server {
             // Output the program wrote just before exiting is still in the
             // PTY. Bounded: a background process that ignores SIGHUP may
             // keep writing to it, and only closing the PTY stops it.
+            // (The pid stays known during the drain: the end of the
+            // PTY's output must not report the pane gone without its
+            // exit status.)
             self.read_pane(id, now, crate::EXIT_DRAIN);
+            self.rt.pids.remove(&pid);
             self.pane_gone(id, status.code());
         }
     }
@@ -611,9 +624,33 @@ impl Server {
     /// The pane's process is gone: tell the model, then drop what the model
     /// no longer knows (or just the PTY of a pane kept by remain-on-exit).
     fn pane_gone(&mut self, id: PaneId, code: Option<i32>) {
+        // A popup's program: the popup closes (-E), or stays with what
+        // the program left until a key.
+        let mut kept = false;
+        if let Some(&(_, client, _)) = self.rt.popups.iter().find(|p| p.0 == id) {
+            let status = code.unwrap_or(1);
+            let close = match self.rt.clients.get_mut(&client).and_then(|c| c.att.as_mut()).and_then(|a| a.overlay.as_mut()) {
+                Some(crate::overlay::Overlay::Popup(p)) if p.pane == id => {
+                    p.exited = true;
+                    match p.close {
+                        lif_core::PopupClose::OnExit => true,
+                        lif_core::PopupClose::OnSuccess => status == 0,
+                        lif_core::PopupClose::Never => false,
+                    }
+                }
+                _ => true,
+            };
+            if close {
+                self.rt.end_overlay(client, status);
+                // (Not a popup any more if its client had lost it.)
+                self.rt.popups.retain(|p| p.0 != id);
+            } else {
+                kept = true;
+            }
+        }
         self.model.pane_exited(id, code, &mut self.rt);
         self.after_model();
-        if self.model.pane(id).is_none() {
+        if self.model.pane(id).is_none() && !kept {
             if let Some(mut p) = self.rt.panes.remove(&id)
                 && let Some(pty) = p.pty.take()
             {
@@ -630,6 +667,84 @@ impl Server {
         self.rt.views_stale = true;
     }
 
+    /// A `pipe-pane` command can take more: write what waits for it.
+    fn pane_pipe_writable(&mut self, pane: PaneId) {
+        if let Some(pipe) = self.rt.panes.get_mut(&pane).and_then(|p| p.pipe.as_mut()) {
+            pipe.flush();
+        }
+        self.close_dead_pipe(pane);
+    }
+
+    /// Close `pane`'s pipe if its command stopped reading.
+    fn close_dead_pipe(&mut self, pane: PaneId) {
+        let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+        if p.pipe.as_ref().is_some_and(|x| x.dead)
+            && let Some(mut old) = p.pipe.take()
+        {
+            let _ = self.rt.registry.deregister(&mut old.tx);
+            log!("pipe-pane: pane {pane}: pid {} stopped reading", old.pid);
+        }
+    }
+
+    /// Draw the clocks whose minute or size changed, and keep the
+    /// deadline for the next minute while any pane shows one.
+    fn refresh_clocks(&mut self, now: Instant) {
+        if self.rt.clock_panes.is_empty() {
+            return;
+        }
+        let wall = sys::wall_clock();
+        let mut left = Vec::with_capacity(self.rt.clock_panes.len());
+        for pane in std::mem::take(&mut self.rt.clock_panes) {
+            let twelve = self.model.pane_option_text(pane, "clock-mode-style").as_deref() == Some("12");
+            let colour = self.model.pane_option_text(pane, "clock-mode-colour").unwrap_or_default();
+            let Some(p) = self.rt.panes.get_mut(&pane) else { continue };
+            let size = p.engine.size();
+            let Some(c) = p.mode.as_deref_mut().and_then(|m| m.clock()) else { continue };
+            left.push(pane);
+            let text = crate::clock::clock_text(wall, twelve);
+            if c.needs_draw(&text, size) {
+                c.draw(&text, size, lif_core::parse_style(&format!("fg={colour}")));
+                self.rt.mark_all(false);
+            }
+        }
+        self.rt.clock_panes = left;
+        self.rt.clock_deadline = (!self.rt.clock_panes.is_empty()).then(|| now + Duration::from_secs(60 - wall.unix_secs.rem_euclid(60) as u64));
+    }
+
+    /// End the popups whose client is gone or no longer shows them, or
+    /// whose screen became too small for them. Nothing to do, nearly
+    /// always: the list is empty unless a popup is up.
+    fn sweep_popups(&mut self) {
+        if self.rt.popups.is_empty() {
+            return;
+        }
+        let mut ended = false;
+        for (pane, client, job) in self.rt.popups.clone() {
+            let att = self.rt.clients.get(&client).filter(|c| !c.dead).and_then(|c| c.att.as_ref());
+            let size = self.rt.clients.get(&client).and_then(|c| c.hello.as_ref()).map(|h| h.size);
+            let shown = match att.and_then(|a| a.overlay.as_ref()) {
+                Some(crate::overlay::Overlay::Popup(p)) if p.pane == pane => {
+                    size.is_none_or(|s| p.rect.right() <= s.cols && p.rect.bottom() <= s.rows)
+                }
+                _ => false,
+            };
+            if shown {
+                continue;
+            }
+            ended = true;
+            if att.is_some_and(|a| matches!(&a.overlay, Some(crate::overlay::Overlay::Popup(p)) if p.pane == pane)) {
+                self.rt.end_overlay(client, 0);
+            } else {
+                self.rt.popups.retain(|p| p.0 != pane);
+                self.rt.popups_done.push((job, 0));
+                lif_core::Host::kill_pane(&mut self.rt, pane);
+            }
+        }
+        if ended {
+            self.after_model();
+        }
+    }
+
     // ----- shell commands ------------------------------------------------
 
     fn read_job(&mut self, token: u32) {
@@ -643,6 +758,16 @@ impl Server {
     }
 
     fn job_exited(&mut self, pid: u32, status: std::process::ExitStatus) {
+        // A pipe-pane command that exited takes no more: close its pipe
+        // now, not at the pane's next output.
+        if let Some(pane) = self.rt.panes.values_mut().find(|p| p.pipe.as_ref().is_some_and(|x| x.pid == pid)) {
+            let id = pane.id;
+            if let Some(pipe) = pane.pipe.as_mut() {
+                pipe.dead = true;
+            }
+            self.close_dead_pipe(id);
+            return;
+        }
         let Some((&token, j)) = self.rt.jobs.iter_mut().find(|(_, j)| j.pid == pid && j.status.is_none()) else { return };
         j.status = Some(crate::job::status_of(status));
         self.job_check(token);
@@ -691,6 +816,7 @@ impl Server {
     /// command still owes, a message for an attached client, or a line in
     /// the message log when nobody is there to see it.
     fn deliver(&mut self, f: lif_core::Finished) {
+        log!("finished: client {:?} waited {} status {} error {:?}", f.client, f.waited, f.status, f.error);
         let client = f.client.filter(|id| self.rt.clients.get(id).is_some_and(|c| !c.dead));
         let Some(id) = client else {
             if let Some(e) = f.error {
@@ -1098,6 +1224,14 @@ impl Server {
     /// environments of sessions that are gone, bring views up to date.
     pub(crate) fn after_model(&mut self) {
         self.rt.respawn_stash = None;
+        // Popups that closed: the commands that waited for them go on.
+        while !self.rt.popups_done.is_empty() {
+            for (job, status) in std::mem::take(&mut self.rt.popups_done) {
+                self.model.job_done(job, lif_core::JobStatus::Exited(status), &[], sys::wall_clock(), &mut self.rt);
+            }
+            self.rt.views_stale = true;
+            self.apply_options();
+        }
         if self.model.has_finished() {
             for f in self.model.take_finished() {
                 self.deliver(f);
@@ -1114,6 +1248,7 @@ impl Server {
             }
         }
         self.model.start_format_jobs(sys::wall_clock(), &mut self.rt);
+        self.sync_choosers();
         if !self.rt.mode_actions.is_empty() {
             for (c, p, a) in std::mem::take(&mut self.rt.mode_actions) {
                 self.mode_action(c, p, a);
