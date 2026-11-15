@@ -25,6 +25,8 @@ fn window_tree_navigates_and_switches() {
     let mut t = attach(&env);
     t.write(b"\x02w");
     t.wait_text("(sort: index) (view: preview)");
+    // (The whole frame: a slow terminal gets it in pieces.)
+    t.wait_for("the bottom of the preview box", secs(10), |t| t.lines()[22].starts_with('└'));
     let l = t.lines();
     assert_eq!(l[0], "(0) - alpha: 2 windows (attached)");
     assert!(l[1].starts_with("(1) ├─→ + 0: [lif]*"), "{:?}", l[1]);
