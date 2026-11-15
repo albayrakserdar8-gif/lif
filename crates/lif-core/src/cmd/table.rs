@@ -120,7 +120,7 @@ pub(crate) static TABLE: &[CmdEntry] = &[
     c("source-file", Some("source"), "Fnqvt:", 1, N),
     c("split-window", Some("splitw"), "bc:dF:hl:p:Pt:vZ", 0, N),
     c("start-server", Some("start"), "", 0, Z),
-    u("suspend-client", Some("suspendc")),
+    c("suspend-client", Some("suspendc"), "t:", 0, Z),
     c("swap-pane", Some("swapp"), "dDs:t:UZ", 0, Z),
     c("swap-window", Some("swapw"), "ds:t:", 0, Z),
     c("switch-client", Some("switchc"), "c:lnpt:T:Z", 0, Z),

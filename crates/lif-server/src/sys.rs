@@ -118,9 +118,21 @@ fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
 /// Opens a client's terminal for the server's own use: by path, so the
 /// open file description (and its O_NONBLOCK) is the server's, not shared
 /// with the shell that gets the terminal back after detaching. It must be
-/// a terminal and the device the client named.
+/// a terminal, the device the client named, and the user's own: the path
+/// is checked before it is opened (opening some devices has side effects)
+/// and the descriptor after.
 pub(crate) fn open_tty(path: &str, dev: u64) -> io::Result<OwnedFd> {
     let c = std::ffi::CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let not_it = || io::Error::new(io::ErrorKind::InvalidInput, "not the client's terminal");
+    // SAFETY: stat is plain data; stat(2) fills it for a valid path.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: c is a valid NUL-terminated path and st a valid out-pointer.
+    cvt(unsafe { libc::stat(c.as_ptr(), &mut st) })?;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR || st.st_rdev as u64 != dev || (st.st_uid != uid && uid != 0) {
+        return Err(not_it());
+    }
     // SAFETY: c is a valid NUL-terminated path.
     let fd = cvt(unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC) })?;
     // SAFETY: open returned a fresh fd nothing else owns.
@@ -238,4 +250,241 @@ pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     // (which may itself contain spaces and parentheses).
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Who is at the other end of a client socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerCred {
+    pub(crate) uid: u32,
+    /// Not every system tells.
+    pub(crate) pid: Option<u32>,
+}
+
+/// Only the server's own user may use it, and root (who can read the
+/// user's files and terminals anyway, as tmux allows). The private 0700
+/// directory and the 0600 socket already keep others out; this holds even
+/// if those permissions were loosened.
+pub(crate) fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid || peer_uid == 0
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn peer_cred(fd: RawFd) -> io::Result<PeerCred> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes two ids through valid pointers.
+    cvt(unsafe { libc::getpeereid(fd, &mut uid, &mut gid) })?;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: LOCAL_PEERPID writes one pid_t; len says how much room there is.
+    let r = unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&mut pid as *mut libc::pid_t).cast(), &mut len) };
+    Ok(PeerCred { uid, pid: (r == 0 && pid > 0).then_some(pid as u32) })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn peer_cred(fd: RawFd) -> io::Result<PeerCred> {
+    // SAFETY: ucred is plain data; zero is a valid value.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED writes one ucred; len says how much room there is.
+    cvt(unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) })?;
+    Ok(PeerCred { uid: cred.uid, pid: (cred.pid > 0).then_some(cred.pid as u32) })
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub(crate) fn peer_cred(fd: RawFd) -> io::Result<PeerCred> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes two ids through valid pointers.
+    cvt(unsafe { libc::getpeereid(fd, &mut uid, &mut gid) })?;
+    Ok(PeerCred { uid, pid: None })
+}
+
+/// Most descriptors the server asks for: far more than anyone runs panes,
+/// and small enough that nothing sized by the limit gets large.
+const MAX_NOFILE: u64 = 65536;
+
+/// Raises the soft RLIMIT_NOFILE to the hard limit (at most [`MAX_NOFILE`]):
+/// a shell's default soft limit (256 in Terminal.app) would cap the server
+/// at a couple of hundred panes. Returns the limit the server had, for its
+/// children, and the one it has now.
+pub(crate) fn raise_fd_limit() -> (Option<u64>, u64) {
+    // SAFETY: rlimit is plain data; getrlimit fills it.
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return (None, 256);
+    }
+    let old = rl.rlim_cur as u64;
+    let hard = rl.rlim_max as u64;
+    let want = hard.min(MAX_NOFILE);
+    if want <= old {
+        return (None, old);
+    }
+    // macOS refuses more than kern.maxfilesperproc (and OPEN_MAX for some
+    // binaries): fall back to OPEN_MAX before giving up.
+    for target in [want, want.min(10240)] {
+        if target <= old {
+            break;
+        }
+        let new = libc::rlimit { rlim_cur: target as libc::rlim_t, rlim_max: rl.rlim_max };
+        // SAFETY: valid pointer to an rlimit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) } == 0 {
+            return (Some(old), target);
+        }
+    }
+    (None, old)
+}
+
+/// Descriptors this process has open. Only for spawning a pane (rare), to
+/// keep a reserve for clients.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn open_fd_count() -> usize {
+    let mut list: Vec<libc::proc_fdinfo> = Vec::new();
+    let mut want = 1024usize;
+    loop {
+        list.resize(want, libc::proc_fdinfo { proc_fd: -1, proc_fdtype: 0 });
+        let cap = (want * std::mem::size_of::<libc::proc_fdinfo>()) as libc::c_int;
+        // SAFETY: the buffer is valid for cap bytes.
+        let got = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, list.as_mut_ptr().cast(), cap) };
+        if got <= 0 {
+            return 0;
+        }
+        let n = got as usize / std::mem::size_of::<libc::proc_fdinfo>();
+        if n < want || want >= 1 << 20 {
+            return n;
+        }
+        want *= 4;
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").map(|d| d.count().saturating_sub(1)).unwrap_or(0)
+}
+
+/// Whether a client's terminal belongs to the client right now: it is the
+/// client's controlling terminal and the client's process group is its
+/// foreground group. When a shell stops the client (job control, or a
+/// SIGSTOP the shell notices) it takes the terminal back by making its own
+/// group the foreground one, and from then on keys typed there are the
+/// shell's: the server must neither read them nor draw over the shell.
+///
+/// The server cannot ask the terminal (tcgetpgrp only answers for the
+/// caller's own controlling terminal); it asks about the client process,
+/// whose kernel record includes its terminal's foreground group: one
+/// proc_pidinfo call on macOS, one pread of /proc/<pid>/stat on Linux.
+pub(crate) struct TtyOwner {
+    pid: u32,
+    rdev: u64,
+    #[cfg(target_os = "linux")]
+    stat: OwnedFd,
+}
+
+impl TtyOwner {
+    /// For client process `pid` and its terminal `rdev`. Fails when the
+    /// terminal is not the client's controlling terminal (its foreground
+    /// group cannot be known) or the client is not in the foreground now.
+    pub(crate) fn new(pid: u32, rdev: u64) -> io::Result<TtyOwner> {
+        #[cfg(target_os = "linux")]
+        let owner = {
+            let path = std::ffi::CString::new(format!("/proc/{pid}/stat")).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: valid NUL-terminated path.
+            let fd = cvt(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) })?;
+            // SAFETY: a fresh fd nothing else owns.
+            TtyOwner { pid, rdev, stat: unsafe { OwnedFd::from_raw_fd(fd) } }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let owner = TtyOwner { pid, rdev };
+        match owner.state() {
+            Some((true, true)) => Ok(owner),
+            Some((false, _)) => Err(io::Error::other("the terminal is not the client's controlling terminal")),
+            Some((true, false)) => Err(io::Error::other("the client is not in the foreground")),
+            None => Err(io::Error::other("cannot see the client process")),
+        }
+    }
+
+    pub(crate) fn rdev(&self) -> u64 {
+        self.rdev
+    }
+
+    /// The client is in the foreground of its terminal.
+    pub(crate) fn foreground(&self) -> bool {
+        self.state() == Some((true, true))
+    }
+
+    /// (the terminal is the client's controlling terminal, the client's
+    /// group is in the foreground of it); `None` when the process is gone.
+    #[cfg(target_vendor = "apple")]
+    fn state(&self) -> Option<(bool, bool)> {
+        // SAFETY: proc_pidinfo fills a proc_bsdinfo of the given size; an
+        // all-zero one is a valid out-parameter.
+        let info = unsafe {
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let n = libc::proc_pidinfo(self.pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size);
+            if n != size {
+                return None;
+            }
+            info
+        };
+        // e_tdev is the kernel's dev_t (32 bits); st_rdev was widened.
+        let ctty = info.e_tdev != u32::MAX && info.e_tdev == self.rdev as u32;
+        Some((ctty, ctty && info.e_tpgid != 0 && info.e_tpgid == info.pbi_pgid))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn state(&self) -> Option<(bool, bool)> {
+        let mut buf = [0u8; 512];
+        // SAFETY: buf is valid for its length; the fd is ours. /proc stat
+        // files are generated afresh by every read from offset 0.
+        let n = unsafe { libc::pread(self.stat.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n <= 0 {
+            return None;
+        }
+        let s = &buf[..n as usize];
+        let close = s.iter().rposition(|&b| b == b')')?;
+        // After the command name: state ppid pgrp session tty_nr tpgid ...
+        let mut fields = s[close + 1..].split(|&b| b == b' ').filter(|f| !f.is_empty());
+        let num = |f: Option<&[u8]>| -> Option<i64> { std::str::from_utf8(f?).ok()?.parse().ok() };
+        let pgrp = num(fields.nth(2))?;
+        let tty_nr = num(fields.nth(1))?;
+        let tpgid = num(fields.next())?;
+        let ctty = tty_nr != 0 && tty_nr as u64 == self.rdev;
+        Some((ctty, ctty && tpgid > 0 && tpgid == pgrp))
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    fn state(&self) -> Option<(bool, bool)> {
+        let _ = (self.pid, self.rdev);
+        None
+    }
+}
+
+/// A descriptor to give up when out of them (see `Server::refuse_one`).
+pub(crate) fn spare_fd() -> Option<OwnedFd> {
+    // SAFETY: valid NUL-terminated path.
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    // SAFETY: a fresh fd nothing else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_the_owner_and_root_may_connect() {
+        assert!(super::peer_allowed(501, 501));
+        assert!(super::peer_allowed(0, 501));
+        assert!(!super::peer_allowed(502, 501));
+        assert!(!super::peer_allowed(65534, 0));
+    }
+
+    #[test]
+    fn peer_credentials_of_a_socket_pair_are_ours() {
+        use std::os::fd::AsRawFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let c = super::peer_cred(a.as_raw_fd()).unwrap();
+        // SAFETY: getuid cannot fail.
+        assert_eq!(c.uid, unsafe { libc::getuid() });
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        assert_eq!(c.pid, Some(std::process::id()));
+    }
 }

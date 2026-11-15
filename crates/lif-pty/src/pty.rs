@@ -288,6 +288,13 @@ unsafe fn child(prep: &mut Prepared, slave: RawFd, err_fd: RawFd, empty: &libc::
             }
         }
         prep.closer.close_all_except(err_fd);
+        if prep.nofile != 0 {
+            let mut rl: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                rl.rlim_cur = (prep.nofile as libc::rlim_t).min(rl.rlim_max);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+            }
+        }
 
         if !prep.dirs.iter().any(|d| libc::chdir(d.as_ptr()) == 0) {
             fail(err_fd, Stage::Chdir);

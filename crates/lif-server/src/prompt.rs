@@ -8,6 +8,9 @@ use lif_types::{Color, Key, KeyAction, KeyEvent, Mods, Span, Style, StyledLine};
 /// Prompt history kept by the server, oldest first.
 pub(crate) const HISTORY_MAX: usize = 100;
 
+/// Longest line a prompt takes, in characters.
+pub(crate) const MAX_LINE: usize = 16 * 1024;
+
 pub(crate) enum PromptAction {
     Continue,
     Cancel,
@@ -217,9 +220,14 @@ impl PromptState {
         PromptAction::Continue
     }
 
-    /// Pasted text goes into the line (control characters dropped).
+    /// Pasted text goes into the line (control characters dropped), up to
+    /// [`MAX_LINE`] characters: each insert shifts the rest of the line, so
+    /// a huge paste would cost its length squared.
     pub(crate) fn insert(&mut self, text: &str) {
         for c in text.chars().filter(|c| !c.is_control()) {
+            if self.line.len() >= MAX_LINE {
+                break;
+            }
             self.line.insert(self.cursor, c);
             self.cursor += 1;
         }

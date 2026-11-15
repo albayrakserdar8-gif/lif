@@ -12,11 +12,35 @@ use std::sync::Mutex;
 
 use crate::sys;
 
-pub(crate) const SIGNALS: [libc::c_int; 5] = [libc::SIGWINCH, libc::SIGHUP, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
+pub(crate) const SIGNALS: [libc::c_int; 7] =
+    [libc::SIGWINCH, libc::SIGHUP, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT];
 
-/// Everything in [`SIGNALS`] but SIGWINCH ends the attachment.
+/// SIGHUP, SIGTERM, SIGINT and SIGQUIT end the attachment; SIGWINCH,
+/// SIGTSTP (suspend) and SIGCONT (resume) do not.
 pub(crate) fn is_terminating(sig: libc::c_int) -> bool {
-    sig != libc::SIGWINCH && SIGNALS.contains(&sig)
+    !matches!(sig, libc::SIGWINCH | libc::SIGTSTP | libc::SIGCONT) && SIGNALS.contains(&sig)
+}
+
+/// Stops the process the way SIGTSTP's default action does, and returns
+/// once it is continued (SIGCONT; its handler has written to the pipes
+/// by then). The caller has already given the terminal back.
+pub(crate) fn stop_self() {
+    // SAFETY: sigaction structs are plain data initialized by zeroing and
+    // sigemptyset; the pointers are valid for each call.
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut dfl.sa_mask);
+        let mut ours: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGTSTP, &dfl, &mut ours);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTSTP);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        // With the default action the process stops here, in raise.
+        libc::raise(libc::SIGTSTP);
+        libc::sigaction(libc::SIGTSTP, &ours, std::ptr::null_mut());
+    }
 }
 
 /// Write ends of every live self-pipe. A process normally has one attach

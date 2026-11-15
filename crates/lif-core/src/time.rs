@@ -53,7 +53,10 @@ fn is_leap(y: i64) -> bool {
 
 impl Tm {
     pub fn from_clock(c: WallClock) -> Tm {
-        let t = c.unix_secs + c.utc_offset_secs as i64;
+        // Saturating: `#{t:...}` takes any i64 from the user, and an
+        // overflow here would take the server down. Far-off instants just
+        // print an absurd (but well-formed) year.
+        let t = c.unix_secs.saturating_add(c.utc_offset_secs as i64);
         let days = t.div_euclid(86400);
         let secs = t.rem_euclid(86400) as u32;
         // Howard Hinnant's civil_from_days.

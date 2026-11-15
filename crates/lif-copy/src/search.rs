@@ -147,6 +147,8 @@ pub(crate) struct Job {
     wrapped: bool,
     /// Matches still to find (a repeat count).
     pub remaining: u32,
+    /// Rows the last [`step`](Self::step) examined.
+    pub used: usize,
 }
 
 impl Job {
@@ -162,6 +164,7 @@ impl Job {
             next: 0,
             wrapped: false,
             remaining: remaining.max(1),
+            used: 0,
         }
     }
 
@@ -181,12 +184,12 @@ impl Job {
         wrap: bool,
     ) -> Step {
         let folded = pat.re.icase();
-        let mut used = 0usize;
+        self.used = 0;
         loop {
             match self.phase {
                 Phase::First => {
                     line.load(g, self.line_first, folded);
-                    used += line.rows();
+                    self.used += line.rows();
                     let n = line.chars.len();
                     let m = if self.forward {
                         let k = line.index_of(self.origin, true);
@@ -217,7 +220,7 @@ impl Job {
                             continue;
                         }
                         line.load(g, self.next, folded);
-                        used += line.rows();
+                        self.used += line.rows();
                         let m = pat.re.find(&line.chars, 0, line.chars.len() + 1, false, sc);
                         if let Some(m) = Self::found(line, m) {
                                 return Step::Found(m);
@@ -238,14 +241,14 @@ impl Job {
                         }
                         let first = g.line_start(self.next - 1, MAX_LINE_ROWS - 1);
                         line.load(g, first, folded);
-                        used += line.rows();
+                        self.used += line.rows();
                         let m = pat.re.find(&line.chars, 0, line.chars.len() + 1, true, sc);
                         if let Some(m) = Self::found(line, m) {
                                 return Step::Found(m);
                         }
                         self.next = first;
                     }
-                    if used >= budget {
+                    if self.used >= budget {
                         return Step::Pending;
                     }
                 }

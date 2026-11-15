@@ -290,6 +290,8 @@ impl Model {
             let n: i64 = if p.len() > 1 { p[1..].parse().ok().filter(|n| *n >= 1)? } else { 1 };
             let pos = win.panes.iter().position(|x| *x == win.active)? as i64;
             let len = win.panes.len() as i64;
+            // Reduced first: n can be up to i64::MAX and pos + n would overflow.
+            let n = n % len;
             let to = if p.starts_with('+') { (pos + n).rem_euclid(len) } else { (pos - n).rem_euclid(len) };
             return Some(win.panes[to as usize]);
         }

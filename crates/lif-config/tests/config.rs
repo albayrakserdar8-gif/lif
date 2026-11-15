@@ -29,8 +29,9 @@ impl Host for TestHost {
         self.calls += 1;
     }
     fn resize_pane(&mut self, _pane: PaneId, _size: Size) {}
-    fn send_to_pane(&mut self, _pane: PaneId, _input: PaneInput<'_>) {
+    fn send_to_pane(&mut self, _pane: PaneId, _input: PaneInput<'_>) -> Result<(), String> {
         self.calls += 1;
+        Ok(())
     }
     fn pane_info(&self, _pane: PaneId) -> PaneInfo<'_> {
         PaneInfo::default()
@@ -809,6 +810,155 @@ fn files_on_disk() {
     let c = Config::load_file(&dir);
     assert!(c.diagnostics[0].message.starts_with("cannot read file"), "{:?}", c.diagnostics);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ------------------------------------------------- hostile files and input --
+
+/// `Config::load_file` on another thread, with a deadline: a reader that
+/// blocks must fail the test, not hang it. `unblock` runs on timeout so the
+/// stuck thread can finish.
+fn load_with_deadline(path: &std::path::Path, unblock: impl FnOnce()) -> Config {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(Config::load_file(&p));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(c) => c,
+        Err(_) => {
+            unblock();
+            panic!("loading {} did not return within 5 s", path.display());
+        }
+    }
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("lif-config-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn a_fifo_is_refused_without_blocking() {
+    let dir = scratch_dir("fifo");
+    let fifo = dir.join("config.toml");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    // Nobody ever writes to it: a blocking open or read would never return.
+    let c = load_with_deadline(&fifo, || {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    });
+    assert!(c.commands.is_empty());
+    assert_eq!(c.diagnostics.len(), 1, "{:?}", c.diagnostics);
+    assert_eq!(c.diagnostics[0].message, "cannot read file: not a regular file");
+    let e = lif_config::read_file_limited(&fifo).unwrap_err();
+    assert_eq!(e.to_string(), "not a regular file");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_device_is_refused_without_reading_it() {
+    // /dev/zero never ends: reading it to the end would exhaust memory.
+    let c = load_with_deadline(std::path::Path::new("/dev/zero"), || {});
+    assert_eq!(c.diagnostics.len(), 1, "{:?}", c.diagnostics);
+    assert_eq!(c.diagnostics[0].message, "cannot read file: not a regular file");
+    assert_eq!(lif_config::read_file_limited(std::path::Path::new("/dev/null")).unwrap_err().to_string(), "not a regular file");
+}
+
+#[test]
+fn file_size_is_capped() {
+    let dir = scratch_dir("size");
+    let p = dir.join("config.toml");
+    let limit = lif_config::MAX_FILE_SIZE as usize;
+    assert_eq!(limit, 1024 * 1024);
+    // Exactly at the limit: read whole.
+    let mut text = "#".repeat(limit - 15);
+    text.push_str("
+mouse = false
+");
+    assert_eq!(text.len(), limit);
+    std::fs::write(&p, &text).unwrap();
+    assert_eq!(lif_config::read_file_limited(&p).unwrap().len(), limit);
+    let c = Config::load_file(&p);
+    assert_eq!(c.command_strings(), ["set-option -g mouse off"], "{:?}", c.diagnostics);
+    // One byte more: refused, nothing applied.
+    text.insert(0, '#');
+    std::fs::write(&p, &text).unwrap();
+    let c = Config::load_file(&p);
+    assert!(c.commands.is_empty());
+    assert_eq!(c.diagnostics.len(), 1, "{:?}", c.diagnostics);
+    assert_eq!(c.diagnostics[0].message, "cannot read file: file too large (1048577 bytes, limit 1 MiB)");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_symlinked_config_is_followed() {
+    let dir = scratch_dir("link");
+    let real = dir.join("real.toml");
+    std::fs::write(&real, "mouse = false
+").unwrap();
+    let link = dir.join("config.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(Config::load_file(&link).command_strings(), ["set-option -g mouse off"]);
+    // A link to a fifo is refused like the fifo.
+    let fifo = dir.join("fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let link2 = dir.join("fifo.toml");
+    std::os::unix::fs::symlink(&fifo, &link2).unwrap();
+    let c = load_with_deadline(&link2, || {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    });
+    assert_eq!(c.diagnostics[0].message, "cannot read file: not a regular file");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+const DEEP: usize = 100_000;
+
+#[test]
+fn deeply_nested_toml_is_an_error_not_a_crash() {
+    for text in [
+        format!("mouse = {}{}\n", "[".repeat(DEEP), "]".repeat(DEEP)),
+        format!("mouse = {}1{}\n", "{ a = ".repeat(DEEP), " }".repeat(DEEP)),
+        format!("{} = 1\n", vec!["a"; DEEP].join(".")),
+        format!("[{}]\n", vec!["a"; DEEP].join(".")),
+    ] {
+        let c = Config::parse(&text);
+        assert!(c.commands.is_empty());
+        assert!(c.has_errors());
+    }
+}
+
+#[test]
+fn deeply_nested_commands_are_an_error_not_a_crash() {
+    let blocks = format!("{}{}", "{ ".repeat(DEEP), " }".repeat(DEEP));
+    let ifs = format!("{}display-message x{}", "if-shell true { ".repeat(DEEP), " }".repeat(DEEP));
+    // In config.toml key bindings.
+    for cmd in [&blocks, &ifs] {
+        let text = format!("[keys]\nx = '{cmd}'\ny = ['{cmd}']\nz = {{ command = '{cmd}' }}\n");
+        let c = Config::parse(&text);
+        assert!(c.commands.is_empty(), "{:?}", c.commands.len());
+        assert_eq!(c.diagnostics.len(), 3);
+        for d in &c.diagnostics {
+            assert!(d.message.ends_with("syntax error: { } blocks nested more than 100 deep"), "{}", &d.message[..d.message.len().min(200)]);
+        }
+    }
+    // In a .tmux.conf.
+    for cmd in [&blocks, &ifs] {
+        let m = migrate_tmux_conf(&format!("bind x {cmd}\nset -g mouse on\n"));
+        assert_eq!(m.untranslated.len(), 1);
+        assert_eq!(m.untranslated[0].reason, "syntax error: { } blocks nested more than 100 deep");
+        assert!(m.toml.contains("mouse = true"));
+    }
+    // The server's check for a tmux file given to source-file.
+    assert!(!lif_config::looks_like_tmux_commands(&blocks));
+    assert!(!lif_config::looks_like_tmux_commands(&format!("# tmux\n{ifs}\n")));
+    assert!(lif_config::looks_like_tmux_commands("# tmux\nset -g mouse on\n"));
+    assert!(!lif_config::looks_like_tmux_commands("mouse = true\n"));
+    // Ordinary nesting still works.
+    let ok = format!("{}display-message x{}", "bind-key -n F12 { ".repeat(8), " }".repeat(8));
+    let c = Config::parse(&format!("[keys]\nx = '{ok}'\n"));
+    assert!(c.diagnostics.is_empty(), "{:?}", c.diagnostics);
+    assert_eq!(c.commands.len(), 1);
 }
 
 // ----------------------------------------------------- tmux.conf migration --

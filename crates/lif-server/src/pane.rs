@@ -48,8 +48,8 @@ impl WriteQueue {
         if self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
-            if self.buf.capacity() > 4 * crate::PANE_WRITE_HIGH {
-                self.buf.shrink_to(crate::PANE_WRITE_HIGH);
+            if self.buf.capacity() > 256 * 1024 {
+                self.buf.shrink_to(64 * 1024);
             }
             return Ok(true);
         }

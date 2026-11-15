@@ -19,6 +19,14 @@ pub const DEFAULT_WORD_SEPARATORS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^\x60{|}~"
 /// literal pattern on 80-column rows (M-series, see tests/bench.rs).
 pub const DEFAULT_SEARCH_STEP_ROWS: usize = 2_000;
 
+/// See [`CopyMode::motion_state`].
+type MotionState = (Point, usize, Option<Sel>, usize, usize, Option<(Point, usize)>);
+
+/// Largest repeat count a command runs with (`send-keys -X -N`, or typed
+/// as a prefix); larger counts are clamped. No history has this many lines,
+/// and motions stop repeating once they stop moving anyway.
+pub const MAX_COUNT: u32 = 1_000_000;
+
 /// Furthest a bracket match looks, in rows.
 const BRACKET_ROWS: usize = 10_000;
 
@@ -200,6 +208,10 @@ struct SearchState {
     scratch: Scratch,
     /// Whether the job runs for an incremental prompt (failure is silent).
     quiet: bool,
+    /// For a repeated search: the first match found and how many matches
+    /// have been found since (it included), to see when a wrapping search
+    /// is back at its first match.
+    lap: Option<(Match, u32)>,
 }
 
 /// One pane's copy mode.
@@ -580,7 +592,7 @@ impl CopyMode {
             && let Key::Char(d @ '0'..='9') = code.key
             && code.mods.is_empty()
         {
-            self.count = Some((n * 10 + d as u32 - '0' as u32).min(1_000_000));
+            self.count = Some((n * 10 + d as u32 - '0' as u32).min(MAX_COUNT));
             return Outcome::Redraw;
         }
         let Some(action) = self.cfg.table.get(&code) else {
@@ -779,7 +791,7 @@ impl CopyMode {
     pub fn run_command(&mut self, view: &mut dyn PaneView, cmd: Command, arg: Option<&str>, count: u32) -> Outcome {
         self.sync(view);
         self.search.job = None;
-        let out = self.run(view, cmd, arg, count.max(1));
+        let out = self.run(view, cmd, arg, count.clamp(1, MAX_COUNT));
         self.apply(view);
         out
     }
@@ -929,26 +941,24 @@ impl CopyMode {
         let seps = self.cfg.word_separators.clone();
         match cmd {
             C::CursorLeft => {
-                for _ in 0..n {
-                    self.reader_op(g, |r| r.left(true));
-                }
+                self.repeat(g, n, |m, g| m.reader_op(g, |r| r.left(true)));
                 self.normalize(g);
             }
             C::CursorRight => {
                 let all = self.rect_active();
-                for _ in 0..n {
+                self.repeat(g, n, |m, g| {
                     // At the last column the cursor may rest on (len - 1 in
                     // vi, len in emacs) it moves to the next line.
-                    let max = self.max_x(g, self.cur.row);
-                    if self.cur.col >= max {
-                        if !all && self.cur.row + 1 < self.total {
-                            self.cur = Point { row: self.cur.row + 1, col: 0 };
+                    let max = m.max_x(g, m.cur.row);
+                    if m.cur.col >= max {
+                        if !all && m.cur.row + 1 < m.total {
+                            m.cur = Point { row: m.cur.row + 1, col: 0 };
                         }
-                        continue;
+                        return;
                     }
-                    self.reader_op(g, |r| r.right(false, all));
-                    self.normalize(g);
-                }
+                    m.reader_op(g, |r| r.right(false, all));
+                    m.normalize(g);
+                });
                 self.normalize(g);
             }
             C::CursorUp | C::CursorDown | C::CursorDownAndCancel => {
@@ -956,53 +966,52 @@ impl CopyMode {
                 if cmd == C::CursorDownAndCancel && self.cur.row + 1 >= self.total {
                     return Outcome::Exit;
                 }
-                for _ in 0..n {
-                    self.note_col(g);
+                self.repeat(g, n, |m, g| {
+                    m.note_col(g);
                     // A line selection keeps its anchored line whole: moving
                     // past it swaps the ends, as tmux does.
-                    if let Some(s) = &mut self.sel
+                    if let Some(s) = &mut m.sel
                         && s.kind == SelKind::Line
                         && s.end.is_none()
                         && s.ends != down
-                        && self.cur.row == s.anchor.row
+                        && m.cur.row == s.anchor.row
                     {
-                        std::mem::swap(&mut s.anchor, &mut self.cur);
+                        std::mem::swap(&mut s.anchor, &mut m.cur);
                         s.ends = down;
                     }
                     if down {
-                        if self.cur.row + 1 < self.total {
-                            self.cur.row += 1;
+                        if m.cur.row + 1 < m.total {
+                            m.cur.row += 1;
                         }
-                    } else if self.cur.row > 0 {
-                        self.cur.row -= 1;
+                    } else if m.cur.row > 0 {
+                        m.cur.row -= 1;
                     }
-                    self.place_col(g, true);
-                }
+                    m.place_col(g, true);
+                });
             }
             C::StartOfLine => self.reader_op(g, |r| r.start_of_line(true)),
             C::EndOfLine => {
                 let all = self.rect_active();
-                for k in 0..n {
-                    if k > 0 && self.cur.row + 1 < self.total {
-                        self.cur.row += 1;
+                self.reader_op(g, |r| r.end_of_line(true, all));
+                self.repeat(g, n.saturating_sub(1), |m, g| {
+                    if m.cur.row + 1 < m.total {
+                        m.cur.row += 1;
                     }
-                    self.reader_op(g, |r| r.end_of_line(true, all));
-                }
+                    m.reader_op(g, |r| r.end_of_line(true, all));
+                });
                 self.normalize(g);
             }
             C::BackToIndentation => self.reader_op(g, |r| r.back_to_indentation()),
             C::NextWord | C::NextSpace => {
                 let s = if cmd == C::NextWord { seps.as_str() } else { "" };
-                for _ in 0..n {
-                    self.reader_op(g, |r| r.next_word(s));
-                }
+                self.repeat(g, n, |m, g| m.reader_op(g, |r| r.next_word(s)));
                 self.normalize(g);
             }
             C::NextWordEnd | C::NextSpaceEnd => {
                 let s = if cmd == C::NextWordEnd { seps.as_str() } else { "" };
                 let vi = self.vi();
-                for _ in 0..n {
-                    self.reader_op(g, |r| {
+                self.repeat(g, n, |m, g| {
+                    m.reader_op(g, |r| {
                         if vi {
                             if !r.g.in_set(r.y, r.x, WHITESPACE) {
                                 r.right(false, false);
@@ -1012,29 +1021,23 @@ impl CopyMode {
                         } else {
                             r.next_word_end(s);
                         }
-                    });
-                }
+                    })
+                });
                 self.normalize(g);
             }
             C::PreviousWord | C::PreviousSpace => {
                 let s = if cmd == C::PreviousWord { seps.as_str() } else { "" };
-                for _ in 0..n {
-                    self.reader_op(g, |r| r.previous_word(s, true, true));
-                }
+                self.repeat(g, n, |m, g| m.reader_op(g, |r| r.previous_word(s, true, true)));
                 self.normalize(g);
             }
             C::PageUp | C::HalfpageUp => {
-                for _ in 0..n {
-                    self.page_up(cmd == C::HalfpageUp);
-                }
+                self.repeat(g, n, |m, _| m.page_up(cmd == C::HalfpageUp));
                 self.place_col(g, false);
             }
             C::PageDown | C::PageDownAndCancel | C::HalfpageDown | C::HalfpageDownAndCancel => {
                 let half = matches!(cmd, C::HalfpageDown | C::HalfpageDownAndCancel);
                 let cancel = matches!(cmd, C::PageDownAndCancel | C::HalfpageDownAndCancel);
-                for _ in 0..n {
-                    self.page_down(half);
-                }
+                self.repeat(g, n, |m, _| m.page_down(half));
                 self.place_col(g, false);
                 if self.top == self.history && (cancel || self.exit_at_bottom) && self.sel.is_none() {
                     return Outcome::Exit;
@@ -1116,12 +1119,13 @@ impl CopyMode {
                 self.rect = false;
                 self.reader_op(g, |r| r.start_of_line(true));
                 self.sel = Some(Sel { anchor: self.cur, kind: SelKind::Line, end: None, ends: true });
-                for k in 0..n {
-                    if k > 0 && self.cur.row + 1 < self.total {
-                        self.cur.row += 1;
+                self.reader_op(g, |r| r.end_of_line(true, false));
+                self.repeat(g, n.saturating_sub(1), |m, g| {
+                    if m.cur.row + 1 < m.total {
+                        m.cur.row += 1;
                     }
-                    self.reader_op(g, |r| r.end_of_line(true, false));
-                }
+                    m.reader_op(g, |r| r.end_of_line(true, false));
+                });
                 self.normalize(g);
             }
             C::SelectWord => {
@@ -1177,12 +1181,13 @@ impl CopyMode {
                     self.reader_op(g, |r| r.start_of_line(true));
                 }
                 self.sel = Some(Sel { anchor: self.cur, kind: SelKind::Char, end: None, ends: true });
-                for k in 0..n {
-                    if k > 0 && self.cur.row + 1 < self.total {
-                        self.cur.row += 1;
+                self.reader_op(g, |r| r.end_of_line(true, false));
+                self.repeat(g, n.saturating_sub(1), |m, g| {
+                    if m.cur.row + 1 < m.total {
+                        m.cur.row += 1;
                     }
-                    self.reader_op(g, |r| r.end_of_line(true, false));
-                }
+                    m.reader_op(g, |r| r.end_of_line(true, false));
+                });
                 self.normalize(g);
                 let text = self.sel_text(g);
                 (self.cur, self.sel, self.rect) = (saved_cur, saved_sel, saved_rect);
@@ -1196,9 +1201,7 @@ impl CopyMode {
             C::JumpForward | C::JumpBackward | C::JumpToForward | C::JumpToBackward => {
                 let Some(c) = arg.and_then(|a| a.chars().next()) else { return Outcome::None };
                 self.last_jump = Some((cmd, c));
-                for _ in 0..n {
-                    self.jump(g, cmd, c);
-                }
+                self.repeat(g, n, |m, g| m.jump(g, cmd, c));
                 self.normalize(g);
             }
             C::JumpAgain | C::JumpReverse => {
@@ -1213,9 +1216,7 @@ impl CopyMode {
                 } else {
                     kind
                 };
-                for _ in 0..n {
-                    self.jump(g, kind, c);
-                }
+                self.repeat(g, n, |m, g| m.jump(g, kind, c));
                 self.normalize(g);
             }
             C::SetMark => self.mark = Some(self.cur),
@@ -1227,17 +1228,15 @@ impl CopyMode {
                 self.normalize(g);
             }
             C::NextParagraph | C::PreviousParagraph => {
-                for _ in 0..n {
-                    self.paragraph(g, cmd == C::NextParagraph);
-                }
+                self.repeat(g, n, |m, g| m.paragraph(g, cmd == C::NextParagraph));
                 self.normalize(g);
             }
             C::NextMatchingBracket | C::PreviousMatchingBracket => {
-                for _ in 0..n {
-                    if !self.bracket(g, cmd == C::NextMatchingBracket) {
-                        break;
-                    }
-                }
+                // Two matching brackets send the cursor back and forth;
+                // repeat() sees the cycle, so a huge count costs two steps.
+                self.repeat(g, n, |m, g| {
+                    m.bracket(g, cmd == C::NextMatchingBracket);
+                });
                 self.normalize(g);
             }
             C::NextPrompt | C::PreviousPrompt => {}
@@ -1273,6 +1272,38 @@ impl CopyMode {
         }
         self.ensure_visible();
         Outcome::Redraw
+    }
+
+    /// Everything a motion reads and changes.
+    fn motion_state(&self) -> MotionState {
+        (self.cur, self.top, self.sel, self.last_cx, self.last_sx, self.tail_snap)
+    }
+
+    /// Run the motion `f` `n` times. Motions depend only on
+    /// [`motion_state`](Self::motion_state), so once a run changes nothing
+    /// the rest would not either, and once the state is back where it
+    /// started (two brackets) the runs repeat in a cycle: either way the
+    /// remaining runs are skipped or reduced to less than one cycle. A count
+    /// can be up to [`MAX_COUNT`].
+    fn repeat(&mut self, g: &mut Grid, n: u32, mut f: impl FnMut(&mut Self, &mut Grid)) {
+        let start = self.motion_state();
+        let mut k = 0;
+        while k < n {
+            let before = self.motion_state();
+            f(self, g);
+            k += 1;
+            let after = self.motion_state();
+            if after == before {
+                return;
+            }
+            if after == start {
+                // A cycle of length k: only the remainder still matters.
+                for _ in 0..(n - k) % k {
+                    f(self, g);
+                }
+                return;
+            }
+        }
     }
 
     fn page_up(&mut self, half: bool) {
@@ -1704,17 +1735,23 @@ impl CopyMode {
         self.search.show = true;
         self.search.quiet = quiet;
         self.search.job = Some(Job::new(g, origin, forward, n));
+        self.search.lap = None;
         let budget = self.cfg.search_step_rows;
         self.drive_search(g, budget)
     }
 
     fn drive_search(&mut self, g: &mut Grid, budget: usize) -> Outcome {
         let wrap = self.cfg.wrap_search;
+        // Rows examined in this call, over all the matches of a repeated
+        // search: a count of a million must not search in one call.
+        let mut spent = 0usize;
         loop {
             let (Some(job), Some(pat)) = (self.search.job.as_mut(), self.search.pat.as_ref()) else {
                 return Outcome::None;
             };
-            match job.step(g, pat, &mut self.search.line, &mut self.search.scratch, budget, wrap) {
+            let step = job.step(g, pat, &mut self.search.line, &mut self.search.scratch, budget.saturating_sub(spent).max(1), wrap);
+            spent += job.used.max(1);
+            match step {
                 Step::Pending => return Outcome::Searching,
                 Step::NotFound => {
                     self.search.job = None;
@@ -1725,12 +1762,28 @@ impl CopyMode {
                     return Outcome::Message(format!("No match: {text}"));
                 }
                 Step::Found(m) => {
-                    let (forward, remaining) = (job.forward, job.remaining);
+                    let (forward, mut remaining) = (job.forward, job.remaining);
                     self.search.current = Some(m);
                     self.cur = m.start;
                     self.scroll_to(m.start.row);
                     if remaining > 1 {
+                        match &mut self.search.lap {
+                            // Back at the first match: the search goes round
+                            // the same `len` matches, so only the count
+                            // modulo a lap matters.
+                            Some((first, len)) if *first == m => {
+                                remaining = (remaining - 1) % *len + 1;
+                                self.search.lap = None;
+                            }
+                            Some((_, len)) => *len += 1,
+                            None => self.search.lap = Some((m, 1)),
+                        }
+                    }
+                    if remaining > 1 {
                         self.search.job = Some(Job::new(g, m.start, forward, remaining - 1));
+                        if spent >= budget {
+                            return Outcome::Searching;
+                        }
                         continue;
                     }
                     self.search.job = None;

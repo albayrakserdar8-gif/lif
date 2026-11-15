@@ -133,6 +133,16 @@ pub fn looks_like_tmux_conf(path: &str) -> bool {
     path.ends_with(".conf")
 }
 
+/// Whether the text of a file that failed to parse as TOML reads as tmux
+/// commands instead (its first line is a command and not `key = value`), so
+/// the user can be pointed at [`migrate_tmux_conf`].
+pub fn looks_like_tmux_commands(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .is_some_and(|first| !first.contains('=') && parse_string(first).is_ok_and(|l| !l.is_empty()))
+}
+
 /// Whether a line ends in an unescaped backslash (continued on the next).
 fn continues(line: &str) -> bool {
     line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1

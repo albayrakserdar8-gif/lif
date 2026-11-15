@@ -17,7 +17,9 @@ impl Host for NullHost {
     }
     fn kill_pane(&mut self, _pane: PaneId) {}
     fn resize_pane(&mut self, _pane: PaneId, _size: Size) {}
-    fn send_to_pane(&mut self, _pane: PaneId, _input: PaneInput<'_>) {}
+    fn send_to_pane(&mut self, _pane: PaneId, _input: PaneInput<'_>) -> Result<(), String> {
+        Ok(())
+    }
     fn pane_info(&self, _pane: PaneId) -> PaneInfo<'_> {
         PaneInfo::default()
     }

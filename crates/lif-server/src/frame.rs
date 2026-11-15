@@ -206,7 +206,8 @@ impl Server {
         {
             let panes = &self.rt.panes;
             for (id, c) in self.rt.clients.iter_mut() {
-                let pending = c.out_pending() || c.closing;
+                // A suspended client's terminal is not ours to draw on.
+                let pending = c.out_pending() || c.closing || c.suspended();
                 let Some(a) = c.att.as_mut() else { continue };
                 a.frame_deadline = None;
                 let Some(view) = a.view.as_ref() else { continue };

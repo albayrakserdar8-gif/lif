@@ -60,11 +60,26 @@ pub const ECHO_WINDOW_BYTES: usize = 64 * 1024;
 /// clients get their turn.
 pub const PANE_READ_BUDGET: usize = 256 * 1024;
 
-/// Bytes queued for a pane's program (keys, pastes, replies) above which
-/// lif stops reading from the client typing into it. The queue can exceed it
-/// by what one client read encodes to (64 KiB of input from the client), so
-/// the hard bound per pane is this plus one read.
-pub const PANE_WRITE_HIGH: usize = 64 * 1024;
+/// Hard bound of the bytes queued for one pane's program: keys, pastes,
+/// `send-keys`, terminal replies, reports, all of it (`Rt::write_pane`).
+/// A program that does not read its input stops being sent more once this
+/// much waits: replies and reports are dropped (as a real terminal drops
+/// them), commands fail, typed and pasted input is dropped with a message.
+/// The client typing is never stopped: its other keys (prefix, detach,
+/// window switching) and resizes keep working. 1 MiB holds any paste a
+/// person makes into a program that reads slowly.
+pub const PANE_INPUT_MAX: usize = 1024 * 1024;
+
+/// Part of [`PANE_INPUT_MAX`] only the end of a bracketed paste may use,
+/// so a paste that was started is always closed.
+pub const PANE_INPUT_RESERVE: usize = 64;
+
+/// What is read from a pane's PTY after its process exited, at most,
+/// before it is closed.
+pub const EXIT_DRAIN: usize = 4 * PANE_READ_BUDGET;
+
+/// Descriptors a new pane leaves free for clients to connect with.
+pub const FD_RESERVE: usize = 32;
 
 /// A pane whose program opened a synchronized update (mode 2026) is not
 /// drawn in its intermediate state for at most this long.

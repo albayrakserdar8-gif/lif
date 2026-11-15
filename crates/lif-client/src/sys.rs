@@ -110,6 +110,15 @@ pub(crate) fn tty_identity(tty: RawFd, input: RawFd, output: RawFd) -> Option<(S
     Some((String::from_utf8(buf[..n].to_vec()).ok()?, dev))
 }
 
+/// Whether this process is in the foreground of terminal `tty` (true when
+/// that cannot be known: no job control without a controlling terminal).
+pub(crate) fn is_foreground(tty: RawFd) -> bool {
+    // SAFETY: tcgetpgrp and getpgrp only inspect the fd / the process.
+    let fg = unsafe { libc::tcgetpgrp(tty) };
+    // SAFETY: as above.
+    fg < 0 || fg == unsafe { libc::getpgrp() }
+}
+
 pub(crate) fn isatty(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the fd.
     unsafe { libc::isatty(fd) == 1 }

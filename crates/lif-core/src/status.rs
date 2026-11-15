@@ -294,8 +294,11 @@ pub(crate) fn render(p: &StatusParts) -> StyledLine {
                 offset = cur_start;
             }
         }
-        let cut_left = offset > 0;
-        let cut_right = offset + avail < list_w;
+        // The < and > markers need room besides the list: with one or two
+        // columns left the list is cut without them.
+        let markers = avail > 2;
+        let cut_left = markers && offset > 0;
+        let cut_right = markers && offset + avail < list_w;
         let inner_start = offset + cut_left as usize;
         let inner_len = avail - cut_left as usize - cut_right as usize;
         if cut_left {

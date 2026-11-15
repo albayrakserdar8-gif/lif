@@ -65,6 +65,10 @@ const SHUTDOWN: Duration = Duration::from_millis(500);
 /// once and this bounds the case of a socket buffer full of input.
 const HANGUP_FLUSH: Duration = Duration::from_millis(100);
 
+/// How long a client being suspended waits for the server to give the
+/// terminal back (`Suspended`) before it stops anyway.
+const SUSPEND_WAIT: Duration = Duration::from_millis(500);
+
 /// The terminal the loop drives. Separate fds so tests can use a PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermFds {
@@ -161,9 +165,10 @@ fn attach(mut conn: Connection, fds: TermFds) -> (io::Result<ExitInfo>, Option<i
         Ok(g) => g,
         Err(e) => return (Err(e), signals.finish()),
     };
+    let mut guard = guard;
     let mut relay = Relay::new();
     let result = match conn.stream.set_nonblocking(true) {
-        Ok(()) => relay.attach(&mut conn, &fds, &signals),
+        Ok(()) => relay.attach(&mut conn, &fds, &signals, &mut guard),
         Err(e) => Err(e),
     };
     drop(guard);
@@ -210,6 +215,22 @@ struct Relay {
     /// The terminating signal that ended the loop.
     signal: Option<i32>,
     tty: TtyUse,
+    suspend: Suspend,
+    /// The server sent `Suspended`: stop.
+    got_suspended: bool,
+    /// The SIGCONT that continued our own stop is still in the pipe.
+    skip_cont: bool,
+}
+
+/// Job control (see `Relay::stop`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suspend {
+    Running,
+    /// SIGTSTP: `Suspend` sent, waiting for `Suspended` until then.
+    Asked(Instant),
+    /// Stopped, or continued in the background (`bg`) and about to stop
+    /// again: the terminal is the shell's.
+    Background,
 }
 
 /// Who reads the terminal.
@@ -236,6 +257,9 @@ impl Relay {
             term_dead: false,
             signal: None,
             tty: TtyUse::Relay,
+            suspend: Suspend::Running,
+            got_suspended: false,
+            skip_cont: false,
         }
     }
 
@@ -245,9 +269,9 @@ impl Relay {
 
     /// The loop and the way out of it. Writes [`FALLBACK_RESTORE`] on every
     /// path where the terminal is alive and the server did not restore it.
-    fn attach(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe) -> io::Result<ExitInfo> {
+    fn attach(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe, guard: &mut RawGuard) -> io::Result<ExitInfo> {
         let sock = conn.stream.as_raw_fd();
-        match self.run(conn, fds, signals) {
+        match self.run(conn, fds, signals, guard) {
             Ok(End::Exit(exit)) => Ok(exit),
             Ok(End::Leave(sig)) => {
                 self.signal = Some(sig);
@@ -278,7 +302,7 @@ impl Relay {
         }
     }
 
-    fn run(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe) -> io::Result<End> {
+    fn run(&mut self, conn: &mut Connection, fds: &TermFds, signals: &SignalPipe, guard: &mut RawGuard) -> io::Result<End> {
         // The terminal may have changed size between Hello and now.
         self.last_size = (conn.hello_size, conn.hello_pixels);
         self.resize_pending = true;
@@ -292,7 +316,12 @@ impl Relay {
             if let Some(exit) = self.write_frames(conn, fds)? {
                 return Ok(End::Exit(exit));
             }
-            if self.resize_pending && self.sock_pending() < SOCK_HIGH {
+            let asked_too_long = matches!(self.suspend, Suspend::Asked(t) if Instant::now() >= t);
+            if std::mem::take(&mut self.got_suspended) || asked_too_long {
+                self.stop(conn, fds, guard)?;
+                continue;
+            }
+            if self.resize_pending && self.sock_pending() < SOCK_HIGH && self.suspend == Suspend::Running {
                 self.resize_pending = false;
                 if let Some((size, pixels)) = self.size_changed(fds.tty) {
                     ClientMsg::Resize { size, pixels }.encode(&mut self.sock_out)?;
@@ -300,7 +329,8 @@ impl Relay {
             }
             self.flush_sock(sock)?;
 
-            let want_input = self.input_open && self.sock_pending() < SOCK_HIGH && self.tty == TtyUse::Relay;
+            let want_input =
+                self.input_open && self.sock_pending() < SOCK_HIGH && self.tty == TtyUse::Relay && self.suspend == Suspend::Running;
             let mut sock_events = 0;
             if !self.out_blocked {
                 sock_events |= libc::POLLIN;
@@ -317,8 +347,13 @@ impl Relay {
                 entry(fds.input, if want_input { libc::POLLIN } else { 0 }),
                 entry(fds.output, if self.out_blocked { libc::POLLOUT } else { 0 }),
             ];
+            // Only a suspension being asked for has a timeout.
+            let timeout = match self.suspend {
+                Suspend::Asked(t) => sys::poll_ms(t).unwrap_or(0),
+                _ => -1,
+            };
             // SAFETY: pfds is a valid array of pollfd of the given length.
-            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
             if r < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -330,14 +365,28 @@ impl Relay {
 
             if ready(0) {
                 let mut leave = None;
+                let (mut tstp, mut cont) = (false, false);
                 signals.drain(|sig| match sig {
                     libc::SIGWINCH => self.resize_pending = true,
+                    libc::SIGTSTP => tstp = true,
+                    libc::SIGCONT => cont = true,
                     // A hangup wins: the terminal is gone whatever else came.
                     libc::SIGHUP => leave = Some(sig),
                     sig => {
                         leave.get_or_insert(sig);
                     }
                 });
+                if cont && leave.is_none() {
+                    self.continued(conn, fds, guard)?;
+                }
+                if tstp && leave.is_none() && self.suspend == Suspend::Running {
+                    if conn.caps().contains(Caps::SUSPEND) {
+                        ClientMsg::Suspend.encode(&mut self.sock_out)?;
+                        self.suspend = Suspend::Asked(Instant::now() + SUSPEND_WAIT);
+                    } else {
+                        self.stop(conn, fds, guard)?;
+                    }
+                }
                 match leave {
                     Some(libc::SIGHUP) => {
                         self.term_dead = true;
@@ -365,6 +414,63 @@ impl Relay {
                 }
             }
         }
+    }
+
+    /// Job control: give the terminal back to the shell as it was before
+    /// attaching, stop (as SIGTSTP's default action would), and when
+    /// continued take it back. The server has stopped using the terminal
+    /// (`Suspended`), or an older server does not know how to and it is
+    /// stopped regardless.
+    fn stop(&mut self, conn: &mut Connection, fds: &TermFds, guard: &mut RawGuard) -> io::Result<()> {
+        let _ = self.flush_sock_until(conn.stream.as_raw_fd(), Instant::now() + HANGUP_FLUSH);
+        guard.leave_raw();
+        signals::stop_self();
+        // Our SIGCONT handler has written to the pipe: it is handled here.
+        self.skip_cont = true;
+        self.suspend = Suspend::Background;
+        self.resume(conn, fds, guard)
+    }
+
+    /// SIGCONT. After our own stop it was handled already. Otherwise the
+    /// client was stopped without a word (SIGSTOP), or continued in the
+    /// background: the shell may have changed the terminal's modes and
+    /// drawn on it, so take it back and have the server repaint it all.
+    fn continued(&mut self, conn: &mut Connection, fds: &TermFds, guard: &mut RawGuard) -> io::Result<()> {
+        if std::mem::take(&mut self.skip_cont) && self.suspend == Suspend::Running {
+            return Ok(());
+        }
+        if matches!(self.suspend, Suspend::Asked(_)) {
+            return Ok(());
+        }
+        self.resume(conn, fds, guard)
+    }
+
+    /// Raw mode again and `Resume`, once the terminal is ours. Continued
+    /// in the background (`bg`), the client stops again at once, as any
+    /// program that uses its terminal does there (SIGTTIN), so the shell
+    /// reports it stopped and `fg` continues it in the foreground (a
+    /// shell sends no signal to a running job it brings to the foreground).
+    fn resume(&mut self, conn: &mut Connection, fds: &TermFds, guard: &mut RawGuard) -> io::Result<()> {
+        while !sys::is_foreground(fds.tty) {
+            guard.leave_raw();
+            self.suspend = Suspend::Background;
+            signals::stop_self();
+            self.skip_cont = true;
+        }
+        guard.enter_raw()?;
+        self.suspend = Suspend::Running;
+        let now = sys::winsize(fds.tty)
+            .map(|ws| (Size::new(ws.ws_col, ws.ws_row), PixelSize { width: ws.ws_xpixel, height: ws.ws_ypixel }))
+            .unwrap_or(self.last_size);
+        self.last_size = now;
+        let (size, pixels) = now;
+        if conn.caps().contains(Caps::SUSPEND) {
+            ClientMsg::Resume { size, pixels }.encode(&mut self.sock_out)?;
+        } else {
+            // An older server repaints everything after a resize.
+            ClientMsg::Resize { size, pixels }.encode(&mut self.sock_out)?;
+        }
+        Ok(())
     }
 
     /// Sends `Detach` and relays server output until `Exit` (`Some`) or
@@ -460,6 +566,12 @@ impl Relay {
                 }
                 ServerMsg::Tty { direct } if self.tty == TtyUse::Asked => {
                     self.tty = if direct { TtyUse::Server } else { TtyUse::Relay };
+                }
+                // The terminal is restored (the bytes for that came before):
+                // stop, whether we asked (SIGTSTP) or not (suspend-client).
+                ServerMsg::Suspended => {
+                    self.got_suspended = true;
+                    return Ok(None);
                 }
                 _ => {}
             }

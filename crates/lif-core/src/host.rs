@@ -289,8 +289,19 @@ pub trait Host {
     /// (TIOCSWINSZ). Only called when the size actually differs.
     fn resize_pane(&mut self, pane: PaneId, size: Size);
 
-    /// Deliver input to the program in a pane.
-    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>);
+    /// `suspend-client`: restore the client's terminal, stop using it and
+    /// have the client stop itself (as with job control's SIGTSTP); it
+    /// carries on when it is continued. An error if the client cannot be
+    /// suspended (an older client).
+    fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
+        let _ = client;
+        Err("suspend-client: not supported".into())
+    }
+
+    /// Deliver input to the program in a pane. An error means the input
+    /// was not queued (the pane's input queue is full: the program is not
+    /// reading); the command reports it.
+    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) -> Result<(), String>;
 
     /// Current facts about a pane. Must be cheap: formats call it often. For
     /// an unknown pane return `PaneInfo::default()`.

@@ -8,6 +8,8 @@ pub mod type_id {
     pub const RESIZE: u16 = 0x04;
     pub const DETACH: u16 = 0x05;
     pub const USE_TTY: u16 = 0x06;
+    pub const SUSPEND: u16 = 0x07;
+    pub const RESUME: u16 = 0x08;
 
     pub const WELCOME: u16 = 0x101;
     pub const COMMAND_DONE: u16 = 0x102;
@@ -15,7 +17,29 @@ pub mod type_id {
     pub const OUTPUT: u16 = 0x104;
     pub const EXIT: u16 = 0x105;
     pub const TTY: u16 = 0x106;
+    pub const SUSPENDED: u16 = 0x107;
+    pub const COMMAND_OUTPUT: u16 = 0x108;
 }
+
+/// Environment variables a client may pass in `Hello`. The client sends
+/// only these, and the server drops anything else a client sends (a raw
+/// client could otherwise plant `LD_PRELOAD` or `PATH` into every pane
+/// of a session). `LIF_PANE` is not on it: it never reaches a pane, the
+/// server only reads it to find the pane a command runs in.
+pub const ENV_ALLOW_LIST: &[&str] = &[
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "SSH_TTY",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "XDG_RUNTIME_DIR",
+];
 
 /// Optional capabilities, exchanged in `Hello` / `Welcome`. A side may only
 /// use a capability both sides announced.
@@ -29,6 +53,13 @@ impl Caps {
     /// of relaying every key and frame through the client: each keystroke
     /// echo then costs two fewer process wake-ups.
     pub const TTY: Caps = Caps(1);
+    /// The client can be suspended (job control, `suspend-client`) while
+    /// attached: `Suspend` / `Suspended` / `Resume`.
+    pub const SUSPEND: Caps = Caps(2);
+    /// The client accepts command output in several `CommandOutput`
+    /// messages before `CommandDone`, so output larger than one frame
+    /// can be delivered.
+    pub const OUTPUT_STREAM: Caps = Caps(4);
 
     pub const fn contains(self, other: Caps) -> bool {
         self.0 & other.0 == other.0
@@ -100,6 +131,17 @@ pub enum ClientMsg {
     /// arrives the server writes nothing for the terminal, and the client
     /// reads nothing from it until the server's [`ServerMsg::Tty`].
     UseTty { path: String, dev: u64 },
+    /// With [`Caps::SUSPEND`], while attached: the client is about to stop
+    /// (SIGTSTP). The server restores the terminal, stops reading and
+    /// writing it, and answers [`ServerMsg::Suspended`] once every byte
+    /// for the terminal before it was written.
+    Suspend,
+    /// With [`Caps::SUSPEND`], while attached: the client is running again,
+    /// in the foreground and in raw mode. The server takes the terminal
+    /// back (if it reads it itself and the client is in the foreground),
+    /// sets its modes again and repaints it all. Also sent after a SIGCONT
+    /// the client did not see coming (SIGSTOP), so the server resyncs.
+    Resume { size: Size, pixels: PixelSize },
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }
@@ -121,6 +163,15 @@ pub enum ServerMsg {
     /// reads and writes it itself from now on; the client stops reading it
     /// and only forwards resizes and signals. Otherwise the client relays.
     Tty { direct: bool },
+    /// With [`Caps::SUSPEND`]: the terminal is restored and the server no
+    /// longer touches it. The answer to `Suspend`, or unasked
+    /// (`suspend-client`): the client then leaves raw mode and stops
+    /// itself, and sends `Resume` when it is continued.
+    Suspended,
+    /// With [`Caps::OUTPUT_STREAM`]: part of a command's output, followed
+    /// by more `CommandOutput` and finally `CommandDone` (which carries
+    /// the rest). The client prints the parts in order.
+    CommandOutput { stdout: Vec<u8>, stderr: Vec<u8> },
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }

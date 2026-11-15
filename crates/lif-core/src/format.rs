@@ -20,12 +20,36 @@ pub trait Vars {
     fn now(&self) -> WallClock;
 }
 
+/// How deeply `#{...}` (and `E:`/`T:` option expansions) may nest; deeper
+/// parts expand to nothing. Bounds the recursion, so the stack.
 const MAX_DEPTH: u32 = 32;
+
+/// Most `#{...}` expansions one call of [`expand`] performs; the rest of the
+/// format expands to nothing. A status line uses a few dozen. Without it a
+/// self-referencing option (`set @x '#{E:@x}#{E:@x}'`) does 2^32 expansions
+/// within the depth limit, on every redraw if it is in the status line.
+pub const MAX_STEPS: u32 = 100_000;
+
+/// Most bytes one call of [`expand`] produces or copies out of variables,
+/// beyond the length of the format itself; output past it is cut off.
+/// Real formats (a status line, a list line) produce well under a kilobyte;
+/// 256 KiB still shows a large user option whole, and bounds what
+/// padding (`#{p99999999999:x}`), substitution and option expansion can
+/// allocate, also when a list command expands a format for each of
+/// thousands of items or a status line once per window.
+pub const MAX_BYTES: usize = 256 << 10;
+
+/// Most comparison steps of one [`glob`] match. The match backtracks to the
+/// last `*`, so it costs up to pattern length times string length; real
+/// patterns against names take a few hundred steps. A match that would take
+/// longer fails.
+const MAX_GLOB_STEPS: u64 = 10_000_000;
 
 /// Expand `fmt`.
 pub fn expand(fmt: &str, vars: &dyn Vars) -> String {
-    let mut out = String::with_capacity(fmt.len());
-    expand_into(fmt, vars, &mut out, 0);
+    let mut out = String::with_capacity(fmt.len().min(MAX_BYTES));
+    let mut cx = Cx::new(vars, fmt.len());
+    expand_into(fmt, &mut cx, &mut out, 0);
     out
 }
 
@@ -43,6 +67,66 @@ pub fn expand_time(fmt: &str, vars: &dyn Vars) -> String {
 /// tmux's truth test: non-empty and not "0".
 pub fn is_true(s: &str) -> bool {
     !s.is_empty() && s != "0"
+}
+
+/// One expansion's variables and what is left of its budgets.
+struct Cx<'a> {
+    vars: &'a dyn Vars,
+    steps: u32,
+    bytes: usize,
+}
+
+impl Cx<'_> {
+    fn new(vars: &dyn Vars, fmt_len: usize) -> Cx<'_> {
+        Cx { vars, steps: MAX_STEPS, bytes: MAX_BYTES.saturating_add(fmt_len) }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.steps == 0 || self.bytes == 0
+    }
+
+    /// Take one expansion step; false once the budget is spent.
+    fn step(&mut self) -> bool {
+        if self.exhausted() {
+            return false;
+        }
+        self.steps -= 1;
+        true
+    }
+
+    /// Append `s` to `out`, cut (at a character boundary) to what is left
+    /// of the byte budget.
+    fn push(&mut self, out: &mut String, s: &str) {
+        let s = cut(s, self.bytes);
+        self.bytes -= s.len();
+        out.push_str(s);
+    }
+
+    fn push_char(&mut self, out: &mut String, c: char) {
+        let mut b = [0u8; 4];
+        self.push(out, c.encode_utf8(&mut b));
+    }
+
+    /// A variable's value, charged to the byte budget: fetching it copies
+    /// it, however little of it ends up in the output (`#{n:@big}`).
+    fn var(&mut self, name: &str) -> String {
+        let v = self.vars.var(name).unwrap_or_default();
+        self.bytes = self.bytes.saturating_sub(v.len());
+        v
+    }
+}
+
+/// The longest prefix of `s` of at most `max` bytes that ends on a
+/// character boundary.
+fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn short_alias(c: char) -> Option<&'static str> {
@@ -101,7 +185,7 @@ fn split_args(s: &str) -> Vec<&str> {
     parts
 }
 
-fn expand_into(fmt: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
+fn expand_into(fmt: &str, cx: &mut Cx, out: &mut String, depth: u32) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -109,30 +193,35 @@ fn expand_into(fmt: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
     let mut i = 0;
     let mut lit = 0;
     while i < b.len() {
+        if cx.exhausted() {
+            return;
+        }
         if b[i] != b'#' || i + 1 >= b.len() {
             i += 1;
             continue;
         }
-        out.push_str(&fmt[lit..i]);
+        cx.push(out, &fmt[lit..i]);
         let c = b[i + 1];
         match c {
             b'#' | b',' | b'}' | b':' => {
-                out.push(c as char);
+                cx.push_char(out, c as char);
                 i += 2;
             }
             b'{' => match skip_to(b, i, b"}") {
                 Some(end) => {
-                    expand_var(&fmt[i + 2..end], vars, out, depth + 1);
+                    if cx.step() {
+                        expand_var(&fmt[i + 2..end], cx, out, depth + 1);
+                    }
                     i = end + 1;
                 }
                 None => {
-                    out.push_str(&fmt[i..]);
+                    cx.push(out, &fmt[i..]);
                     i = b.len();
                 }
             },
             b'[' => {
                 let end = fmt[i..].find(']').map(|e| i + e + 1).unwrap_or(b.len());
-                out.push_str(&fmt[i..end]);
+                cx.push(out, &fmt[i..end]);
                 i = end;
             }
             b'(' => {
@@ -156,10 +245,15 @@ fn expand_into(fmt: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
             _ => {
                 let ch = fmt[i + 1..].chars().next().unwrap_or('#');
                 match short_alias(ch) {
-                    Some(name) => out.push_str(&vars.var(name).unwrap_or_default()),
+                    Some(name) => {
+                        if cx.step() {
+                            let v = cx.var(name);
+                            cx.push(out, &v);
+                        }
+                    }
                     None => {
-                        out.push('#');
-                        out.push(ch);
+                        cx.push_char(out, '#');
+                        cx.push_char(out, ch);
                     }
                 }
                 i += 1 + ch.len_utf8();
@@ -167,19 +261,19 @@ fn expand_into(fmt: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
         }
         lit = i;
     }
-    out.push_str(&fmt[lit..]);
+    cx.push(out, &fmt[lit..]);
 }
 
-fn sub(s: &str, vars: &dyn Vars, depth: u32) -> String {
+fn sub(s: &str, cx: &mut Cx, depth: u32) -> String {
     let mut out = String::new();
-    expand_into(s, vars, &mut out, depth);
+    expand_into(s, cx, &mut out, depth);
     out
 }
 
 /// Value of a condition or bare name: a format if it contains `#`,
 /// otherwise a variable.
-fn value_of(s: &str, vars: &dyn Vars, depth: u32) -> String {
-    if s.contains('#') { sub(s, vars, depth) } else { vars.var(s).unwrap_or_default() }
+fn value_of(s: &str, cx: &mut Cx, depth: u32) -> String {
+    if s.contains('#') { sub(s, cx, depth) } else { cx.var(s) }
 }
 
 enum Modifier {
@@ -197,18 +291,39 @@ enum Modifier {
     Subst(String, String),
 }
 
-fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
+/// `#{e|op|:a,b}`. Overflow saturates (`i64::MIN / -1` is `i64::MAX`) and
+/// division by zero gives 0, as before: a format has no way to report an
+/// error, and a panic would take the server down.
+fn arithmetic(op: &str, a: i64, b: i64) -> i64 {
+    match op {
+        "+" => a.saturating_add(b),
+        "-" => a.saturating_sub(b),
+        "*" => a.saturating_mul(b),
+        "/" if b != 0 => a.checked_div(b).unwrap_or(i64::MAX),
+        // The only overflowing case, i64::MIN % -1, is 0 mathematically.
+        "m" | "%" if b != 0 => a.checked_rem(b).unwrap_or(0),
+        "==" => (a == b) as i64,
+        "!=" => (a != b) as i64,
+        "<" => (a < b) as i64,
+        ">" => (a > b) as i64,
+        "<=" => (a <= b) as i64,
+        ">=" => (a >= b) as i64,
+        _ => 0,
+    }
+}
+
+fn expand_var(content: &str, cx: &mut Cx, out: &mut String, depth: u32) {
     // Conditional: #{?c1,a,c2,b,...,else}
     if let Some(rest) = content.strip_prefix('?') {
         let parts = split_args(rest);
         let mut k = 0;
         while k < parts.len() {
             if k + 1 >= parts.len() {
-                expand_into(parts[k], vars, out, depth);
+                expand_into(parts[k], cx, out, depth);
                 return;
             }
-            if is_true(&value_of(parts[k], vars, depth)) {
-                expand_into(parts[k + 1], vars, out, depth);
+            if is_true(&value_of(parts[k], cx, depth)) {
+                expand_into(parts[k + 1], cx, out, depth);
                 return;
             }
             k += 2;
@@ -221,7 +336,7 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
             if parts.len() != 2 {
                 return;
             }
-            let (a, b) = (sub(parts[0], vars, depth), sub(parts[1], vars, depth));
+            let (a, b) = (sub(parts[0], cx, depth), sub(parts[1], cx, depth));
             let r = match &op[..n - 1] {
                 "==" => a == b,
                 "!=" => a != b,
@@ -232,19 +347,20 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
                 "<" => a < b,
                 _ => a > b,
             };
-            out.push(if r { '1' } else { '0' });
+            cx.push_char(out, if r { '1' } else { '0' });
             return;
         }
     }
     if let Some(rest) = content.strip_prefix("!:") {
-        out.push(if is_true(&sub(rest, vars, depth)) { '0' } else { '1' });
+        let v = sub(rest, cx, depth);
+        cx.push_char(out, if is_true(&v) { '0' } else { '1' });
         return;
     }
     if let Some(rest) = content.strip_prefix("m:") {
         let parts = split_args(rest);
         if parts.len() == 2 {
-            let (pat, s) = (sub(parts[0], vars, depth), sub(parts[1], vars, depth));
-            out.push(if glob(pat.as_bytes(), s.as_bytes()) { '1' } else { '0' });
+            let (pat, s) = (sub(parts[0], cx, depth), sub(parts[1], cx, depth));
+            cx.push_char(out, if glob(pat.as_bytes(), s.as_bytes()) { '1' } else { '0' });
         }
         return;
     }
@@ -254,41 +370,28 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
         if parts.len() != 2 {
             return;
         }
-        let a: i64 = sub(parts[0], vars, depth).trim().parse().unwrap_or(0);
-        let b: i64 = sub(parts[1], vars, depth).trim().parse().unwrap_or(0);
-        let v = match op {
-            "+" => a.wrapping_add(b),
-            "-" => a.wrapping_sub(b),
-            "*" => a.wrapping_mul(b),
-            "/" if b != 0 => a / b,
-            "m" | "%" if b != 0 => a % b,
-            "==" => (a == b) as i64,
-            "!=" => (a != b) as i64,
-            "<" => (a < b) as i64,
-            ">" => (a > b) as i64,
-            "<=" => (a <= b) as i64,
-            ">=" => (a >= b) as i64,
-            _ => 0,
-        };
-        out.push_str(&v.to_string());
+        let a: i64 = sub(parts[0], cx, depth).trim().parse().unwrap_or(0);
+        let b: i64 = sub(parts[1], cx, depth).trim().parse().unwrap_or(0);
+        cx.push(out, &arithmetic(op, a, b).to_string());
         return;
     }
     // Modifier chain "m1;m2:name".
-    let (mods, name) = match parse_modifiers(content, vars, depth) {
+    let (mods, name) = match parse_modifiers(content, cx, depth) {
         Some(x) => x,
         None => (Vec::new(), content),
     };
     let literal = mods.iter().any(|m| matches!(m, Modifier::Literal));
     let mut value = if literal { name.to_string() } else { String::new() };
     if !literal {
-        let expand_opt = mods.iter().any(|m| matches!(m, Modifier::Expand | Modifier::ExpandTime));
-        let raw = vars.var(name).unwrap_or_default();
-        value = if expand_opt {
-            if mods.iter().any(|m| matches!(m, Modifier::ExpandTime)) {
-                expand_time(&raw, vars)
-            } else {
-                sub(&raw, vars, depth)
-            }
+        let raw = cx.var(name);
+        value = if mods.iter().any(|m| matches!(m, Modifier::ExpandTime)) {
+            // Expanded here rather than with expand_time so the depth and
+            // the budgets carry on: `set @x '#{T:@x}'` must not recurse
+            // without end.
+            let timed = if raw.contains('%') { strftime(&raw, &Tm::from_clock(cx.vars.now())) } else { raw };
+            sub(&timed, cx, depth)
+        } else if mods.iter().any(|m| matches!(m, Modifier::Expand)) {
+            sub(&raw, cx, depth)
         } else {
             raw
         };
@@ -297,7 +400,7 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
         match m {
             Modifier::Time => {
                 if let Ok(t) = value.parse::<i64>() {
-                    value = ctime(&Tm::from_clock(vars.now().at(t)));
+                    value = ctime(&Tm::from_clock(cx.vars.now().at(t)));
                 }
             }
             Modifier::Basename => {
@@ -316,25 +419,30 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
                 };
             }
             Modifier::Quote => value = shell_quote(&value),
-            Modifier::Subst(a, b) if !a.is_empty() => value = value.replace(a.as_str(), b),
+            Modifier::Subst(a, b) if !a.is_empty() => value = replace_capped(&value, a, b, cx.bytes),
             _ => {}
         }
     }
     for m in &mods {
         match m {
             Modifier::Truncate(n, marker) => {
-                let count = value.chars().count() as i64;
-                if *n > 0 && count > *n {
-                    value = value.chars().take(*n as usize).collect::<String>() + marker;
-                } else if *n < 0 && count > -n {
-                    value = marker.clone() + &value.chars().skip((count + n) as usize).collect::<String>();
+                let count = value.chars().count() as u64;
+                let keep = n.unsigned_abs();
+                if count > keep {
+                    let keep = keep as usize;
+                    value = if *n > 0 {
+                        value.chars().take(keep).collect::<String>() + marker
+                    } else {
+                        marker.clone() + &value.chars().skip(count as usize - keep).collect::<String>()
+                    };
                 }
             }
             Modifier::Pad(n) => {
-                let count = value.chars().count() as i64;
-                let want = n.abs();
+                let count = value.chars().count() as u64;
+                let want = n.unsigned_abs();
                 if count < want {
-                    let pad = " ".repeat((want - count) as usize);
+                    // Never more padding than the output can still take.
+                    let pad = " ".repeat((want - count).min(cx.bytes as u64) as usize);
                     value = if *n > 0 { value + &pad } else { pad + &value };
                 }
             }
@@ -343,10 +451,29 @@ fn expand_var(content: &str, vars: &dyn Vars, out: &mut String, depth: u32) {
             _ => {}
         }
     }
-    out.push_str(&value);
+    cx.push(out, &value);
 }
 
-fn parse_modifiers<'a>(content: &'a str, vars: &dyn Vars, depth: u32) -> Option<(Vec<Modifier>, &'a str)> {
+/// `s.replace(a, b)` producing at most `max` bytes (and so allocating at
+/// most that): a short pattern with a long replacement multiplies the size.
+fn replace_capped(s: &str, a: &str, b: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for (i, _) in s.match_indices(a) {
+        for piece in [&s[last..i], b] {
+            if out.len() + piece.len() > max {
+                out.push_str(cut(piece, max - out.len()));
+                return out;
+            }
+            out.push_str(piece);
+        }
+        last = i + a.len();
+    }
+    out.push_str(cut(&s[last..], max - out.len()));
+    out
+}
+
+fn parse_modifiers<'a>(content: &'a str, cx: &mut Cx, depth: u32) -> Option<(Vec<Modifier>, &'a str)> {
     let b = content.as_bytes();
     let colon = skip_to(b, 0, b":")?;
     let spec = &content[..colon];
@@ -359,7 +486,7 @@ fn parse_modifiers<'a>(content: &'a str, vars: &dyn Vars, depth: u32) -> Option<
         let mut chars = m.chars();
         let c = chars.next()?;
         let rest = chars.as_str();
-        let arg_num = |s: &str| -> Option<i64> { sub(s, vars, depth).trim().parse().ok() };
+        let mut arg_num = |s: &str| -> Option<i64> { sub(s, cx, depth).trim().parse().ok() };
         let m = match c {
             '=' => {
                 if let Some(r) = rest.strip_prefix('/') {
@@ -411,7 +538,12 @@ fn shell_quote(s: &str) -> String {
 pub(crate) fn glob(p: &[u8], s: &[u8]) -> bool {
     let (mut pi, mut si) = (0, 0);
     let (mut star_p, mut star_s) = (usize::MAX, 0);
+    let mut steps = 0u64;
     while si < s.len() {
+        steps += 1;
+        if steps > MAX_GLOB_STEPS {
+            return false;
+        }
         if pi < p.len() {
             match p[pi] {
                 b'*' => {
@@ -426,7 +558,10 @@ pub(crate) fn glob(p: &[u8], s: &[u8]) -> bool {
                     continue;
                 }
                 b'[' => {
-                    if let Some(end) = p[pi + 1..].iter().position(|c| *c == b']').map(|e| pi + 1 + e) {
+                    let close = p[pi + 1..].iter().position(|c| *c == b']');
+                    // The scan for ']' is part of the cost of the step.
+                    steps += close.unwrap_or(p.len() - pi) as u64;
+                    if let Some(end) = close.map(|e| pi + 1 + e) {
                         let set = &p[pi + 1..end];
                         let (neg, set) = match set.first() {
                             Some(b'!') | Some(b'^') => (true, &set[1..]),

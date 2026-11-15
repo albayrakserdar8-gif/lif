@@ -20,5 +20,5 @@ mod sys;
 
 pub use pty::{Pty, ReadOutcome};
 pub use reaper::ChildReaper;
-pub use spawn::SpawnOptions;
+pub use spawn::{SpawnOptions, set_child_fd_limit};
 pub use std::process::ExitStatus;

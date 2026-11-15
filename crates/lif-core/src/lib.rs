@@ -48,8 +48,17 @@ pub use ids::{ClientId, PaneId, SessionId, WindowId};
 pub use keys::KeyCode;
 pub use layout::{Axis, Direction, Geometry, Layout, LayoutError, Preset, PresetParams, SizeSpec, SplitSize};
 pub use model::{
-    Client, ClientInfo, ClientView, CmdContext, CmdOutput, Model, Pane, PasteBuffer, Session, Window,
+    Client, ClientInfo, ClientView, CmdContext, CmdOutput, Model, Pane, PasteBuffer, Session, Window, clamp_size,
 };
+
+/// Largest window width or height, in cells (tmux's limit too): a client
+/// claiming a bigger terminal is treated as this big, and commands refuse
+/// more.
+pub const MAX_WINDOW_DIM: u16 = 10_000;
+
+/// Largest window area, in cells: 4 Mi, a 2048x2048 terminal (far beyond
+/// any screen's text grid; a pane's screen costs about 10 bytes a cell).
+pub const MAX_WINDOW_CELLS: u32 = 4 * 1024 * 1024;
 pub use time::WallClock;
 
 /// A tmux style string (`fg=black,bg=green,bold`) applied to the default
@@ -60,3 +69,6 @@ pub fn parse_style(spec: &str) -> lif_types::Style {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod limits_tests;

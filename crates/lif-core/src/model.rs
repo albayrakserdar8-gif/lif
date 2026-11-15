@@ -318,6 +318,12 @@ pub struct Model {
     pub(crate) messages: std::collections::VecDeque<String>,
 }
 
+/// The largest window index: `base-index`'s maximum, tmux's INT_MAX. Every
+/// index a command computes (`-t`, `-a`/`-b` shifting, renumbering) is
+/// checked against it, so index arithmetic has headroom below `u32::MAX`
+/// and cannot wrap onto a live window.
+pub(crate) const MAX_WINDOW_INDEX: u32 = i32::MAX as u32;
+
 /// Messages kept for `show-messages` (tmux's `message-limit` default).
 const MESSAGE_LIMIT: usize = 1000;
 
@@ -490,16 +496,24 @@ impl Model {
         self.counter
     }
 
-    pub(crate) fn alloc_pane(&mut self) -> PaneId {
-        let id = PaneId(self.next_pane);
-        self.next_pane += 1;
-        id
+    // Ids are never reused (scripts and hooks hold `%N` across commands), so
+    // a long-lived server can in principle run a counter out. Then the
+    // command fails rather than wrapping onto a live id; `u32::MAX` itself
+    // is never handed out because the model uses it as a placeholder.
+
+    pub(crate) fn alloc_pane(&mut self) -> Result<PaneId, CmdError> {
+        let id = next_id(&mut self.next_pane).ok_or_else(|| CmdError::new("no free pane id"))?;
+        Ok(PaneId(id))
     }
 
-    pub(crate) fn alloc_window(&mut self) -> WindowId {
-        let id = WindowId(self.next_window);
-        self.next_window += 1;
-        id
+    pub(crate) fn alloc_window(&mut self) -> Result<WindowId, CmdError> {
+        let id = next_id(&mut self.next_window).ok_or_else(|| CmdError::new("no free window id"))?;
+        Ok(WindowId(id))
+    }
+
+    pub(crate) fn alloc_session(&mut self) -> Result<SessionId, CmdError> {
+        let id = next_id(&mut self.next_session).ok_or_else(|| CmdError::new("no free session id"))?;
+        Ok(SessionId(id))
     }
 
     pub(crate) fn session_by_name(&self, name: &str) -> Option<SessionId> {
@@ -527,10 +541,17 @@ impl Model {
         self.sopt(Some(s), "status").as_num() as u16
     }
 
-    pub(crate) fn first_free_index(&self, s: SessionId) -> u32 {
-        let base = self.sopt(Some(s), "base-index").as_num() as u32;
+    /// The lowest unused window index at or above `base-index`.
+    pub(crate) fn first_free_index(&self, s: SessionId) -> Result<u32, CmdError> {
+        let base = self.base_index(s);
         let sess = &self.sessions[&s];
-        (base..).find(|i| !sess.windows.contains_key(i)).unwrap_or(base)
+        (base..=MAX_WINDOW_INDEX).find(|i| !sess.windows.contains_key(i)).ok_or_else(|| CmdError::new("no free window index"))
+    }
+
+    /// `base-index`, clamped so a value from anywhere but the option parser
+    /// cannot put a window above [`MAX_WINDOW_INDEX`].
+    pub(crate) fn base_index(&self, s: SessionId) -> u32 {
+        self.sopt(Some(s), "base-index").as_num().clamp(0, MAX_WINDOW_INDEX as i64) as u32
     }
 
     // ----- sizes ----------------------------------------------------------
@@ -734,12 +755,18 @@ impl Model {
     }
 
     pub(crate) fn renumber(&mut self, sid: SessionId) {
-        let base = self.sopt(Some(sid), "base-index").as_num() as u32;
+        let base = self.base_index(sid);
         let s = self.sessions.get_mut(&sid).expect("session");
         let wins: Vec<WindowId> = s.windows.values().copied().collect();
+        // With base-index near the maximum the run would pass it; end the
+        // run at the maximum instead (tmux would overflow its int there).
+        let n = u32::try_from(wins.len()).unwrap_or(u32::MAX);
+        // Every window already has an index at or below the maximum, so
+        // there are at most MAX_WINDOW_INDEX + 1 of them and the zip below
+        // drops none.
+        let start = base.min(MAX_WINDOW_INDEX.saturating_sub(n.saturating_sub(1)));
         s.windows.clear();
-        for (i, wid) in wins.into_iter().enumerate() {
-            let idx = base + i as u32;
+        for (wid, idx) in wins.into_iter().zip(start..=MAX_WINDOW_INDEX) {
             s.windows.insert(idx, wid);
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.index = idx;
@@ -851,7 +878,8 @@ impl Model {
     }
 
     /// A client connected (before it runs any command).
-    pub fn client_connect(&mut self, id: ClientId, info: ClientInfo) {
+    pub fn client_connect(&mut self, id: ClientId, mut info: ClientInfo) {
+        info.size = clamp_size(info.size);
         let activity = self.tick();
         self.clients.insert(
             id,
@@ -871,6 +899,7 @@ impl Model {
 
     /// An attached client's terminal changed size.
     pub fn client_resized(&mut self, id: ClientId, size: Size, host: &mut dyn Host) {
+        let size = clamp_size(size);
         let tick = self.tick();
         let Some(c) = self.clients.get_mut(&id) else { return };
         c.info.size = size;
@@ -1355,6 +1384,16 @@ impl Vars for Fctx<'_> {
     }
 }
 
+/// Take the next id from `counter`; `None` once only `u32::MAX` is left.
+fn next_id(counter: &mut u32) -> Option<u32> {
+    let id = *counter;
+    if id == u32::MAX {
+        return None;
+    }
+    *counter = id + 1;
+    Some(id)
+}
+
 /// tmux's buffer sample: the first 50 characters, made printable.
 pub(crate) fn buffer_sample(data: &[u8]) -> String {
     let text = String::from_utf8_lossy(data);
@@ -1374,4 +1413,20 @@ pub(crate) fn buffer_sample(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// A terminal size from a client, within [`crate::MAX_WINDOW_DIM`] and
+/// [`crate::MAX_WINDOW_CELLS`] (rows give way): a window as large as a
+/// u16 allows would be billions of cells, and every cell of a pane's
+/// screen is allocated.
+pub fn clamp_size(s: Size) -> Size {
+    let cols = s.cols.min(crate::MAX_WINDOW_DIM);
+    let rows = s.rows.min(crate::MAX_WINDOW_DIM);
+    let max_rows = (crate::MAX_WINDOW_CELLS / u32::from(cols.max(1))).min(u32::from(u16::MAX)) as u16;
+    Size::new(cols, rows.min(max_rows.max(1)))
+}
+
+/// Whether a window of `cols` x `rows` is within the limits.
+pub(crate) fn size_allowed(cols: u16, rows: u16) -> bool {
+    cols <= crate::MAX_WINDOW_DIM && rows <= crate::MAX_WINDOW_DIM && u32::from(cols) * u32::from(rows) <= crate::MAX_WINDOW_CELLS
 }

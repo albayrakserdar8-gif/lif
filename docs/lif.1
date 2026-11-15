@@ -546,6 +546,14 @@ Same as show-options -w.
 Read a lif TOML configuration file. -q ignores a missing file, -n only
 checks it.
 .It Xo
+.Ic suspend-client Pq Ic suspendc
+.Op Fl t Ar target-client
+.Xc
+Suspend a client: its terminal is restored and the client stops, as with
+the shell's job control; it carries on (and redraws everything) when the
+shell continues it with
+.Ic fg .
+.It Xo
 .Ic split-window Pq Ic splitw
 .Op Fl bdhPvZ
 .Op Fl c Ar start-directory
@@ -630,7 +638,6 @@ commands are recognized and fail with
 .Ic show-environment ,
 .Ic show-hooks ,
 .Ic show-prompt-history ,
-.Ic suspend-client ,
 .Ic switch-mode ,
 .Ic unlink-window ,
 .Ic wait-for .
@@ -768,6 +775,8 @@ resize-pane -R 5 (repeatable)
 send-prefix
 .It Li C-o
 rotate-window
+.It Li C-z
+suspend-client
 .It Li C-Up
 resize-pane -U (repeatable)
 .It Li C-Down
@@ -880,8 +889,52 @@ says otherwise.
 The default socket.
 The directory must be owned by the user with mode 0700.
 .It Pa <socket>.lock
-Lock file used while a server starts.
+The server holds a lock on this file for as long as it runs; a client
+that cannot connect but finds the lock held reports the server as not
+responding instead of starting a second one.
+The file stays when the server exits.
 .El
+.Sh SECURITY AND LIMITS
+Only the user who started the server (and root) may connect to it; the
+socket directory is mode 0700 and the socket 0600.
+Of a client's environment only
+.Ev COLORTERM , TERM_PROGRAM , TERM_PROGRAM_VERSION , SSH_AUTH_SOCK ,
+.Ev SSH_CONNECTION , SSH_TTY , DISPLAY , WAYLAND_DISPLAY , LANG , LC_ALL ,
+.Ev LC_CTYPE
+and
+.Ev XDG_RUNTIME_DIR
+reach new panes; the server drops anything else a client sends.
+.Pp
+While a client is attached the server reads keys from and draws on its
+terminal itself, but only while the client is in the foreground of that
+terminal: when a shell stops the client (job control, or SIGSTOP), what is
+typed there goes to the shell and nothing is drawn over it.
+A client stopped with SIGTSTP (or
+.Ic suspend-client )
+restores the terminal first.
+.Pp
+At most 1 MiB waits to be written to a pane's program.
+A program that does not read its input gets nothing more once that much
+waits: typed and pasted input is dropped with a message, terminal answers
+and reports are dropped,
+.Ic send-keys
+and
+.Ic paste-buffer
+fail; the client's other keys keep working.
+Other bounds: windows up to 10000 cells wide or high and 4 Mi cells in
+all;
+.Ic send-keys
+at most 1 MiB of input per command and
+.Fl N
+at most 1000000; one format expands to at most 256 KiB;
+.Ic source-file
+reads regular files of at most 1 MiB;
+.Ic { }
+blocks nest at most 100 deep.
+Command output larger than one protocol frame is sent in parts.
+The server raises its open-file limit to the hard limit (at most 65536)
+and keeps 32 descriptors for clients when it creates panes; programs in
+panes get the limit the server started with.
 .Sh EXIT STATUS
 .Ex -std
 In particular a command that fails (unknown target, invalid option,

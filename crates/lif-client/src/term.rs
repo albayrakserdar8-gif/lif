@@ -86,6 +86,8 @@ fn install_panic_hook() {
 /// dropping it restores all three.
 pub(crate) struct RawGuard {
     saved: Saved,
+    /// The terminal is in raw mode now (not while suspended).
+    raw: bool,
 }
 
 impl RawGuard {
@@ -104,28 +106,44 @@ impl RawGuard {
         let saved = Saved { id, tty, output, termios, flags };
         // Registered before anything changes, so a failure half way is still undone.
         ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(saved);
-        let guard = RawGuard { saved };
+        let mut guard = RawGuard { saved, raw: true };
+        guard.enter_raw()?;
+        Ok(guard)
+    }
 
-        let mut raw = termios;
+    /// Raw mode (again, after a suspension).
+    pub(crate) fn enter_raw(&mut self) -> io::Result<()> {
+        let mut raw = self.saved.termios;
         // SAFETY: valid termios pointer.
         unsafe { libc::cfmakeraw(&mut raw) };
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
+        self.raw = true;
         // TCSANOW, not TCSAFLUSH: keys typed before attaching are not dropped.
         // SAFETY: valid termios pointer.
-        sys::cvt(unsafe { libc::tcsetattr(tty, libc::TCSANOW, &raw) })?;
+        sys::cvt(unsafe { libc::tcsetattr(self.saved.tty, libc::TCSANOW, &raw) })?;
         // The output is non-blocking so a slow terminal shows up as EAGAIN
         // and the loop can stop reading the socket instead of stalling.
-        for (fd, fl) in flags {
+        for (fd, fl) in self.saved.flags {
             sys::set_flags(fd, fl | libc::O_NONBLOCK)?;
         }
-        Ok(guard)
+        Ok(())
+    }
+
+    /// The terminal as it was before attaching, for the shell, while the
+    /// client is stopped.
+    pub(crate) fn leave_raw(&mut self) {
+        if std::mem::take(&mut self.raw) {
+            self.saved.restore();
+        }
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        self.saved.restore();
+        // Not again after a suspension: the shell has the terminal (and
+        // tcsetattr from the background would stop us with SIGTTOU).
+        self.leave_raw();
         ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.id != self.saved.id);
     }
 }

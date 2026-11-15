@@ -187,7 +187,7 @@ fn config_command(argv: &[String]) -> Option<i32> {
                 Ok(p) => p.unwrap_or_else(|| home_file(".tmux.conf")),
                 Err(code) => return Some(code),
             };
-            let text = match std::fs::read(&path) {
+            let text = match lif_config::read_file_limited(&path) {
                 Ok(b) => String::from_utf8_lossy(&b).into_owned(),
                 Err(e) => {
                     eprintln!("{}: {e}", path.display());
@@ -235,12 +235,23 @@ fn main() {
         Ok(c) => c,
         Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
             if !may_start {
-                eprintln!("no server running on {}", socket.display());
+                if e.kind() == io::ErrorKind::ConnectionRefused && start::server_holds_lock(&socket) {
+                    eprintln!("lif: {}", start::not_responding(&socket));
+                } else {
+                    eprintln!("no server running on {}", socket.display());
+                }
                 exit(1);
             }
-            if let Err(e) = start::start_server(&socket, cli.verbose, cli.config.as_deref()) {
-                eprintln!("lif: server failed to start: {e}");
-                exit(1);
+            match start::start_server(&socket, cli.verbose, cli.config.as_deref()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    eprintln!("lif: {e}");
+                    exit(1);
+                }
+                Err(e) => {
+                    eprintln!("lif: server failed to start: {e}");
+                    exit(1);
+                }
             }
             match connect_with(&socket, hello(&socket)) {
                 Ok(c) => c,

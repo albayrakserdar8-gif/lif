@@ -493,7 +493,8 @@ impl Cell {
             if ch.len() < 2 {
                 return Err("container with fewer than two children".into());
             }
-            let mut total = 0;
+            // u64: a parsed layout string can list many large cells.
+            let mut total = 0u64;
             for c in ch {
                 c.check()?;
                 match axis {
@@ -501,18 +502,18 @@ impl Cell {
                         if c.sy != self.sy {
                             return Err(format!("child height {} != {}", c.sy, self.sy));
                         }
-                        total += c.sx;
+                        total += c.sx as u64;
                     }
                     Axis::TopBottom => {
                         if c.sx != self.sx {
                             return Err(format!("child width {} != {}", c.sx, self.sx));
                         }
-                        total += c.sy;
+                        total += c.sy as u64;
                     }
                 }
             }
-            total += ch.len() as u32 - 1;
-            if total != self.along(*axis) {
+            total += ch.len() as u64 - 1;
+            if total != self.along(*axis) as u64 {
                 return Err(format!("children sum {total} != {}", self.along(*axis)));
             }
         }
@@ -953,7 +954,7 @@ impl Layout {
         if csum.len() != 4 || u16::from_str_radix(csum, 16).ok() != Some(checksum(body)) {
             return Err(bad());
         }
-        let mut p = Parser { s: body.as_bytes(), i: 0 };
+        let mut p = Parser { s: body.as_bytes(), i: 0, depth: 0 };
         let mut root = p.cell().ok_or_else(bad)?;
         if p.i != p.s.len() {
             return Err(bad());
@@ -986,9 +987,20 @@ fn checksum(s: &str) -> u16 {
     c
 }
 
+/// How deeply a layout string's `{...}` / `[...]` cells may nest. The parser
+/// recurses once per level, so without a limit a long string of `{` given to
+/// `select-layout` overflows the stack. A window of the largest size holds
+/// far fewer nested splits than this.
+const MAX_LAYOUT_DEPTH: usize = 1000;
+
+/// Largest cell size a layout string may give: what fits in a window
+/// (sizes are u16), so the size arithmetic on parsed trees cannot overflow.
+const MAX_LAYOUT_CELLS: u32 = u16::MAX as u32;
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -997,7 +1009,7 @@ impl Parser<'_> {
         while self.i < self.s.len() && self.s[self.i].is_ascii_digit() {
             self.i += 1;
         }
-        std::str::from_utf8(&self.s[start..self.i]).ok()?.parse().ok()
+        std::str::from_utf8(&self.s[start..self.i]).ok()?.parse().ok().filter(|n| *n <= MAX_LAYOUT_CELLS)
     }
 
     fn eat(&mut self, c: u8) -> bool {
@@ -1035,11 +1047,16 @@ impl Parser<'_> {
             _ => return Some(Cell::leaf(PaneId(0), sx, sy)),
         };
         let axis = if close == b'}' { Axis::LeftRight } else { Axis::TopBottom };
+        if self.depth >= MAX_LAYOUT_DEPTH {
+            return None;
+        }
         self.i += 1;
+        self.depth += 1;
         let mut ch = vec![self.cell()?];
         while self.eat(b',') {
             ch.push(self.cell()?);
         }
+        self.depth -= 1;
         self.eat(close).then_some(())?;
         if ch.len() == 1 {
             return ch.pop();
@@ -1166,7 +1183,8 @@ fn main(panes: &[PaneId], axis: Axis, w: u32, h: u32, params: &PresetParams, mir
     if otherw_opt > 0 && otherw_opt < avail {
         mainw = avail - otherw_opt;
     }
-    if mainw + 1 > avail {
+    // Not `mainw + 1 > avail`: main-pane-width can be any u32.
+    if mainw >= avail {
         mainw = avail.saturating_sub(1);
     }
     let mainw = mainw.max(PANE_MINIMUM);

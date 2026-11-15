@@ -93,6 +93,7 @@ dependencies = [
 name = "lif-config"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lif-core",
  "lif-types",
  "toml",

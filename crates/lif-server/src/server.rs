@@ -34,7 +34,7 @@ const READ_BUF: usize = 64 * 1024;
 const TTY_READ_BUF: usize = 16 * 1024;
 
 /// Optional protocol features this server implements.
-const SERVER_CAPS: Caps = Caps::TTY;
+const SERVER_CAPS: Caps = Caps(Caps::TTY.0 | Caps::SUSPEND.0 | Caps::OUTPUT_STREAM.0);
 
 /// About how long one step of a copy-mode search may take before the loop
 /// looks at its descriptors again.
@@ -74,6 +74,16 @@ pub(crate) struct Server {
     /// Copy-mode bindings run from `send-keys` that are running now, so a
     /// binding that sends its own key cannot recurse without end.
     binding_depth: u32,
+    /// A descriptor kept open to be closed when `accept` fails for lack of
+    /// descriptors: it makes room to accept the waiting connection, tell
+    /// it why and close it, so the listener's queue is drained and its
+    /// readiness edge is not lost (see `Server::accept`).
+    spare_fd: Option<std::os::fd::OwnedFd>,
+    /// (device, inode) of the socket this server bound: on exit it removes
+    /// the path only if it is still that socket.
+    socket_id: Option<(u64, u64)>,
+    /// The server's user, for the peer check of every connection.
+    uid: u32,
 }
 
 impl Server {
@@ -101,7 +111,14 @@ impl Server {
         let editor = std::env::var("EDITOR").ok();
         let keys = lif_copy::ModeKeys::from_editor(visual.as_deref(), editor.as_deref());
         let _ = model.set_global_option("mode-keys", if keys == lif_copy::ModeKeys::Vi { "vi" } else { "emacs" });
-        let rt = Rt::new(poll.registry().try_clone()?, reaper, opts.socket.to_string_lossy().into_owned());
+        let mut rt = Rt::new(poll.registry().try_clone()?, reaper, opts.socket.to_string_lossy().into_owned());
+        let (old_limit, limit) = sys::raise_fd_limit();
+        rt.fd_limit = limit as usize;
+        lif_pty::set_child_fd_limit(old_limit);
+        let socket_id = std::fs::symlink_metadata(&opts.socket).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        });
         let now = Instant::now();
         let mut s = Server {
             poll,
@@ -128,7 +145,12 @@ impl Server {
             scratch_clients: Vec::new(),
             scratch_views: Vec::new(),
             binding_depth: 0,
+            spare_fd: sys::spare_fd(),
+            socket_id,
+            // SAFETY: getuid cannot fail.
+            uid: unsafe { libc::getuid() },
         };
+        log!("descriptor limit {limit} (was {old_limit:?})");
         log!("server {} started on {}", std::process::id(), s.opts.socket.display());
         for line in crate::load_startup_commands(&s.opts) {
             match lif_core::parse_string(&line) {
@@ -267,17 +289,7 @@ impl Server {
         self.scratch_panes = panes;
         let mut clients = std::mem::take(&mut self.scratch_clients);
         clients.clear();
-        for c in self.rt.clients.values_mut() {
-            // A client waiting for a pane that is gone waits no more.
-            if let Some(p) = c.blocked_on
-                && !self.rt.panes.get(&p).is_some_and(|p| p.pty.is_some())
-            {
-                c.unblock();
-            }
-            if c.read_more && c.blocked_on.is_none() {
-                clients.push(c.id);
-            }
-        }
+        clients.extend(self.rt.clients.values().filter(|c| c.read_more).map(|c| c.id));
         for &c in &clients {
             self.read_client(c, now);
         }
@@ -337,7 +349,7 @@ impl Server {
             min(p.autoscroll_at);
         }
         for c in self.rt.clients.values() {
-            if (c.read_more && c.blocked_on.is_none()) || c.tty_read_more() {
+            if c.read_more || c.tty_read_more() {
                 return Some(now);
             }
             if let Some(a) = c.att.as_ref() {
@@ -354,19 +366,52 @@ impl Server {
         d
     }
 
+    /// Accepts every waiting connection. The listener is edge-triggered:
+    /// one that is left waiting would never be reported again, so this
+    /// always drains the queue. Out of descriptors, the spare one is
+    /// closed to accept the connection, tell the client and close it.
     fn accept(&mut self) {
         loop {
+            // On macOS an accept that fails for lack of a descriptor has
+            // already taken the connection off the queue and drops it: so
+            // look first, and when there is no room take it with the spare.
+            if !self.fd_available() {
+                match self.refuse_one() {
+                    Some(true) => continue,
+                    Some(false) => return,
+                    None => {
+                        log!("accept: out of descriptors and no spare one");
+                        return;
+                    }
+                }
+            }
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    let fd = stream.as_raw_fd();
+                    let peer = match sys::peer_cred(fd) {
+                        Ok(p) if sys::peer_allowed(p.uid, self.uid) => p,
+                        Ok(p) => {
+                            log!("connection from uid {} refused", p.uid);
+                            continue;
+                        }
+                        Err(e) => {
+                            log!("connection refused: no peer credentials: {e}");
+                            continue;
+                        }
+                    };
+                    let Some(next) = self.next_client.checked_add(1) else {
+                        log!("client ids exhausted");
+                        continue;
+                    };
                     let id = ClientId(self.next_client);
-                    self.next_client += 1;
+                    self.next_client = next;
                     let token = Token(CLIENT_TOKEN | id.0 as usize);
                     if let Err(e) = self.poll.registry().register(&mut stream, token, Interest::READABLE) {
                         log!("register client: {e}");
                         continue;
                     }
                     self.first_client_deadline = None;
-                    self.rt.clients.insert(id, ClientRt::new(id, stream, token));
+                    self.rt.clients.insert(id, ClientRt::new(id, stream, token, peer));
                     // Data may already be waiting: the edge was before registration.
                     if let Some(c) = self.rt.clients.get_mut(&id) {
                         c.read_more = true;
@@ -374,12 +419,68 @@ impl Server {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                    // (ENFILE: the whole system is out.) Refuse the rest.
+                    if self.refuse_one().is_none() {
+                        log!("accept: {e}; no spare descriptor");
+                        return;
+                    }
+                }
                 Err(e) => {
                     log!("accept: {e}");
                     return;
                 }
             }
         }
+    }
+
+    /// A descriptor is free for an accepted connection (checked by
+    /// duplicating the spare: only when a connection arrives).
+    fn fd_available(&mut self) -> bool {
+        let Some(spare) = self.spare_fd.as_ref() else {
+            self.spare_fd = sys::spare_fd();
+            return self.spare_fd.is_some();
+        };
+        // SAFETY: F_DUPFD_CLOEXEC on an fd we own; the copy is closed at once.
+        let fd = unsafe { libc::fcntl(spare.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: fd is the copy just made.
+        unsafe { libc::close(fd) };
+        true
+    }
+
+    /// Out of descriptors: close the spare, accept one waiting connection
+    /// into it, answer it with an error a lif client prints, close it and
+    /// take the spare back. Some(false) when nothing was waiting, None
+    /// when there was no spare.
+    fn refuse_one(&mut self) -> Option<bool> {
+        let Some(spare) = self.spare_fd.take() else {
+            self.spare_fd = sys::spare_fd();
+            return None;
+        };
+        drop(spare);
+        let waiting = self.listener.accept();
+        let handled = waiting.is_ok();
+        if let Ok((stream, _)) = waiting {
+            let mut out = Vec::new();
+            let _ = ServerMsg::Welcome {
+                protocol: PROTOCOL_VERSION,
+                caps: Caps::NONE,
+                server_version: env!("CARGO_PKG_VERSION").into(),
+                server_pid: std::process::id(),
+            }
+            .encode(&mut out);
+            let msg = format!("server out of file descriptors (limit {}): close some panes\n", self.rt.fd_limit);
+            let _ = ServerMsg::CommandDone { status: 1, stdout: Vec::new(), stderr: msg.into_bytes() }.encode(&mut out);
+            let _ = ServerMsg::Exit { reason: lif_proto::ExitReason::Error, message: "[server out of file descriptors]".into() }.encode(&mut out);
+            // A fresh socket buffer takes these few bytes at once.
+            sys::write_all_timeout(stream.as_raw_fd(), &out, 0);
+            log!("out of descriptors: refused a connection");
+        }
+        self.spare_fd = sys::spare_fd();
+        Some(handled)
     }
 
     fn handle_signals(&mut self) {
@@ -403,17 +504,19 @@ impl Server {
     }
 
     pub(crate) fn log_stats(&self) {
-        let mut vt = 0;
+        let (mut vt, mut queued) = (0, 0);
         for p in self.rt.panes.values() {
             vt += p.engine.memory().resident_bytes;
+            queued += p.wq.len();
         }
         log!(
-            "stats: iterations={} panes={} clients={} rss={} vt_bytes={}",
+            "stats: iterations={} panes={} clients={} rss={} vt_bytes={} input_queued={}",
             self.iterations,
             self.rt.panes.len(),
             self.rt.clients.len(),
             sys::rss_bytes(),
-            vt
+            vt,
+            queued
         );
     }
 
@@ -421,14 +524,6 @@ impl Server {
 
     fn pane_writable(&mut self, id: PaneId) {
         self.rt.flush_pane(id);
-        let Some(p) = self.rt.panes.get(&id) else { return };
-        if p.wq.len() <= crate::PANE_WRITE_HIGH / 2 {
-            for c in self.rt.clients.values_mut() {
-                if c.blocked_on == Some(id) {
-                    c.unblock();
-                }
-            }
-        }
     }
 
     pub(crate) fn read_pane(&mut self, id: PaneId, now: Instant, budget: usize) {
@@ -470,6 +565,8 @@ impl Server {
         p.engine.drain_events(&mut events);
         if !self.replies.is_empty() {
             let r = std::mem::take(&mut self.replies);
+            // A program that asks and never reads the answers: they are
+            // dropped once its input queue is full.
             self.rt.write_pane(id, &r);
             self.replies = r;
         }
@@ -483,8 +580,10 @@ impl Server {
         for (pid, status) in self.rt.reaper.reap() {
             let Some(id) = self.rt.pids.remove(&pid) else { continue };
             log!("pane {id} pid {pid} exited: {status:?}");
-            // Output the program wrote just before exiting is still in the PTY.
-            self.read_pane(id, now, usize::MAX);
+            // Output the program wrote just before exiting is still in the
+            // PTY. Bounded: a background process that ignores SIGHUP may
+            // keep writing to it, and only closing the PTY stops it.
+            self.read_pane(id, now, crate::EXIT_DRAIN);
             self.pane_gone(id, status.code());
         }
     }
@@ -518,8 +617,7 @@ impl Server {
         loop {
             let Some(c) = self.rt.clients.get_mut(&id) else { return };
             c.read_more = false;
-            if c.dead || c.blocked_on.is_some() {
-                c.read_more = c.blocked_on.is_some();
+            if c.dead {
                 return;
             }
             if total >= CLIENT_READ_BUDGET {
@@ -550,7 +648,7 @@ impl Server {
     fn process_messages(&mut self, id: ClientId, now: Instant) {
         loop {
             let Some(c) = self.rt.clients.get_mut(&id) else { return };
-            if c.dead || c.blocked_on.is_some() {
+            if c.dead {
                 return;
             }
             let msg = match c.dec.next() {
@@ -562,50 +660,104 @@ impl Server {
                     return;
                 }
             };
+            // What a message means depends on the connection's state:
+            // Hello once, first; Command only before attaching; terminal
+            // messages only while attached (after a detach the server
+            // started, the client's messages in flight are ignored). A
+            // message out of place is a client bug or a hostile one:
+            // disconnect rather than guess (a second Hello used to
+            // re-register the client and leave a zombie attachment).
+            let (hello, attached, closing, tty_held) =
+                (c.hello.is_some(), c.att.is_some(), c.closing, matches!(c.term_out, TermOut::Hold(_)));
+            let misplaced = match &msg {
+                ClientMsg::Unknown { .. } => false,
+                _ if closing => {
+                    continue;
+                }
+                ClientMsg::Hello(_) => hello,
+                _ if !hello => true,
+                ClientMsg::Command { .. } => attached,
+                ClientMsg::Resize { .. } | ClientMsg::Detach => false,
+                ClientMsg::Input(_) | ClientMsg::Suspend | ClientMsg::Resume { .. } => !attached,
+                ClientMsg::UseTty { .. } => !attached || !tty_held,
+            };
+            if misplaced {
+                log!("client {id}: protocol error: {} out of place", client_msg_name(&msg));
+                self.disconnect(id);
+                return;
+            }
             match msg {
                 ClientMsg::Hello(h) => self.hello(id, h),
                 ClientMsg::Command { argv } => self.command(id, argv),
                 ClientMsg::Input(bytes) => self.client_input(id, &bytes, now),
-                ClientMsg::Resize { size, pixels: _ } => {
-                    if let Some(c) = self.rt.clients.get_mut(&id) {
-                        if let Some(h) = c.hello.as_mut() {
-                            h.size = size;
-                        }
-                        if let Some(a) = c.att.as_mut() {
-                            a.renderer.invalidate();
-                            a.needs_frame = true;
-                            a.status_stale = true;
-                        }
-                    }
-                    self.model.client_resized(id, size, &mut self.rt);
-                    self.after_model();
-                }
+                ClientMsg::Resize { size, pixels: _ } => self.client_size(id, size),
                 ClientMsg::Detach => {
                     self.disconnect(id);
                     return;
                 }
                 ClientMsg::UseTty { path, dev } => self.use_tty(id, &path, dev),
+                ClientMsg::Suspend => {
+                    if let Err(e) = self.rt.suspend(id) {
+                        log!("client {id}: protocol error: {e}");
+                        self.disconnect(id);
+                        return;
+                    }
+                }
+                ClientMsg::Resume { size, pixels: _ } => {
+                    self.client_size(id, size);
+                    self.rt.resume(id);
+                }
                 ClientMsg::Unknown { .. } => {}
             }
         }
     }
 
+    /// The client's terminal changed size (`Resize`, `Resume`).
+    fn client_size(&mut self, id: ClientId, size: lif_types::Size) {
+        let size = lif_core::clamp_size(size);
+        let Some(c) = self.rt.clients.get_mut(&id) else { return };
+        if let Some(h) = c.hello.as_mut() {
+            h.size = size;
+        }
+        let Some(a) = c.att.as_mut() else { return };
+        a.renderer.invalidate();
+        a.needs_frame = true;
+        a.status_stale = true;
+        self.model.client_resized(id, size, &mut self.rt);
+        self.after_model();
+    }
+
     /// The attached client's terminal is in raw mode and is `path`: open
     /// it and use it directly (see `client::TermOut`), or relay if that
     /// fails. Either way the terminal bytes held back so far go out now.
+    ///
+    /// Direct use needs the server to know, before every read and write,
+    /// that the terminal is still the client's (`sys::TtyOwner`): so the
+    /// terminal must be the client process's controlling terminal with the
+    /// client in its foreground, and no other client may be using it.
+    /// Otherwise the client relays, which is always safe: a stopped client
+    /// reads nothing.
     fn use_tty(&mut self, id: ClientId, path: &str, dev: u64) {
+        let taken = self.rt.clients.values().any(|o| o.id != id && o.tty().is_some_and(|t| !t.dead && t.owner.rdev() == dev));
         let Some(c) = self.rt.clients.get_mut(&id) else { return };
-        if !matches!(c.term_out, TermOut::Hold(_)) {
-            return;
-        }
         let token = Token(TTY_TOKEN | id.0 as usize);
         let mut tty = None;
         if !path.is_empty() {
-            match sys::open_tty(path, dev) {
-                Ok(fd) => match self.rt.registry.register(&mut SourceFd(&fd.as_raw_fd()), token, Interest::READABLE) {
-                    Ok(()) => tty = Some(Tty::new(fd, token)),
-                    Err(e) => log!("client {id}: cannot poll {path}: {e}"),
-                },
+            let owner = match (taken, c.peer.pid) {
+                (true, _) => Err(io::Error::other("another client uses it")),
+                (false, Some(pid)) => sys::TtyOwner::new(pid, dev),
+                (false, None) => Err(io::Error::other("the client process is unknown")),
+            };
+            match owner.and_then(|o| sys::open_tty(path, dev).map(|fd| (fd, o))) {
+                Ok((fd, owner)) => {
+                    let mut t = Tty::new(fd, token, owner);
+                    crate::host::tty_interest(&self.rt.registry, &mut t);
+                    if t.interest.is_some() {
+                        tty = Some(t);
+                    } else {
+                        log!("client {id}: cannot poll {path}");
+                    }
+                }
                 Err(e) => log!("client {id}: cannot use {path}: {e}"),
             }
         }
@@ -631,44 +783,59 @@ impl Server {
         buf.resize(TTY_READ_BUF, 0);
         let mut n = 0;
         let mut gone = false;
+        let mut background = false;
         if let Some(c) = self.rt.clients.get_mut(&id) {
-            let paused = c.dead || c.blocked_on.is_some();
+            let paused = c.dead || c.suspended();
             if let Some(t) = c.tty_mut()
                 && !t.dead
+                && t.reading
                 && !paused
             {
                 t.read_more = false;
-                let fd = t.fd.as_raw_fd();
-                loop {
-                    if n == buf.len() {
-                        t.read_more = true;
-                        break;
-                    }
-                    // SAFETY: the slice is valid for its length; the fd is ours.
-                    let r = unsafe { libc::read(fd, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
-                    if r > 0 {
-                        n += r as usize;
-                        continue;
-                    }
-                    if r == 0 {
-                        gone = true;
-                        break;
-                    }
-                    match io::Error::last_os_error().kind() {
-                        io::ErrorKind::WouldBlock => break,
-                        io::ErrorKind::Interrupted => {}
-                        _ => {
+                // Never read a terminal the client is not the foreground
+                // of: what is typed there now is for the shell.
+                if !t.usable() {
+                    background = true;
+                } else {
+                    let fd = t.fd.as_raw_fd();
+                    loop {
+                        if n == buf.len() {
+                            t.read_more = true;
+                            break;
+                        }
+                        // SAFETY: the slice is valid for its length; the fd is ours.
+                        let r = unsafe { libc::read(fd, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
+                        if r > 0 {
+                            n += r as usize;
+                            continue;
+                        }
+                        if r == 0 {
                             gone = true;
                             break;
                         }
+                        match io::Error::last_os_error().kind() {
+                            io::ErrorKind::WouldBlock => break,
+                            io::ErrorKind::Interrupted => {}
+                            _ => {
+                                gone = true;
+                                break;
+                            }
+                        }
+                    }
+                    if gone {
+                        t.dead = true;
+                        t.read_more = false;
                     }
                 }
-                if gone {
-                    t.dead = true;
-                    t.read_more = false;
-                    let _ = self.rt.registry.deregister(&mut SourceFd(&fd));
-                }
+                crate::host::tty_interest(&self.rt.registry, t);
             }
+        }
+        if background {
+            log!("client {id}: not in the foreground of its terminal; leaving it alone");
+            if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                a.suspended.get_or_insert(crate::client::Suspension::Background);
+            }
+            self.rt.end_paste(id);
         }
         if n > 0 {
             self.client_input(id, &buf[..n], now);
@@ -680,7 +847,13 @@ impl Server {
         }
     }
 
-    fn hello(&mut self, id: ClientId, h: lif_proto::Hello) {
+    fn hello(&mut self, id: ClientId, mut h: lif_proto::Hello) {
+        // Only what a lif client may send reaches session environments
+        // (and so every later pane): never LD_PRELOAD, PATH, SHELL...
+        h.size = lif_core::clamp_size(h.size);
+        h.env.retain(|(k, v)| {
+            (lif_proto::ENV_ALLOW_LIST.contains(&k.as_str()) || k == "LIF_PANE") && !v.contains('\0') && v.len() <= 4096
+        });
         let Some(c) = self.rt.clients.get_mut(&id) else { return };
         c.caps = SERVER_CAPS.intersect(h.caps);
         c.send(&ServerMsg::Welcome {
@@ -719,12 +892,12 @@ impl Server {
                     log!("client {id}: output of an attaching command dropped");
                 }
             }
-            Ok(out) => c.send(&ServerMsg::CommandDone { status: 0, stdout: out.stdout.into_bytes(), stderr: Vec::new() }),
+            Ok(out) => c.send_command_done(0, out.stdout.into_bytes(), Vec::new()),
             Err(e) if attached_now => {
                 let text = e.to_string();
                 lif_core::Host::show_message(&mut self.rt, id, &text, 750);
             }
-            Err(e) => c.send(&ServerMsg::CommandDone { status: 1, stdout: Vec::new(), stderr: format!("{e}\n").into_bytes() }),
+            Err(e) => c.send_command_done(1, Vec::new(), format!("{e}\n").into_bytes()),
         }
         self.rt.flush_client(id);
     }
@@ -873,8 +1046,10 @@ impl Server {
         if c.dead {
             return;
         }
-        c.dead = true;
         log!("client {id} disconnected");
+        self.rt.end_paste(id);
+        let Some(c) = self.rt.clients.get_mut(&id) else { return };
+        c.dead = true;
         // What it showed may now be hidden (see Server::release_hidden_panes).
         self.rt.views_stale = true;
         self.model.client_disconnect(id, &mut self.rt);
@@ -915,10 +1090,34 @@ impl Server {
             lif_core::Host::kill_pane(&mut self.rt, p);
         }
         self.rt.respawn_stash = None;
-        let _ = std::fs::remove_file(&self.opts.socket);
-        if let Some(l) = &self.opts.lock {
-            let _ = std::fs::remove_file(l);
+        // Only our own socket: if another server was started on this path
+        // (it could only after this one stopped holding the lock, but a
+        // user may also have moved things around), its socket stays.
+        let ours = std::fs::symlink_metadata(&self.opts.socket).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        });
+        if ours.is_some() && ours == self.socket_id {
+            let _ = std::fs::remove_file(&self.opts.socket);
         }
+        // The lock file stays: removing it would let a client that already
+        // opened it and one that creates a new one both get "the" lock.
+        // The lock itself goes with this process.
         self.log_stats();
+    }
+}
+
+/// A client message's name for the log (never its payload).
+fn client_msg_name(m: &ClientMsg) -> &'static str {
+    match m {
+        ClientMsg::Hello(_) => "Hello",
+        ClientMsg::Command { .. } => "Command",
+        ClientMsg::Input(_) => "Input",
+        ClientMsg::Resize { .. } => "Resize",
+        ClientMsg::Detach => "Detach",
+        ClientMsg::UseTty { .. } => "UseTty",
+        ClientMsg::Suspend => "Suspend",
+        ClientMsg::Resume { .. } => "Resume",
+        ClientMsg::Unknown { .. } => "Unknown",
     }
 }

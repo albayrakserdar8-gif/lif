@@ -36,9 +36,10 @@ mod tmux;
 use lif_core::{CmdContext, Host, Model, WallClock, parse_string};
 use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub use tmux::{Migration, Untranslated, looks_like_tmux_conf, migrate_tmux_conf};
+pub use tmux::{Migration, Untranslated, looks_like_tmux_commands, looks_like_tmux_conf, migrate_tmux_conf};
 
 /// The documented example configuration, every key explained.
 pub const EXAMPLE: &str = include_str!("../config.example.toml");
@@ -119,20 +120,26 @@ impl Config {
 
     /// Read and translate `path`. A missing file gives an empty config
     /// without diagnostics; an unreadable one a diagnostic.
+    /// The file is read with [`read_file_limited`].
     pub fn load_file(path: &Path) -> Config {
-        let mut cfg = match std::fs::read(path) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => Config::parse(&text),
-                Err(e) => Config {
-                    diagnostics: vec![file_error(format!("file is not valid UTF-8 (byte {})", e.utf8_error().valid_up_to()))],
-                    ..Config::default()
-                },
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        let mut cfg = match read_file_limited(path) {
+            Ok(bytes) => Config::from_bytes(&bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Config::default(),
             Err(e) => Config { diagnostics: vec![file_error(format!("cannot read file: {e}"))], ..Config::default() },
         };
         cfg.path = Some(path.to_path_buf());
         cfg
+    }
+
+    /// Translate the bytes of a config file, which must be UTF-8.
+    pub fn from_bytes(bytes: &[u8]) -> Config {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Config::parse(text),
+            Err(e) => Config {
+                diagnostics: vec![file_error(format!("file is not valid UTF-8 (byte {})", e.valid_up_to()))],
+                ..Config::default()
+            },
+        }
     }
 
     /// Find the file from the real environment ([`default_path`]) and load it.
@@ -181,6 +188,50 @@ impl Config {
         }
         out
     }
+}
+
+/// The largest file [`read_file_limited`] reads: 1 MiB. A real config is a
+/// few KiB; the cap keeps a mistaken `source-file` from filling the
+/// server's memory.
+pub const MAX_FILE_SIZE: u64 = 1 << 20;
+
+/// Read a whole configuration file for the server or the CLI, refusing
+/// anything that could stall or exhaust a process that serves every session:
+/// only regular files (a FIFO or a device such as `/dev/zero` gives the error
+/// `not a regular file`) of at most [`MAX_FILE_SIZE`] bytes (`file too large
+/// (N bytes, limit 1 MiB)`). Symbolic links are followed. A missing file is
+/// an error of kind `NotFound`.
+pub fn read_file_limited(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let not_regular = || io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");
+    // Checked before opening too, because opening some devices has effects
+    // of its own (a serial line raises DTR, a tape rewinds).
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    // Non-blocking so that a FIFO swapped in after the check cannot block
+    // open(2) waiting for a writer; no controlling terminal so that a tty
+    // swapped in cannot become the (session leader) server's. std adds
+    // O_CLOEXEC itself.
+    let mut f = std::fs::File::options().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
+    // The opened file is what gets read, whatever the path names by now.
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    let too_large =
+        |n: &dyn fmt::Display| io::Error::new(io::ErrorKind::InvalidData, format!("file too large ({n} bytes, limit 1 MiB)"));
+    if meta.len() > MAX_FILE_SIZE {
+        return Err(too_large(&meta.len()));
+    }
+    // One byte past the limit tells a file that grew since fstat apart from
+    // one that is exactly at it.
+    let mut buf = Vec::with_capacity(meta.len() as usize + 1);
+    (&mut f).take(MAX_FILE_SIZE + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_FILE_SIZE {
+        return Err(too_large(&format_args!("more than {MAX_FILE_SIZE}")));
+    }
+    Ok(buf)
 }
 
 fn file_error(message: String) -> Diagnostic {

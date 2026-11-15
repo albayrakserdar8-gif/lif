@@ -11,21 +11,9 @@ use lif_types::{PixelSize, Size};
 use crate::sys;
 
 /// Environment variables passed to the server in `Hello`. Fixed, so a
-/// client never leaks unrelated secrets from its environment.
-pub const ENV_ALLOW_LIST: &[&str] = &[
-    "COLORTERM",
-    "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
-    "SSH_AUTH_SOCK",
-    "SSH_CONNECTION",
-    "SSH_TTY",
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "XDG_RUNTIME_DIR",
-];
+/// client never leaks unrelated secrets from its environment (the server
+/// enforces the same list).
+pub use lif_proto::ENV_ALLOW_LIST;
 
 /// A server that accepts but never answers must not hang the client forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,7 +84,7 @@ pub fn hello_from_env() -> Hello {
     Hello {
         protocol: PROTOCOL_VERSION,
         // On a terminal the server may take it over while attached.
-        caps: if is_tty { Caps::TTY } else { Caps::NONE },
+        caps: Caps(if is_tty { Caps::TTY.0 | Caps::SUSPEND.0 } else { 0 } | Caps::OUTPUT_STREAM.0),
         pid: std::process::id(),
         size,
         pixels,
@@ -185,13 +173,32 @@ pub enum CommandOutcome {
     Attached,
 }
 
-/// Sends one command and waits for its outcome.
+/// Sends one command and waits for its outcome. Output a server sends in
+/// parts (`CommandOutput`, for output larger than one frame) is joined.
 pub fn run_command<S: Into<String>>(conn: &mut Connection, argv: impl IntoIterator<Item = S>) -> io::Result<CommandOutcome> {
     let argv = argv.into_iter().map(Into::into).collect();
-    conn.send(&ClientMsg::Command { argv })?;
-    match conn.recv()? {
-        ServerMsg::CommandDone { status, stdout, stderr } => Ok(CommandOutcome::Done { status, stdout, stderr }),
-        ServerMsg::Attached => Ok(CommandOutcome::Attached),
-        m => Err(unexpected(&m, "CommandDone or Attached")),
+    if let Err(e) = conn.send(&ClientMsg::Command { argv }) {
+        // A server that refuses the connection (out of descriptors) has
+        // answered and closed it before reading: its answer says why.
+        return match conn.recv() {
+            Ok(ServerMsg::CommandDone { status, stdout, stderr }) => Ok(CommandOutcome::Done { status, stdout, stderr }),
+            _ => Err(e),
+        };
+    }
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    loop {
+        match conn.recv()? {
+            ServerMsg::CommandOutput { stdout, stderr } => {
+                out.extend_from_slice(&stdout);
+                err.extend_from_slice(&stderr);
+            }
+            ServerMsg::CommandDone { status, stdout, stderr } => {
+                out.extend_from_slice(&stdout);
+                err.extend_from_slice(&stderr);
+                return Ok(CommandOutcome::Done { status, stdout: out, stderr: err });
+            }
+            ServerMsg::Attached => return Ok(CommandOutcome::Attached),
+            m => return Err(unexpected(&m, "CommandDone or Attached")),
+        }
     }
 }

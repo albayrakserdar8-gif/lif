@@ -6,9 +6,16 @@ pub(crate) enum Word {
     Block(Vec<Vec<Word>>),
 }
 
+/// How deeply `{ ... }` blocks may nest. Parsing, printing and dropping a
+/// command list all recurse once per level, so without a limit a long
+/// enough argument of `{` overflows the stack; real configurations nest a
+/// few levels.
+pub(crate) const MAX_BLOCK_DEPTH: usize = 100;
+
 struct Lexer {
     c: Vec<char>,
     i: usize,
+    depth: usize,
 }
 
 fn is_blank(c: Option<char>) -> bool {
@@ -17,7 +24,7 @@ fn is_blank(c: Option<char>) -> bool {
 
 /// Split `s` into commands, each a list of words.
 pub(crate) fn lex(s: &str) -> Result<Vec<Vec<Word>>, String> {
-    let mut l = Lexer { c: s.chars().collect(), i: 0 };
+    let mut l = Lexer { c: s.chars().collect(), i: 0, depth: 0 };
     l.commands(false)
 }
 
@@ -66,8 +73,13 @@ impl Lexer {
                     return Ok(cmds);
                 }
                 Some('{') if is_blank(self.peek2()) => {
+                    if self.depth >= MAX_BLOCK_DEPTH {
+                        return Err(format!("syntax error: {{ }} blocks nested more than {MAX_BLOCK_DEPTH} deep"));
+                    }
                     self.i += 1;
+                    self.depth += 1;
                     let inner = self.commands(true)?;
+                    self.depth -= 1;
                     cur.push(Word::Block(inner));
                 }
                 Some('\\') if self.peek2() == Some('\n') => self.i += 2,

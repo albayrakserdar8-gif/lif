@@ -103,6 +103,13 @@ pub(crate) struct Attached {
     pub(crate) active_pane: Option<PaneId>,
     /// The pane receiving the current bracketed paste.
     pub(crate) paste: Option<PaneId>,
+    /// Part of the current paste did not fit the pane's input queue: the
+    /// rest of it is dropped too (a paste with a hole is worse than a
+    /// paste cut short).
+    pub(crate) paste_dropping: bool,
+    /// The terminal is not the server's to use (see [`Suspension`]): no
+    /// frames, no other output, no reading.
+    pub(crate) suspended: Option<Suspension>,
     /// OSC 52 reads relayed to this terminal, in order.
     pub(crate) clip_reads: VecDeque<(PaneId, u8)>,
     /// Styles of borders and copy-mode overlays (from the options).
@@ -118,6 +125,18 @@ pub(crate) struct Attached {
     /// The last left click on a pane not in a mode: (pane, cell, time in
     /// ms, clicks so far), for double and triple clicks.
     pub(crate) clicks: Option<(PaneId, lif_types::Pos, u64, u8)>,
+}
+
+/// Why an attached client's terminal is left alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Suspension {
+    /// The client stops itself (SIGTSTP, `suspend-client`): the server
+    /// restored the terminal and said `Suspended`.
+    Stopped,
+    /// The server found the client out of the foreground of its terminal
+    /// (a shell took it back after stopping the client): it stopped using
+    /// the terminal without a word, the shell owns it now.
+    Background,
 }
 
 /// Where the bytes for a client's terminal go.
@@ -138,20 +157,69 @@ pub(crate) struct Tty {
     /// Bytes for the terminal; `out[pos..]` is unwritten.
     pub(crate) out: Vec<u8>,
     pos: usize,
-    /// WRITABLE interest is registered.
-    pub(crate) want_write: bool,
+    /// What the fd is registered for (`None`: not registered).
+    pub(crate) interest: Option<mio::Interest>,
+    /// The server reads keys from it (not while the client is suspended).
+    pub(crate) reading: bool,
     /// Input may be left (budget, or reading was paused): read again.
     pub(crate) read_more: bool,
     /// Hung up or failed: never read or written again.
     pub(crate) dead: bool,
+    /// The client process, to check before every read and write that the
+    /// terminal is still the client's (see `sys::TtyOwner`).
+    pub(crate) owner: crate::sys::TtyOwner,
+    /// The check failed: the terminal is someone else's until the client
+    /// says it is back (`Resume`).
+    pub(crate) background: bool,
 }
 
 impl Tty {
-    pub(crate) fn new(fd: OwnedFd, token: Token) -> Tty {
-        Tty { fd, token, out: Vec::new(), pos: 0, want_write: false, read_more: true, dead: false }
+    pub(crate) fn new(fd: OwnedFd, token: Token, owner: crate::sys::TtyOwner) -> Tty {
+        Tty {
+            fd,
+            token,
+            out: Vec::new(),
+            pos: 0,
+            interest: None,
+            reading: true,
+            read_more: true,
+            dead: false,
+            owner,
+            background: false,
+        }
     }
 
-    fn pending(&self) -> usize {
+    /// The terminal may be used: the client is in its foreground. Once it
+    /// is not, nothing queued for it is written (it would land on the
+    /// shell's screen) and nothing is read from it until `Resume`.
+    pub(crate) fn usable(&mut self) -> bool {
+        if self.dead || self.background {
+            return false;
+        }
+        if !self.owner.foreground() {
+            self.background = true;
+            self.read_more = false;
+            self.out.clear();
+            self.pos = 0;
+            return false;
+        }
+        true
+    }
+
+    /// The interest the fd should be registered with now.
+    pub(crate) fn wanted_interest(&self) -> Option<mio::Interest> {
+        if self.dead || self.background {
+            return None;
+        }
+        let read = self.reading.then_some(mio::Interest::READABLE);
+        let write = (self.pending() > 0).then_some(mio::Interest::WRITABLE);
+        match (read, write) {
+            (Some(r), Some(w)) => Some(r | w),
+            (r, w) => r.or(w),
+        }
+    }
+
+    pub(crate) fn pending(&self) -> usize {
         self.out.len() - self.pos
     }
 
@@ -165,6 +233,9 @@ impl Tty {
     /// Writes what the terminal takes; a failure makes it dead and drops
     /// what was queued (nobody can see it any more).
     fn flush(&mut self) {
+        if self.pos < self.out.len() && !self.usable() {
+            return;
+        }
         while !self.dead && self.pos < self.out.len() {
             // SAFETY: the slice is valid for its length; the fd is ours.
             let n = unsafe { libc::write(self.fd.as_raw_fd(), self.out[self.pos..].as_ptr().cast(), self.out.len() - self.pos) };
@@ -206,9 +277,9 @@ pub(crate) struct ClientRt {
     pub(crate) closing: bool,
     /// Remove at the end of the iteration.
     pub(crate) dead: bool,
-    /// Reading is paused because this pane's input queue is full.
-    pub(crate) blocked_on: Option<PaneId>,
-    /// Data may be left in the socket (budget, or unblocked): read again.
+    /// The process at the other end (checked on accept).
+    pub(crate) peer: crate::sys::PeerCred,
+    /// Data may be left in the socket (budget): read again.
     pub(crate) read_more: bool,
     pub(crate) att: Option<Box<Attached>>,
     /// Capabilities both sides announced.
@@ -217,7 +288,7 @@ pub(crate) struct ClientRt {
 }
 
 impl ClientRt {
-    pub(crate) fn new(id: ClientId, stream: mio::net::UnixStream, token: Token) -> Self {
+    pub(crate) fn new(id: ClientId, stream: mio::net::UnixStream, token: Token, peer: crate::sys::PeerCred) -> Self {
         ClientRt {
             id,
             stream,
@@ -230,7 +301,7 @@ impl ClientRt {
             mid_frame: false,
             closing: false,
             dead: false,
-            blocked_on: None,
+            peer,
             read_more: false,
             att: None,
             caps: Caps::NONE,
@@ -238,18 +309,14 @@ impl ClientRt {
         }
     }
 
-    /// Reading may go on: the pane this client was blocked on drained.
-    pub(crate) fn unblock(&mut self) {
-        self.blocked_on = None;
-        self.read_more = true;
-        if let Some(t) = self.tty_mut() {
-            t.read_more = true;
-        }
-    }
-
     /// Keys may be waiting in the terminal the server reads itself.
     pub(crate) fn tty_read_more(&self) -> bool {
-        self.blocked_on.is_none() && !self.dead && self.tty().is_some_and(|t| t.read_more && !t.dead)
+        !self.dead && self.tty().is_some_and(|t| t.read_more && t.reading && !t.dead && !t.background)
+    }
+
+    /// The terminal is left alone for now (see [`Suspension`]).
+    pub(crate) fn suspended(&self) -> bool {
+        self.att.as_ref().is_some_and(|a| a.suspended.is_some())
     }
 
     /// The terminal the server writes itself, if it does.
@@ -304,17 +371,59 @@ impl ClientRt {
         }
     }
 
-    pub(crate) fn send(&mut self, msg: &ServerMsg) {
+    /// Queues `msg` for the socket. False if it cannot be encoded (too
+    /// large): nothing was queued. Never logs the payload, which can be
+    /// megabytes (a Debug dump of it froze the loop for minutes).
+    pub(crate) fn send(&mut self, msg: &ServerMsg) -> bool {
         self.compact();
-        if let Err(e) = msg.encode(&mut self.out) {
-            log!("client {}: cannot encode {msg:?}: {e}", self.id);
+        match msg.encode(&mut self.out) {
+            Ok(()) => true,
+            Err(e) => {
+                log!("client {}: cannot encode {}: {e}", self.id, msg_summary(msg));
+                false
+            }
         }
+    }
+
+    /// A command's result. Output that does not fit one frame goes in
+    /// `CommandOutput` parts to a client that takes them; one that does not
+    /// gets an error instead of nothing (it would wait forever).
+    pub(crate) fn send_command_done(&mut self, status: i32, stdout: Vec<u8>, stderr: Vec<u8>) {
+        let total = stdout.len() + stderr.len();
+        if total <= COMMAND_CHUNK {
+            if self.send(&ServerMsg::CommandDone { status, stdout, stderr }) {
+                return;
+            }
+        } else if total <= MAX_COMMAND_OUTPUT && self.caps.contains(Caps::OUTPUT_STREAM) {
+            let mut sent = 0;
+            while stdout.len() - sent > COMMAND_CHUNK {
+                let part = ServerMsg::CommandOutput { stdout: stdout[sent..sent + COMMAND_CHUNK].to_vec(), stderr: Vec::new() };
+                self.send(&part);
+                sent += COMMAND_CHUNK;
+            }
+            let mut err_sent = 0;
+            while stderr.len() - err_sent > COMMAND_CHUNK {
+                let part = ServerMsg::CommandOutput { stdout: Vec::new(), stderr: stderr[err_sent..err_sent + COMMAND_CHUNK].to_vec() };
+                self.send(&part);
+                err_sent += COMMAND_CHUNK;
+            }
+            let last = ServerMsg::CommandDone { status, stdout: stdout[sent..].to_vec(), stderr: stderr[err_sent..].to_vec() };
+            if self.send(&last) {
+                return;
+            }
+        }
+        let why = if self.caps.contains(Caps::OUTPUT_STREAM) || total > MAX_COMMAND_OUTPUT {
+            format!("command output too large ({total} bytes, limit {MAX_COMMAND_OUTPUT})\n")
+        } else {
+            format!("command output too large for this client ({total} bytes, limit {COMMAND_CHUNK}); use a newer lif client\n")
+        };
+        self.send(&ServerMsg::CommandDone { status: 1, stdout: Vec::new(), stderr: why.into_bytes() });
     }
 
     /// Terminal bytes outside a frame (bell, OSC 52 / 9, mode switches).
     /// Dropped when a stalled client already has [`MAX_EXTRA`] pending.
     pub(crate) fn send_output(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() || self.closing {
+        if bytes.is_empty() || self.closing || self.suspended() {
             return;
         }
         self.compact();
@@ -330,6 +439,13 @@ impl ClientRt {
                 t.out.extend_from_slice(bytes);
             }
         }
+    }
+
+    /// Terminal bytes as `Output` messages on the socket, whoever writes
+    /// the terminal otherwise: the client writes every `Output` it gets.
+    pub(crate) fn send_terminal_via_socket(&mut self, bytes: &[u8]) {
+        self.compact();
+        encode_output(bytes, &mut self.out);
     }
 
     /// The attachment and the buffer a frame is rendered into: the socket
@@ -423,6 +539,30 @@ impl ClientRt {
             self.out.clear();
             self.out_pos = 0;
         }
+    }
+}
+
+/// One command's output in one message, at most: far below `MAX_PAYLOAD`
+/// so a client that does not take output in parts still gets most outputs.
+pub(crate) const COMMAND_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Most output one command may produce (`capture-pane -S -` of a huge
+/// history): the whole output sits in the socket queue until the client
+/// reads it, so it is bounded like any queue.
+pub(crate) const MAX_COMMAND_OUTPUT: usize = 256 * 1024 * 1024;
+
+/// A message for the log: its kind and size, never its payload.
+pub(crate) fn msg_summary(msg: &ServerMsg) -> String {
+    match msg {
+        ServerMsg::CommandDone { status, stdout, stderr } => format!("CommandDone(status {status}, {} + {} bytes)", stdout.len(), stderr.len()),
+        ServerMsg::CommandOutput { stdout, stderr } => format!("CommandOutput({} + {} bytes)", stdout.len(), stderr.len()),
+        ServerMsg::Output(b) => format!("Output({} bytes)", b.len()),
+        ServerMsg::Exit { reason, message } => format!("Exit({reason:?}, {} bytes)", message.len()),
+        ServerMsg::Welcome { .. } => "Welcome".into(),
+        ServerMsg::Attached => "Attached".into(),
+        ServerMsg::Tty { direct } => format!("Tty({direct})"),
+        ServerMsg::Suspended => "Suspended".into(),
+        ServerMsg::Unknown { type_id } => format!("Unknown({type_id:#x})"),
     }
 }
 

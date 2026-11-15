@@ -187,17 +187,21 @@ impl Server {
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
         p.engine.encode_key(key, &mut b);
-        self.rt.write_input(pane, &b);
+        if !self.rt.write_input(pane, &b) {
+            self.input_dropped(client, pane, b.len());
+        }
         self.replies = b;
-        self.block_if_full(client, pane);
     }
 
-    /// Stop reading from a client whose pane does not take input.
-    fn block_if_full(&mut self, client: ClientId, pane: PaneId) {
-        let full = self.rt.panes.get(&pane).is_some_and(|p| p.wq.len() > crate::PANE_WRITE_HIGH);
-        if full && let Some(c) = self.rt.clients.get_mut(&client) {
-            c.blocked_on = Some(pane);
-        }
+    /// Typed or pasted input did not fit the pane's input queue (its
+    /// program is not reading): it is dropped, as a terminal with a full
+    /// input queue drops it, and the user is told. The client is never
+    /// stopped: its other keys keep working.
+    fn input_dropped(&mut self, client: ClientId, pane: PaneId, bytes: usize) {
+        log!("pane {pane}: input queue full, {bytes} bytes from client {client} dropped");
+        let d = self.display_time();
+        let text = format!("pane {pane} is not reading its input: input dropped");
+        self.rt.show_message(client, &text, d);
     }
 
     /// A key for a pane in a mode: through the copy-mode key table (the
@@ -674,11 +678,19 @@ impl Server {
         }
         let Some(pane) = a.view.as_ref().map(|v| v.active_pane) else { return };
         a.paste = Some(pane);
+        a.paste_dropping = false;
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let bracketed = p.engine.modes().bracketed_paste;
-        p.paste_bracketed = Some(bracketed);
-        if bracketed {
-            self.rt.write_pane(pane, b"\x1b[200~");
+        // A start that did not fit is not ended either.
+        let started = !bracketed || self.rt.write_input(pane, b"\x1b[200~");
+        if let Some(p) = self.rt.panes.get_mut(&pane) {
+            p.paste_bracketed = Some(bracketed && started);
+        }
+        if !started {
+            if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                a.paste_dropping = true;
+            }
+            self.input_dropped(id, pane, 6);
         }
     }
 
@@ -690,21 +702,30 @@ impl Server {
             return;
         }
         let Some(pane) = a.paste else { return };
+        if a.paste_dropping {
+            return;
+        }
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
         p.engine.encode_paste_chunk(data, &mut b);
-        self.rt.write_input(pane, &b);
+        let queued = self.rt.write_input(pane, &b);
         self.replies = b;
-        self.block_if_full(id, pane);
+        if !queued {
+            if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                a.paste_dropping = true;
+            }
+            self.input_dropped(id, pane, data.len());
+        }
     }
 
     fn paste_end(&mut self, id: ClientId) {
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
+        a.paste_dropping = false;
         let Some(pane) = a.paste.take() else { return };
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         if p.paste_bracketed.take() == Some(true) {
-            self.rt.write_pane(pane, b"\x1b[201~");
+            self.rt.write_pane_closing(pane, b"\x1b[201~");
         }
     }
 

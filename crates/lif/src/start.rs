@@ -3,9 +3,10 @@
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
     if r == -1 { Err(io::Error::last_os_error()) } else { Ok(r) }
@@ -17,31 +18,112 @@ fn lock_path(socket: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// How long a client waits for a server another process holds the lock
+/// for (it is starting, or it is running) to accept a connection.
+const LOCKED_WAIT: Duration = Duration::from_secs(3);
+
+/// `<socket>.lock`, opened for flock: never through a symlink, never
+/// someone else's file, never inherited by the panes.
+fn open_lock(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = f.metadata()?;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !m.file_type().is_file() || m.uid() != uid {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{}: not a regular file owned by you", path.display())));
+    }
+    if m.mode() & 0o777 != 0o600 {
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
+}
+
+/// Takes the exclusive lock without waiting. False if another process
+/// holds it.
+fn try_lock(f: &std::fs::File) -> io::Result<bool> {
+    loop {
+        // SAFETY: flock on an fd we own.
+        match cvt(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether a server process lives on `socket`: it holds the lock for as
+/// long as it runs. For telling "not responding" from "not running".
+pub(crate) fn server_holds_lock(socket: &Path) -> bool {
+    match open_lock(&lock_path(socket), false) {
+        // Closing our fd releases the lock we may have taken.
+        Ok(f) => matches!(try_lock(&f), Ok(false)),
+        Err(_) => false,
+    }
+}
+
+/// Removes what a dead server left at `socket`. Only a socket of ours: on
+/// Linux connecting to a regular file also fails with ECONNREFUSED, and
+/// the path may be anything the user named with -S.
+fn remove_stale(socket: &Path) -> io::Result<()> {
+    let m = match std::fs::symlink_metadata(socket) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !m.file_type().is_socket() || m.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket of yours; not removing it", socket.display()),
+        ));
+    }
+    match std::fs::remove_file(socket) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The error for a server that holds the lock but does not accept.
+pub(crate) fn not_responding(socket: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, format!("server on {} is not responding", socket.display()))
+}
+
 /// Starts a server on `socket` unless one is already running there, and
-/// returns once it accepts connections. An exclusive lock on
-/// `<socket>.lock` serializes clients racing to start one.
+/// returns once it accepts connections.
+///
+/// A server holds an exclusive lock on `<socket>.lock` for its whole life
+/// (the daemon inherits the lock of the client that starts it). A client
+/// that gets the lock knows no server lives on the path, so whatever is
+/// at the socket path is stale; one that does not get it waits for the
+/// server (being started by another client, or running) to accept, and
+/// reports a server that never does as not responding. It never removes
+/// the socket of a live server: one that is stopped, or whose listen
+/// backlog is full, refuses connections like a dead one.
 /// `config` is `lif -f`: the configuration file the new server reads
 /// (a server already running keeps its own, as in tmux).
 pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) -> io::Result<()> {
     let lock_path = lock_path(socket);
-    let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&lock_path)?;
-    loop {
-        // SAFETY: flock on an fd we own.
-        match cvt(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+    let lock = open_lock(&lock_path, true)?;
+    let deadline = Instant::now() + LOCKED_WAIT;
+    while !try_lock(&lock)? {
+        if UnixStream::connect(socket).is_ok() {
+            return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(not_responding(socket));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    // Whoever held the lock before us may have started it.
-    if UnixStream::connect(socket).is_ok() {
-        return Ok(());
-    }
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    remove_stale(socket)?;
     let mut fds = [0; 2];
     // SAFETY: fds has room for two descriptors.
     cvt(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
@@ -65,7 +147,7 @@ pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) 
         // A relative -f is relative to where the user ran lif, not to the
         // daemon's / working directory.
         let config = config.map(|c| std::env::current_dir().map(|d| d.join(c)).unwrap_or_else(|_| c.to_path_buf()));
-        let code = daemon_main(socket, &lock_path, verbose, config, ready_w.as_raw_fd());
+        let code = daemon_main(socket, &lock_path, verbose, config, ready_w.as_raw_fd(), lock.as_raw_fd());
         std::process::exit(code);
     }
     drop(ready_w);
@@ -75,6 +157,8 @@ pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) 
     let mut answer = Vec::new();
     let mut f = std::fs::File::from(ready_r);
     let _ = f.read_to_end(&mut answer);
+    // Closing our descriptor does not release the lock: the daemon holds
+    // the same open file description. (LOCK_UN would release it for both.)
     drop(lock);
     match answer.first() {
         Some(b'R') => Ok(()),
@@ -96,7 +180,7 @@ fn open_fds() -> Vec<RawFd> {
 
 /// The daemon: detached from the terminal and the client's process group,
 /// cwd `/`, stdio on /dev/null, no inherited fds, default signals.
-fn daemon_main(socket: &Path, lock: &Path, verbose: bool, config: Option<PathBuf>, ready: RawFd) -> i32 {
+fn daemon_main(socket: &Path, lock: &Path, verbose: bool, config: Option<PathBuf>, ready: RawFd, lock_fd: RawFd) -> i32 {
     // SAFETY: plain syscalls on fds this process owns.
     unsafe {
         libc::chdir(c"/".as_ptr());
@@ -110,7 +194,8 @@ fn daemon_main(socket: &Path, lock: &Path, verbose: bool, config: Option<PathBuf
             }
         }
         for fd in open_fds() {
-            if fd > 2 && fd != ready {
+            // The lock stays open (and locked) until the server exits.
+            if fd > 2 && fd != ready && fd != lock_fd {
                 libc::close(fd);
             }
         }

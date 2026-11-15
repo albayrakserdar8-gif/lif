@@ -67,6 +67,8 @@ pub(crate) struct Prepared {
     /// Directories to try with chdir, in order.
     pub(crate) dirs: Vec<CString>,
     pub(crate) closer: FdCloser,
+    /// RLIMIT_NOFILE soft limit to give the child (0: leave it).
+    pub(crate) nofile: u64,
     /// Shown in error messages.
     pub(crate) display_name: String,
     // Own the strings the pointer arrays above point into.
@@ -106,6 +108,17 @@ fn usable_shell(path: &OsStr) -> Option<CString> {
     }
     let c = CString::new(path.as_bytes()).ok()?;
     sys::is_executable(&c).then_some(c)
+}
+
+/// See [`set_child_fd_limit`].
+static CHILD_NOFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The RLIMIT_NOFILE soft limit children get (`None`: whatever this
+/// process has). A server that raised its own limit to serve many panes
+/// gives programs back the limit they would have had: some size tables by
+/// it, or close every descriptor up to it.
+pub fn set_child_fd_limit(soft: Option<u64>) {
+    CHILD_NOFILE.store(soft.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn prepare(opts: &SpawnOptions) -> io::Result<Prepared> {
@@ -227,6 +240,7 @@ pub(crate) fn prepare(opts: &SpawnOptions) -> io::Result<Prepared> {
         envp: envp_ptrs,
         dirs,
         closer: FdCloser::new(),
+        nofile: CHILD_NOFILE.load(std::sync::atomic::Ordering::Relaxed),
         display_name,
         _argv: argv,
         _envp: envp_strings,

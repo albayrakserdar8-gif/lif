@@ -214,6 +214,11 @@ impl ClientMsg {
                 put_bytes(o, path.as_bytes());
                 put_u64(o, *dev);
             }),
+            ClientMsg::Suspend => frame(out, type_id::SUSPEND, |_| {}),
+            ClientMsg::Resume { size, pixels } => frame(out, type_id::RESUME, |o| {
+                put_size(o, *size);
+                put_pixels(o, *pixels);
+            }),
             ClientMsg::Unknown { .. } => Err(ProtoError::NotEncodable),
         }
     }
@@ -230,14 +235,16 @@ impl ClientMsg {
                 pixels: r.opt(Reader::pixels)?,
                 term: r.opt(Reader::string)?,
                 cwd: r.opt(Reader::string)?,
-                env: r.opt(|r| r.vec(|r| Ok((r.string()?, r.string()?))))?,
+                env: r.opt(|r| r.vec(8, |r| Ok((r.string()?, r.string()?))))?,
                 is_tty: r.opt(Reader::bool)?,
             }),
-            type_id::COMMAND => ClientMsg::Command { argv: r.opt(|r| r.vec(Reader::string))? },
+            type_id::COMMAND => ClientMsg::Command { argv: r.opt(|r| r.vec(4, Reader::string))? },
             type_id::INPUT => ClientMsg::Input(r.opt(|r| r.bytes().map(<[u8]>::to_vec))?),
             type_id::RESIZE => ClientMsg::Resize { size: r.opt(Reader::size)?, pixels: r.opt(Reader::pixels)? },
             type_id::DETACH => ClientMsg::Detach,
             type_id::USE_TTY => ClientMsg::UseTty { path: r.opt(Reader::string)?, dev: r.opt(Reader::u64)? },
+            type_id::SUSPEND => ClientMsg::Suspend,
+            type_id::RESUME => ClientMsg::Resume { size: r.opt(Reader::size)?, pixels: r.opt(Reader::pixels)? },
             _ => ClientMsg::Unknown { type_id },
         })
     }
@@ -265,6 +272,11 @@ impl ServerMsg {
                 put_bytes(o, message.as_bytes());
             }),
             ServerMsg::Tty { direct } => frame(out, type_id::TTY, |o| put_bool(o, *direct)),
+            ServerMsg::Suspended => frame(out, type_id::SUSPENDED, |_| {}),
+            ServerMsg::CommandOutput { stdout, stderr } => frame(out, type_id::COMMAND_OUTPUT, |o| {
+                put_bytes(o, stdout);
+                put_bytes(o, stderr);
+            }),
             ServerMsg::Unknown { .. } => Err(ProtoError::NotEncodable),
         }
     }
@@ -291,6 +303,11 @@ impl ServerMsg {
                 message: r.opt(Reader::string)?,
             },
             type_id::TTY => ServerMsg::Tty { direct: r.opt(Reader::bool)? },
+            type_id::SUSPENDED => ServerMsg::Suspended,
+            type_id::COMMAND_OUTPUT => ServerMsg::CommandOutput {
+                stdout: r.opt(|r| r.bytes().map(<[u8]>::to_vec))?,
+                stderr: r.opt(|r| r.bytes().map(<[u8]>::to_vec))?,
+            },
             _ => ServerMsg::Unknown { type_id },
         })
     }
@@ -323,6 +340,19 @@ impl Message for ServerMsg {
 
 // ---------------------------------------------------------------------------
 // Payload decoding
+
+/// Most bytes of elements a list reserves before its elements have been
+/// decoded. An element in memory can be far larger than on the wire (an
+/// empty string pair is 8 bytes there, 48 here), so a count that the payload
+/// can hold may still ask for several times the frame; past this the Vec
+/// grows as elements actually arrive.
+const PREALLOC_BYTES: usize = 64 * 1024;
+
+/// Elements to reserve for a list of `n` (already checked against the
+/// payload).
+fn initial_capacity<T>(n: usize) -> usize {
+    n.min(PREALLOC_BYTES / size_of::<T>().max(1))
+}
 
 struct Reader<'a> {
     type_id: u16,
@@ -395,11 +425,23 @@ impl<'a> Reader<'a> {
             Err(_) => Err(ProtoError::InvalidUtf8 { type_id: self.type_id }),
         }
     }
-    fn vec<T>(&mut self, mut elem: impl FnMut(&mut Self) -> Result<T, ProtoError>) -> Result<Vec<T>, ProtoError> {
+    /// A u32 count, then that many elements, each at least `min_wire`
+    /// bytes on the wire.
+    fn vec<T>(
+        &mut self,
+        min_wire: usize,
+        mut elem: impl FnMut(&mut Self) -> Result<T, ProtoError>,
+    ) -> Result<Vec<T>, ProtoError> {
         let n = self.u32()? as usize;
-        // The count comes from the peer: every element takes at least one
-        // byte, so never reserve more than the bytes that are left.
-        let mut v = Vec::with_capacity(n.min(self.buf.len() - self.pos));
+        let remaining = self.buf.len() - self.pos;
+        // The count comes from the peer: one that the rest of the payload
+        // cannot hold is cut off for sure, so fail before decoding any of it.
+        if n > remaining / min_wire {
+            return Err(ProtoError::Truncated { type_id: self.type_id });
+        }
+        let mut v = Vec::with_capacity(initial_capacity::<T>(n));
+        #[cfg(test)]
+        tests::RESERVED.with(|r| r.set(r.get().max(v.capacity() * size_of::<T>())));
         for _ in 0..n {
             v.push(elem(self)?);
         }
@@ -672,6 +714,91 @@ impl<M: Message> Decoder<M> {
         match self.next_frame()? {
             Some(f) => f.decode().map(Some),
             None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The largest up-front reservation `Reader::vec` made on this
+        /// thread, in bytes.
+        pub(super) static RESERVED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A payload: `prefix`, a count of `n`, then `body` zero bytes (each
+    /// 4 of them an empty string).
+    fn list_payload(prefix: &[u8], n: u32, body: usize) -> Vec<u8> {
+        let mut p = prefix.to_vec();
+        p.extend_from_slice(&n.to_le_bytes());
+        p.resize(p.len() + body, 0);
+        p
+    }
+
+    fn reserved_by(decode: impl FnOnce()) -> usize {
+        RESERVED.with(|r| r.set(0));
+        decode();
+        RESERVED.with(|r| r.get())
+    }
+
+    /// The fixed fields of a Hello before `env`, with empty strings.
+    fn hello_prefix() -> Vec<u8> {
+        let mut p = Vec::new();
+        put_u16(&mut p, 1);
+        put_u64(&mut p, 0);
+        put_u32(&mut p, 1);
+        put_size(&mut p, Size::new(80, 24));
+        put_pixels(&mut p, PixelSize::default());
+        put_bytes(&mut p, b"");
+        put_bytes(&mut p, b"");
+        p
+    }
+
+    #[test]
+    fn huge_counts_reserve_little() {
+        let body = MAX_PAYLOAD - 64;
+        // Every count the payload could hold, and counts it could not.
+        for n in [(body / 8) as u32, (body / 4) as u32, u32::MAX] {
+            let p = list_payload(&hello_prefix(), n, body);
+            let got = reserved_by(|| {
+                let _ = ClientMsg::decode(type_id::HELLO, &p);
+            });
+            assert!(got <= PREALLOC_BYTES, "Hello env with count {n} reserved {got} bytes");
+            let p = list_payload(&[], n, body);
+            let got = reserved_by(|| {
+                let _ = ClientMsg::decode(type_id::COMMAND, &p);
+            });
+            assert!(got <= PREALLOC_BYTES, "Command argv with count {n} reserved {got} bytes");
+        }
+    }
+
+    #[test]
+    fn counts_the_payload_cannot_hold_fail_at_once() {
+        // 2 pairs need 16 bytes; 15 are left.
+        let p = list_payload(&hello_prefix(), 2, 15);
+        assert_eq!(ClientMsg::decode(type_id::HELLO, &p), Err(ProtoError::Truncated { type_id: type_id::HELLO }));
+        let p = list_payload(&[], 3, 11);
+        assert_eq!(ClientMsg::decode(type_id::COMMAND, &p), Err(ProtoError::Truncated { type_id: type_id::COMMAND }));
+        // Exactly enough: decodes.
+        let p = list_payload(&hello_prefix(), 2, 16);
+        match ClientMsg::decode(type_id::HELLO, &p) {
+            Ok(ClientMsg::Hello(h)) => assert_eq!(h.env, vec![(String::new(), String::new()); 2]),
+            other => panic!("{other:?}"),
+        }
+        let p = list_payload(&[], 3, 12);
+        assert_eq!(ClientMsg::decode(type_id::COMMAND, &p), Ok(ClientMsg::Command { argv: vec![String::new(); 3] }));
+    }
+
+    #[test]
+    fn lists_longer_than_the_reservation_still_decode() {
+        let n = 3 * PREALLOC_BYTES / size_of::<String>();
+        let p = list_payload(&[], n as u32, 4 * n);
+        match ClientMsg::decode(type_id::COMMAND, &p) {
+            Ok(ClientMsg::Command { argv }) => assert_eq!(argv.len(), n),
+            other => panic!("{other:?}"),
         }
     }
 }

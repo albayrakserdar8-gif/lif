@@ -17,6 +17,43 @@ use std::collections::BTreeMap;
 
 type R = Result<CmdOutput, CmdError>;
 
+/// Most repeats `send-keys -N` accepts (tmux takes any u32: `-N 4294967295`
+/// would queue for most of an hour on the server's one thread). Copy-mode
+/// commands (`-X`) never need more: no history has that many lines.
+const MAX_REPEAT: u32 = 1_000_000;
+
+/// Most input one `send-keys` sends, in bytes, all repeats counted (a key
+/// counts as [`KEY_INPUT_BYTES`]). Checked before anything is sent: a
+/// command over it sends nothing. Pastes of real text stay far below it.
+const MAX_SEND_BYTES: u64 = 1 << 20;
+
+/// What a key counts for against [`MAX_SEND_BYTES`]: about the longest
+/// encoding a key gets (kitty keyboard protocol with modifiers and event
+/// type, `ESC [ 57441 ; 16 : 3 u`).
+const KEY_INPUT_BYTES: u64 = 16;
+
+/// tmux's CMD_SOURCE_FILE_DEPTH_LIMIT: how deeply `source-file` may nest.
+const MAX_SOURCE_DEPTH: u32 = 50;
+
+thread_local! {
+    /// How many `source-file` commands are running inside each other. Not a
+    /// model field because only the call stack it guards cares; the server
+    /// runs the model on one thread.
+    static SOURCE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Longest message or pane-number display `-d` accepts, in milliseconds:
+/// tmux's limit (UINT_MAX, about 49 days). The server adds it to the clock,
+/// which a larger value would overflow.
+fn parse_delay(d: &str) -> Result<u64, CmdError> {
+    match d.parse::<u64>() {
+        Ok(ms) if ms <= u32::MAX as u64 => Ok(ms),
+        Ok(_) => err(format!("delay too large: {d}")),
+        Err(_) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => err(format!("delay too large: {d}")),
+        Err(_) => err(format!("delay invalid: {d}")),
+    }
+}
+
 const LIST_SESSIONS: &str = "#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_grouped, (group ,}#{session_group}#{?session_grouped,),}#{?session_attached, (attached),}";
 const LIST_WINDOWS: &str = "#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}";
 const LIST_WINDOWS_ALL: &str = "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] ";
@@ -121,6 +158,12 @@ pub fn expand_prompt_template(template: &str, answers: &[&str]) -> String {
                     false
                 };
                 if hit {
+                    // Answers pasted into prompts and templates with many
+                    // slots multiply: past the limit nothing runs (a cut
+                    // command could do something else entirely).
+                    if out.len() + 2 * ans.len() > MAX_TEMPLATE_OUTPUT {
+                        return String::new();
+                    }
                     k += 2;
                     let quoted = k < b.len() && b[k] == b'%';
                     if quoted {
@@ -145,6 +188,20 @@ pub fn expand_prompt_template(template: &str, answers: &[&str]) -> String {
     }
     t
 }
+
+/// Most output a list command (`list-windows -F ...`) builds: each
+/// item's format is bounded (`format::MAX_BYTES`), their number is not.
+const MAX_LIST_OUTPUT: usize = 64 * 1024 * 1024;
+
+fn check_list_output(out: &str) -> Result<(), CmdError> {
+    if out.len() > MAX_LIST_OUTPUT {
+        return err(format!("output too large (more than {MAX_LIST_OUTPUT} bytes)"));
+    }
+    Ok(())
+}
+
+/// Longest command [`expand_prompt_template`] builds.
+const MAX_TEMPLATE_OUTPUT: usize = 1024 * 1024;
 
 fn parse_size_arg(s: &str, of: u32, what: &str) -> Result<u32, CmdError> {
     match SizeSpec::parse(s) {
@@ -192,12 +249,16 @@ impl Model {
                 let sid = self.clients[&cid].session;
                 let cw = self.sessions.get(&sid.expect("attached")).map(|s| s.current);
                 let ms = match a.get('d') {
-                    Some(d) => d.parse().map_err(|_| CmdError(format!("delay invalid: {d}")))?,
+                    Some(d) => parse_delay(d)?,
                     None => self.wopt(cw, "display-panes-time").as_num() as u64,
                 };
                 let template = a.strings(0).into_iter().next().unwrap_or_else(|| "select-pane -t '%%'".to_string());
                 host.display_panes(cid, ms, &template, !a.has('N'));
                 ok()
+            }
+            "suspend-client" => {
+                let cid = self.attached_client(ctx, a.get('t'))?;
+                host.suspend_client(cid).map(|()| CmdOutput::default()).map_err(CmdError)
             }
             "has-session" => self.find_target(ctx, a.get('t'), Kind::Session, Flags::default()).map(|_| CmdOutput::default()),
             "kill-pane" => {
@@ -276,6 +337,7 @@ impl Model {
                         continue;
                     }
                     out.push_str(&format::expand(a.get('F').unwrap_or(LIST_BUFFERS), &c));
+                    check_list_output(&out)?;
                     out.push('\n');
                 }
                 text(out)
@@ -300,6 +362,7 @@ impl Model {
                         continue;
                     }
                     out.push_str(&format::expand(a.get('F').unwrap_or(LIST_CLIENTS), &fc));
+                    check_list_output(&out)?;
                     out.push('\n');
                 }
                 text(out)
@@ -316,6 +379,7 @@ impl Model {
                     if let Some(fmt) = a.get('F') {
                         let inner = self.fctx(&*host, None, None, None, ctx.client, ctx.now);
                         out.push_str(&format::expand(fmt, &CommandVars { entry: e, inner: &inner }));
+                        check_list_output(&out)?;
                         out.push('\n');
                         continue;
                     }
@@ -340,6 +404,7 @@ impl Model {
                         continue;
                     }
                     out.push_str(&format::expand(a.get('F').unwrap_or(LIST_SESSIONS), &c));
+                    check_list_output(&out)?;
                     out.push('\n');
                 }
                 text(out)
@@ -434,7 +499,7 @@ impl Model {
                 let name = if a.has('2') { "prefix2" } else { "prefix" };
                 if let Value::Key(Some(k)) = self.sopt(Some(f.s), name) {
                     let ev = k.to_event();
-                    host.send_to_pane(p, PaneInput::Key(&ev));
+                    host.send_to_pane(p, PaneInput::Key(&ev)).map_err(CmdError)?;
                 }
                 ok()
             }
@@ -509,8 +574,15 @@ impl Model {
                 self.buffers.insert(0, PasteBuffer { name: n.to_string(), data, automatic: false });
             }
             None => {
-                let name = format!("buffer{:04}", self.next_buffer);
-                self.next_buffer += 1;
+                // The counter wraps after 2^32 copies; skip names still in
+                // use rather than replace a buffer.
+                let name = loop {
+                    let n = format!("buffer{:04}", self.next_buffer);
+                    self.next_buffer = self.next_buffer.wrapping_add(1);
+                    if !self.buffers.iter().any(|b| b.name == n) {
+                        break n;
+                    }
+                };
                 self.buffers.insert(0, PasteBuffer { name, data, automatic: true });
                 let limit = self.gopt("buffer-limit").as_num().max(1) as usize;
                 let mut auto = 0;
@@ -661,13 +733,11 @@ impl Model {
     }
 
     /// tmux's `winlink_shuffle_up`: make room at `idx` by moving the windows
-    /// from `idx` up to the next gap one index up.
-    fn shuffle_up(&mut self, sid: SessionId, idx: u32) {
+    /// from `idx` up to the next gap one index up. Fails, changing nothing,
+    /// when no gap is left at or below the maximum index.
+    fn shuffle_up(&mut self, sid: SessionId, idx: u32) -> Result<(), CmdError> {
+        let mut last = self.shuffle_gap(sid, idx)?;
         let s = self.sessions.get_mut(&sid).expect("session");
-        let mut last = idx;
-        while s.windows.contains_key(&last) {
-            last += 1;
-        }
         while last > idx {
             if let Some(w) = s.windows.remove(&(last - 1)) {
                 s.windows.insert(last, w);
@@ -677,18 +747,76 @@ impl Model {
             }
             last -= 1;
         }
+        Ok(())
     }
 
-    /// Resolve the index for a new or moved window (`-t`, `-a`, `-b`, `-k`).
-    /// The third value is a window that `-k` displaced but that could not be
-    /// killed yet because it is the session's only window; pass it to
-    /// [`Model::replace_killed`] after linking the new window.
-    fn place_index(&mut self, f: &Found, a: &Args, moving: Option<WindowId>, what: &str, host: &mut dyn Host) -> Result<(u32, bool, Option<WindowId>), CmdError> {
+    /// The first free index at or after `idx` that `shuffle_up` would move
+    /// windows into.
+    fn shuffle_gap(&self, sid: SessionId, idx: u32) -> Result<u32, CmdError> {
+        let s = &self.sessions[&sid];
+        (idx..=crate::model::MAX_WINDOW_INDEX).find(|i| !s.windows.contains_key(i)).ok_or_else(|| CmdError::new("no free window index"))
+    }
+
+    /// An index a target named, refused above the maximum: tmux's targets
+    /// stop at INT_MAX, and indices above it leave no room for `-a`.
+    fn check_index(i: u32) -> Result<u32, CmdError> {
+        if i > crate::model::MAX_WINDOW_INDEX {
+            return Err(Self::too_big(i));
+        }
+        Ok(i)
+    }
+
+    fn too_big(i: u32) -> CmdError {
+        CmdError(format!("window index too big: {i} (the largest is {})", crate::model::MAX_WINDOW_INDEX))
+    }
+
+    /// The index `-a` / `-b` insert at (after shuffling), or `None` without
+    /// those flags. Checks that the shuffle has room, so a caller can refuse
+    /// before it starts a process or takes a pane out of its window.
+    fn insert_index(&self, f: &Found, a: &Args) -> Result<Option<u32>, CmdError> {
+        if !a.has('a') && !a.has('b') {
+            return Ok(None);
+        }
+        let base = match f.idx {
+            Some(i) => Self::check_index(i)?,
+            None => self.windows[&self.sessions[&f.s].current].index,
+        };
+        let idx = if a.has('a') {
+            match base.checked_add(1) {
+                Some(i) if i <= crate::model::MAX_WINDOW_INDEX => i,
+                _ => return err("no free window index"),
+            }
+        } else {
+            base
+        };
+        self.shuffle_gap(f.s, idx)?;
+        Ok(Some(idx))
+    }
+
+    /// Everything [`Model::place_index`] can refuse for lack of an index,
+    /// without changing anything.
+    fn check_placement(&self, f: &Found, a: &Args) -> Result<(), CmdError> {
+        if self.insert_index(f, a)?.is_some() {
+            return Ok(());
+        }
+        match f.idx {
+            Some(i) => Self::check_index(i).map(|_| ()),
+            None => self.first_free_index(f.s).map(|_| ()),
+        }
+    }
+
+    /// Resolve the index for a new or moved window (`-t`, `-a`, `-b`, `-k`)
+    /// and make room there (`-a` / `-b` shift windows up, `-k` kills the
+    /// window in the way). The second value is a window that `-k` displaced
+    /// but that could not be killed yet because it is the session's only
+    /// window; pass it to [`Model::replace_killed`] after linking the new
+    /// window. On error nothing has changed.
+    fn place_index(&mut self, f: &Found, a: &Args, moving: Option<WindowId>, what: &str, host: &mut dyn Host) -> Result<(u32, Option<WindowId>), CmdError> {
         let sid = f.s;
-        if a.has('a') || a.has('b') {
-            let base = f.idx.unwrap_or_else(|| self.windows[&self.sessions[&sid].current].index);
-            let idx = if a.has('a') { base + 1 } else { base };
-            return Ok((idx, true, None));
+        self.check_placement(f, a).map_err(|e| CmdError(format!("{what}{}", e.0)))?;
+        if let Some(idx) = self.insert_index(f, a)? {
+            self.shuffle_up(sid, idx)?;
+            return Ok((idx, None));
         }
         match f.idx {
             Some(i) => {
@@ -702,13 +830,13 @@ impl Model {
                     if self.sessions[&sid].windows.len() == 1 && moving.is_none_or(|m| self.windows[&m].session != sid) {
                         // Killing the only window now would destroy the
                         // session the window goes into; replace it instead.
-                        return Ok((i, false, Some(existing)));
+                        return Ok((i, Some(existing)));
                     }
                     self.remove_window_inner(existing, None, false, host);
                 }
-                Ok((i, false, None))
+                Ok((i, None))
             }
-            None => Ok((self.first_free_index(sid), false, None)),
+            None => Ok((self.first_free_index(sid)?, None)),
         }
     }
 
@@ -728,10 +856,9 @@ impl Model {
         }
     }
 
-    fn insert_window(&mut self, sid: SessionId, idx: u32, shuffle: bool, wid: WindowId) {
-        if shuffle {
-            self.shuffle_up(sid, idx);
-        }
+    /// Link `wid` at `idx`, which [`Model::place_index`] made free (or
+    /// holds the `-k` window that [`Model::replace_killed`] drops next).
+    fn insert_window(&mut self, sid: SessionId, idx: u32, wid: WindowId) {
         let s = self.sessions.get_mut(&sid).expect("session");
         s.windows.insert(idx, wid);
         let w = self.windows.get_mut(&wid).expect("window");
@@ -772,8 +899,9 @@ impl Model {
     /// failure nothing remains. The window is not linked into the session.
     #[allow(clippy::too_many_arguments)]
     fn spawn_window(&mut self, sid: SessionId, name: Option<String>, args: &[String], cwd: String, size: Size, client: Option<ClientId>, host: &mut dyn Host) -> Result<(WindowId, PaneId), CmdError> {
-        let pid = self.alloc_pane();
-        let wid = self.alloc_window();
+        let failed = |e: CmdError| CmdError(format!("create window failed: {}", e.0));
+        let pid = self.alloc_pane().map_err(failed)?;
+        let wid = self.alloc_window().map_err(failed)?;
         let command = self.spawn_command(sid, args);
         let mut options = OptionSet::default();
         let auto_name = name.is_none();
@@ -867,17 +995,23 @@ impl Model {
         let parse_dim = |v: Option<&str>, d: u16, what: &str| -> Result<u16, CmdError> {
             match v {
                 None | Some("-") => Ok(d),
-                Some(s) => s.parse::<u16>().ok().filter(|n| *n > 0).ok_or_else(|| CmdError(format!("{what} invalid"))),
+                Some(s) => s
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n > 0 && *n <= crate::MAX_WINDOW_DIM)
+                    .ok_or_else(|| CmdError(format!("{what} invalid (1 to {})", crate::MAX_WINDOW_DIM))),
             }
         };
         let mut size = Size::new(parse_dim(a.get('x'), dw, "width")?, parse_dim(a.get('y'), dh, "height")?);
+        if !crate::model::size_allowed(size.cols, size.rows) {
+            return err(format!("size too large: {}x{} (at most {} cells)", size.cols, size.rows, crate::MAX_WINDOW_CELLS));
+        }
         if !detached && let Some((_, info, _)) = &client {
             let sl = self.sopt(None, "status").as_num() as u16;
             size = Size::new(info.size.cols.max(1), info.size.rows.saturating_sub(sl).max(1));
         }
         // tmux names unnamed sessions after their id, skipping taken names.
-        let mut id = SessionId(self.next_session);
-        self.next_session += 1;
+        let mut id = self.alloc_session()?;
         let name = match name {
             Some(n) => n,
             None => loop {
@@ -885,8 +1019,7 @@ impl Model {
                 if self.session_by_name(&n).is_none() {
                     break n;
                 }
-                id = SessionId(self.next_session);
-                self.next_session += 1;
+                id = self.alloc_session()?;
             },
         };
         let tick = self.tick();
@@ -914,8 +1047,8 @@ impl Model {
                 return Err(e);
             }
         };
-        let base = self.sopt(Some(id), "base-index").as_num() as u32;
-        self.insert_window(id, base, false, wid);
+        let base = self.base_index(id);
+        self.insert_window(id, base, wid);
         self.sessions.get_mut(&id).expect("session").current = wid;
         if !detached && let Some((cid, _, _)) = client {
             self.switch_client(cid, id, host);
@@ -1051,7 +1184,7 @@ impl Model {
         match client {
             Some(c) if !a.has('p') => {
                 let ms = match a.get('d') {
-                    Some(d) => d.parse().map_err(|_| CmdError(format!("delay invalid: {d}")))?,
+                    Some(d) => parse_delay(d)?,
                     None => self.sopt(Some(f.s), "display-time").as_num() as u64,
                 };
                 host.show_message(c, &msg, ms);
@@ -1140,11 +1273,13 @@ impl Model {
         {
             return err(format!("create window failed: index {i} in use"));
         }
+        // Refuse before starting a process that would only be killed.
+        self.check_placement(&f, a).map_err(|e| CmdError(format!("create window failed: {}", e.0)))?;
         let cwd_default = self.default_cwd(ctx, Some(sid));
         let cwd = self.cwd_arg(a, Some(&f), ctx, &*host, cwd_default);
         let size = self.new_window_size(sid);
         let (wid, pid) = self.spawn_window(sid, name, &a.strings(0), cwd, size, ctx.client, host)?;
-        let (idx, shuffle, displaced) = match self.place_index(&f, a, None, "create window failed: ", host) {
+        let (idx, displaced) = match self.place_index(&f, a, None, "create window failed: ", host) {
             Ok(x) => x,
             Err(e) => {
                 host.kill_pane(pid);
@@ -1159,7 +1294,7 @@ impl Model {
             self.panes.remove(&pid);
             return err("session gone");
         }
-        self.insert_window(sid, idx, shuffle, wid);
+        self.insert_window(sid, idx, wid);
         self.replace_killed(displaced, wid, host);
         if !a.has('d') {
             self.select_window(sid, wid, host);
@@ -1191,6 +1326,7 @@ impl Model {
                     continue;
                 }
                 out.push_str(&format::expand(a.get('F').unwrap_or(default), &c));
+                check_list_output(&out)?;
                 out.push('\n');
             }
         }
@@ -1226,6 +1362,7 @@ impl Model {
                     continue;
                 }
                 out.push_str(&format::expand(fmt, &c));
+                check_list_output(&out)?;
                 out.push('\n');
             }
         }
@@ -1233,7 +1370,7 @@ impl Model {
     }
 
     /// Move window `wid` to `idx` in `dst` (another session or the same).
-    fn relink_window(&mut self, wid: WindowId, dst: SessionId, idx: u32, shuffle: bool, select: bool, host: &mut dyn Host) {
+    fn relink_window(&mut self, wid: WindowId, dst: SessionId, idx: u32, select: bool, host: &mut dyn Host) {
         let src = self.windows[&wid].session;
         let old_idx = self.windows[&wid].index;
         let s = self.sessions.get_mut(&src).expect("session");
@@ -1242,7 +1379,7 @@ impl Model {
         s.last.retain(|w| *w != wid);
         if src != dst {
             if s.windows.is_empty() {
-                self.insert_window(dst, idx, shuffle, wid);
+                self.insert_window(dst, idx, wid);
                 self.destroy_session(src, host);
             } else {
                 if was_current {
@@ -1256,13 +1393,13 @@ impl Model {
                     self.renumber(src);
                 }
                 host.redraw(Redraw::Session(src));
-                self.insert_window(dst, idx, shuffle, wid);
+                self.insert_window(dst, idx, wid);
             }
             if let Some(sz) = self.desired_size(dst, Some(wid)) {
                 self.resize_window(wid, sz, host);
             }
         } else {
-            self.insert_window(dst, idx, shuffle, wid);
+            self.insert_window(dst, idx, wid);
         }
         if select {
             self.select_window(dst, wid, host);
@@ -1280,11 +1417,11 @@ impl Model {
         let src = self.find_target(ctx, a.get('s'), Kind::Window, Flags::default())?;
         let wid = need_window(&src)?;
         let dst = self.find_target(ctx, a.get('t'), Kind::Window, Flags { window_index: true, ..Flags::default() })?;
-        let (idx, shuffle, displaced) = self.place_index(&dst, a, Some(wid), "", host)?;
+        let (idx, displaced) = self.place_index(&dst, a, Some(wid), "", host)?;
         if !self.windows.contains_key(&wid) || !self.sessions.contains_key(&dst.s) {
             return ok();
         }
-        self.relink_window(wid, dst.s, idx, shuffle, !a.has('d'), host);
+        self.relink_window(wid, dst.s, idx, !a.has('d'), host);
         self.replace_killed(displaced, wid, host);
         ok()
     }
@@ -1373,9 +1510,9 @@ impl Model {
             if info.current_path.is_empty() { self.sessions[&f.s].cwd.clone() } else { info.current_path.to_string() }
         };
         let cwd = self.cwd_arg(a, Some(&f), ctx, &*host, cwd_default);
+        let pid = self.alloc_pane()?;
         let was_zoomed = self.windows.get_mut(&wid).expect("window").layout.unzoom();
         let saved = self.windows[&wid].layout.clone();
-        let pid = self.alloc_pane();
         if let Err(e) = self.windows.get_mut(&wid).expect("window").layout.split(target, pid, axis, size, before) {
             if was_zoomed {
                 self.windows.get_mut(&wid).expect("window").layout.zoom(target);
@@ -1570,8 +1707,8 @@ impl Model {
         let name = a.get('n').map(|n| self.expand_found(&src, ctx, &*host, n));
         if self.windows[&sw].panes.len() == 1 {
             // Only one pane: move the whole window, as tmux does.
-            let (idx, shuffle, displaced) = if dst.idx.is_none() && !a.has('a') && !a.has('b') {
-                (self.first_free_index(dst.s), false, None)
+            let (idx, displaced) = if dst.idx.is_none() && !a.has('a') && !a.has('b') {
+                (self.first_free_index(dst.s)?, None)
             } else {
                 self.place_index(&dst, a, Some(sw), "", host)?
             };
@@ -1580,12 +1717,14 @@ impl Model {
                 w.name = n;
                 w.options.set("automatic-rename", Value::Flag(false));
             }
-            self.relink_window(sw, dst.s, idx, shuffle, !a.has('d'), host);
+            self.relink_window(sw, dst.s, idx, !a.has('d'), host);
             self.replace_killed(displaced, sw, host);
             let p = self.windows[&sw].active;
             return self.print_new(a, NEW_WINDOW, dst.s, sw, p, ctx, &*host);
         }
-        let (idx, shuffle, displaced) = self.place_index(&dst, a, None, "", host)?;
+        // Both can fail; take them before the pane leaves its window.
+        let wid = self.alloc_window()?;
+        let (idx, displaced) = self.place_index(&dst, a, None, "", host)?;
         // Take the pane out of its window.
         {
             let w = self.windows.get_mut(&sw).expect("window");
@@ -1603,7 +1742,6 @@ impl Model {
             w.panes.remove(pos);
         }
         self.sync_window(sw, host);
-        let wid = self.alloc_window();
         let size = self.new_window_size(dst.s);
         let mut options = OptionSet::default();
         let wname = match name {
@@ -1636,7 +1774,7 @@ impl Model {
             },
         );
         self.panes.get_mut(&p).expect("pane").window = wid;
-        self.insert_window(dst.s, idx, shuffle, wid);
+        self.insert_window(dst.s, idx, wid);
         self.replace_killed(displaced, wid, host);
         if !a.has('d') {
             self.select_window(dst.s, wid, host);
@@ -1746,11 +1884,15 @@ impl Model {
     fn cmd_send_keys(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let p = need_pane(&f)?;
-        if a.has('R') {
-            host.send_to_pane(p, PaneInput::Reset);
-        }
         let count = match a.get('N') {
-            Some(n) => n.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| CmdError(format!("repeat count invalid: {n}")))?,
+            Some(n) => match n.parse::<u64>() {
+                Ok(c) if c > MAX_REPEAT as u64 => return err(format!("repeat count too large: {n}")),
+                Ok(c) if c > 0 => c as u32,
+                _ if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n.bytes().any(|b| b != b'0') => {
+                    return err(format!("repeat count too large: {n}"));
+                }
+                _ => return err(format!("repeat count invalid: {n}")),
+            },
             None => 1,
         };
         let keys: Vec<String> = a
@@ -1765,29 +1907,59 @@ impl Model {
                 Some(d) if d == "--" => &rest[1..],
                 _ => rest,
             };
+            if a.has('R') {
+                host.send_to_pane(p, PaneInput::Reset).map_err(CmdError)?;
+            }
             return host.mode_command(ctx.client, p, name, rest, count).map(|()| CmdOutput::default()).map_err(CmdError);
         }
-        if a.has('H') {
+        // Everything is parsed and measured before anything is sent, so a
+        // command over the limits sends nothing.
+        enum Item<'k> {
+            Key(lif_types::KeyEvent),
+            Text(&'k str),
+        }
+        let (items, raw) = if a.has('H') {
             let mut bytes = Vec::with_capacity(keys.len());
             for k in &keys {
                 let b = u8::from_str_radix(k.trim_start_matches("0x"), 16).map_err(|_| CmdError::new("invalid key"))?;
                 bytes.push(b);
             }
-            for _ in 0..count {
-                host.send_to_pane(p, PaneInput::Bytes(&bytes));
-            }
+            (Vec::new(), bytes)
+        } else {
+            let items: Vec<Item> = keys
+                .iter()
+                .map(|k| match KeyCode::parse(k).filter(|_| !a.has('l')) {
+                    Some(code) => Item::Key(code.to_event()),
+                    None => Item::Text(k),
+                })
+                .collect();
+            (items, Vec::new())
+        };
+        let per_round: u64 = raw.len() as u64
+            + items.iter().map(|i| match i {
+                Item::Key(_) => KEY_INPUT_BYTES,
+                Item::Text(t) => t.len() as u64,
+            }).sum::<u64>();
+        let total = per_round * count as u64;
+        if total > MAX_SEND_BYTES {
+            return err(format!("too much input: {total} bytes (at most {MAX_SEND_BYTES} per command)"));
+        }
+        if a.has('R') {
+            host.send_to_pane(p, PaneInput::Reset).map_err(CmdError)?;
+        }
+        if items.is_empty() && raw.is_empty() {
             return ok();
         }
         for _ in 0..count {
-            for k in &keys {
-                if !a.has('l')
-                    && let Some(code) = KeyCode::parse(k)
-                {
-                    let ev = code.to_event();
-                    host.send_to_pane(p, PaneInput::Key(&ev));
-                } else {
-                    host.send_to_pane(p, PaneInput::Text(k));
-                }
+            if !raw.is_empty() {
+                host.send_to_pane(p, PaneInput::Bytes(&raw)).map_err(CmdError)?;
+            }
+            for i in &items {
+                let input = match i {
+                    Item::Key(ev) => PaneInput::Key(ev),
+                    Item::Text(t) => PaneInput::Text(t),
+                };
+                host.send_to_pane(p, input).map_err(CmdError)?;
             }
         }
         ok()
@@ -1795,8 +1967,21 @@ impl Model {
 
     /// tmux's `source-file` for lif's TOML files: every command that can
     /// run does; problems (the file's and the commands') are logged for
-    /// `show-messages` and returned as the error, one per line.
+    /// `show-messages` and returned as the error, one per line. Files may
+    /// source files, at most [`MAX_SOURCE_DEPTH`] deep (a file that sources
+    /// itself would otherwise recurse until the stack overflows).
     fn cmd_source_file(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let depth = SOURCE_DEPTH.get();
+        if depth >= MAX_SOURCE_DEPTH {
+            return err("too many nested files");
+        }
+        SOURCE_DEPTH.set(depth + 1);
+        let r = self.source_files(a, ctx, host);
+        SOURCE_DEPTH.set(depth);
+        r
+    }
+
+    fn source_files(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let mut out = String::new();
         let mut errors: Vec<String> = Vec::new();
         for path in a.strings(0) {
@@ -1851,7 +2036,12 @@ impl Model {
             match v {
                 None => Ok(default),
                 Some("-") => Ok(dash),
-                Some(s) => s.parse::<i64>().map(LinePos::Line).map_err(|_| CmdError(format!("line invalid: {s}"))),
+                // Clamped (the host clamps to the lines there are anyway) so the
+                // host's line arithmetic cannot overflow.
+                Some(s) => s
+                    .parse::<i64>()
+                    .map(|n| LinePos::Line(n.clamp(-(i32::MAX as i64), i32::MAX as i64)))
+                    .map_err(|_| CmdError(format!("line invalid: {s}"))),
             }
         };
         let range = CaptureRange {
@@ -1892,7 +2082,7 @@ impl Model {
             }
             out
         };
-        host.send_to_pane(p, PaneInput::Paste { data: &data, bracketed: a.has('p') });
+        host.send_to_pane(p, PaneInput::Paste { data: &data, bracketed: a.has('p') }).map_err(CmdError)?;
         if a.has('d') {
             self.buffers.remove(i);
         }

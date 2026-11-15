@@ -286,10 +286,16 @@ fn output_during_copy_mode_does_not_move_the_view() {
     let start = offset(&t);
     t.write(b"\x1b[5~");
     t.wait_for("paged up", secs(10), |t| offset(t) == start + 21);
-    let before: Vec<String> = t.lines()[1..].to_vec();
+    // The last row is the status line, whose clock may tick between the two
+    // looks; compare the pane's rows only.
+    let pane_rows = |t: &Term| -> Vec<String> {
+        let l = t.lines();
+        l[1..l.len() - 1].to_vec()
+    };
+    let before = pane_rows(&t);
     env.wait_capture("o", "late39");
     t.settle(Duration::from_millis(200));
-    assert_eq!(t.lines()[1..].to_vec(), before, "the view stayed on its rows");
+    assert_eq!(pane_rows(&t), before, "the view stayed on its rows");
     // The rows that arrived are counted below the view.
     assert!(offset(&t) >= start + 21 + 40, "{}", t.lines()[0]);
     t.write(b"q");

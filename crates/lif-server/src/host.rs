@@ -88,6 +88,8 @@ pub(crate) struct Rt {
     /// `copy-pipe` commands still being fed, by id (`PIPE_TOKEN | id`).
     pub(crate) pipes: HashMap<u32, crate::pipe::PipeJob>,
     pub(crate) next_pipe: u32,
+    /// The RLIMIT_NOFILE soft limit (0: unknown).
+    pub(crate) fd_limit: usize,
 }
 
 pub(crate) fn pane_token(p: PaneId) -> Token {
@@ -132,6 +134,7 @@ impl Rt {
             mode_bindings: Vec::new(),
             pipes: HashMap::new(),
             next_pipe: 0,
+            fd_limit: 0,
         }
     }
 
@@ -169,29 +172,147 @@ impl Rt {
         }
     }
 
-    /// Queue bytes for a pane's program and try to write them now.
-    pub(crate) fn write_pane(&mut self, pane: PaneId, bytes: &[u8]) {
+    /// Queue bytes for a pane's program and try to write them now. Every
+    /// byte for a pane goes through here (keys, pastes, `send-keys`,
+    /// terminal replies, reports), so this is where the queue's one hard
+    /// bound, [`crate::PANE_INPUT_MAX`], holds: bytes that would take the
+    /// queue past it are not queued at all, and false says so; the caller
+    /// decides what that means (replies and reports are dropped, as a real
+    /// terminal drops them; commands fail; typed input is dropped with a
+    /// message). False also when the pane has no program to write to.
+    pub(crate) fn write_pane(&mut self, pane: PaneId, bytes: &[u8]) -> bool {
+        self.queue_pane(pane, bytes, crate::PANE_INPUT_MAX - crate::PANE_INPUT_RESERVE)
+    }
+
+    /// [`Rt::write_pane`] for the few bytes that end a state the program
+    /// was put in (the end of a bracketed paste): they may use the reserve
+    /// kept below the hard bound, so a paste that was let in is closed.
+    pub(crate) fn write_pane_closing(&mut self, pane: PaneId, bytes: &[u8]) -> bool {
+        self.queue_pane(pane, bytes, crate::PANE_INPUT_MAX)
+    }
+
+    fn queue_pane(&mut self, pane: PaneId, bytes: &[u8], limit: usize) -> bool {
         if bytes.is_empty() {
-            return;
+            return true;
         }
-        let Some(p) = self.panes.get_mut(&pane) else { return };
+        let Some(p) = self.panes.get(&pane) else { return false };
         if p.pty.is_none() {
-            return;
+            return false;
         }
+        if p.wq.len() + bytes.len() > limit {
+            // The program may have read since the last write.
+            self.flush_pane(pane);
+            let Some(p) = self.panes.get(&pane) else { return false };
+            if p.wq.len() + bytes.len() > limit {
+                return false;
+            }
+        }
+        let Some(p) = self.panes.get_mut(&pane) else { return false };
         p.wq.push(bytes);
         self.flush_pane(pane);
+        true
     }
 
     /// [`Rt::write_pane`] for input a client typed (keys, mouse, paste):
     /// the pane's next output is its echo (see `crate::ECHO_WINDOW`).
-    pub(crate) fn write_input(&mut self, pane: PaneId, bytes: &[u8]) {
+    pub(crate) fn write_input(&mut self, pane: PaneId, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
-            return;
+            return true;
         }
         if let Some(p) = self.panes.get_mut(&pane) {
             p.note_input(Instant::now());
         }
-        self.write_pane(pane, bytes);
+        self.write_pane(pane, bytes)
+    }
+
+    /// Stop using `client`'s terminal for now and say so with `Suspended`
+    /// (`ClientMsg::Suspend`, `suspend-client`): its modes are restored
+    /// (the bytes for that go out before the message), no frame, other
+    /// output or read touches it until `Rt::resume`.
+    pub(crate) fn suspend(&mut self, id: ClientId) -> Result<(), String> {
+        let Some(c) = self.clients.get_mut(&id) else { return Err("no such client".into()) };
+        if !c.caps.contains(lif_proto::Caps::SUSPEND) {
+            return Err("suspend-client: this client cannot be suspended (it is an older lif)".into());
+        }
+        let Some(a) = c.att.as_mut() else { return Err("client is not attached".into()) };
+        if a.suspended.is_none() {
+            let mut b = Vec::new();
+            leave_bytes(a, &mut b);
+            a.mouse = (false, false);
+            c.send_output(&b);
+            if let Some(a) = c.att.as_mut() {
+                a.suspended = Some(crate::client::Suspension::Stopped);
+            }
+            if let Some(t) = c.tty_mut() {
+                t.reading = false;
+                t.read_more = false;
+            }
+            log!("client {id}: suspended");
+        }
+        c.send(&ServerMsg::Suspended);
+        self.flush_client(id);
+        self.end_paste(id);
+        Ok(())
+    }
+
+    /// The client is running again in the foreground (`ClientMsg::Resume`):
+    /// take the terminal back, set its modes, draw it all. Whatever it
+    /// shows now (a shell, its prompt) is not ours. A client that is not
+    /// in the foreground of the terminal the server reads stays suspended.
+    pub(crate) fn resume(&mut self, id: ClientId) {
+        let Some(c) = self.clients.get_mut(&id) else { return };
+        if c.att.is_none() {
+            return;
+        }
+        if let Some(t) = c.tty_mut() {
+            if t.dead {
+                return;
+            }
+            t.background = false;
+            if t.usable() {
+                t.reading = true;
+                t.read_more = true;
+            } else {
+                log!("client {id}: resumed but not in the foreground");
+                if let Some(a) = c.att.as_mut() {
+                    a.suspended.get_or_insert(crate::client::Suspension::Background);
+                }
+                self.flush_client(id);
+                return;
+            }
+        }
+        let Some(a) = c.att.as_mut() else { return };
+        let mut b = Vec::new();
+        lif_input::write_enter(&a.enter_caps, &mut b);
+        if a.kitty_pushed {
+            lif_input::write_kitty_upgrade(&mut b);
+        }
+        a.suspended = None;
+        // draw_client sends the mouse mode again.
+        a.mouse = (false, false);
+        a.renderer.invalidate();
+        a.needs_frame = true;
+        a.status_stale = true;
+        a.last_frame = None;
+        c.send_output(&b);
+        c.arm_panic();
+        log!("client {id}: resumed");
+        self.flush_client(id);
+    }
+
+    /// A paste `client` was streaming into a pane is over before its end
+    /// arrived (the client left, detached or the pane changed): end it for
+    /// the program, which would otherwise take everything typed later as
+    /// pasted text.
+    pub(crate) fn end_paste(&mut self, client: ClientId) {
+        let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
+        a.paste_dropping = false;
+        let Some(pane) = a.paste.take() else { return };
+        if let Some(p) = self.panes.get_mut(&pane)
+            && p.paste_bracketed.take() == Some(true)
+        {
+            self.write_pane_closing(pane, b"\x1b[201~");
+        }
     }
 
     /// Write a pane's queue and keep WRITABLE interest in step with it.
@@ -232,14 +353,15 @@ impl Rt {
                     let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
                     let _ = self.registry.reregister(&mut c.stream, c.token, interest);
                 }
-                if let Some(t) = c.tty_mut()
-                    && !t.dead
-                    && tty != t.want_write
-                {
-                    t.want_write = tty;
-                    let interest = if tty { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
-                    let fd = std::os::fd::AsRawFd::as_raw_fd(&t.fd);
-                    let _ = self.registry.reregister(&mut SourceFd(&fd), t.token, interest);
+                // The terminal went to the background during the flush:
+                // the client is stopped, and the terminal is its shell's.
+                let background = c.tty().is_some_and(|t| t.background);
+                if background && let Some(a) = c.att.as_mut() && a.suspended.is_none() {
+                    log!("client {id}: not in the foreground of its terminal; leaving it alone");
+                    a.suspended = Some(crate::client::Suspension::Background);
+                }
+                if let Some(t) = c.tty_mut() {
+                    tty_interest(&self.registry, t);
                 }
                 if !sock && !tty && c.closing {
                     c.dead = true;
@@ -338,6 +460,8 @@ impl Rt {
             focused: true,
             active_pane: None,
             paste: None,
+            paste_dropping: false,
+            suspended: None,
             clip_reads: Default::default(),
             theme: lif_render::Theme::default(),
             msg_style: crate::prompt::message_style(),
@@ -366,6 +490,27 @@ impl Rt {
     }
 }
 
+/// Registers a client terminal's fd for what it is wanted for now (see
+/// `Tty::wanted_interest`), deregistering it when for nothing: a
+/// terminal that belongs to a shell for now must not wake the loop.
+pub(crate) fn tty_interest(registry: &Registry, t: &mut crate::client::Tty) {
+    let want = t.wanted_interest();
+    if want == t.interest {
+        return;
+    }
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&t.fd);
+    let r = match (t.interest, want) {
+        (None, Some(i)) => registry.register(&mut SourceFd(&fd), t.token, i),
+        (Some(_), Some(i)) => registry.reregister(&mut SourceFd(&fd), t.token, i),
+        (Some(_), None) => registry.deregister(&mut SourceFd(&fd)),
+        (None, None) => Ok(()),
+    };
+    match r {
+        Ok(()) => t.interest = want,
+        Err(e) => log!("terminal registration: {e}"),
+    }
+}
+
 impl PaneRt {
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         self.pty.as_ref().map(std::os::fd::AsRawFd::as_raw_fd).unwrap_or(-1)
@@ -382,7 +527,19 @@ fn exit_message(reason: &DetachReason) -> (ExitReason, String) {
 }
 
 impl Host for Rt {
+    fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
+        self.suspend(client)
+    }
+
     fn spawn_pane(&mut self, spec: &SpawnSpec) -> Result<(), String> {
+        // Panes must not take the last descriptors: clients still need
+        // some to connect (and to run kill-pane).
+        if self.fd_limit > 0 {
+            let open = crate::sys::open_fd_count();
+            if open + crate::FD_RESERVE >= self.fd_limit {
+                return Err(format!("cannot create a pane: {open} of {} file descriptors in use", self.fd_limit));
+            }
+        }
         let argv: Vec<OsString> = match &spec.command {
             SpawnCommand::LoginShell { .. } => Vec::new(),
             SpawnCommand::Shell { shell, command } => vec![shell.into(), "-c".into(), command.into()],
@@ -485,7 +642,7 @@ impl Host for Rt {
         self.views_stale = true;
     }
 
-    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) {
+    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) -> Result<(), String> {
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
         if let Some(p) = self.panes.get_mut(&pane) {
@@ -515,8 +672,16 @@ impl Host for Rt {
                 }
             }
         }
-        self.write_pane(pane, &buf);
+        let queued = self.write_pane(pane, &buf);
+        let len = buf.len();
         self.scratch = buf;
+        if queued || len == 0 {
+            Ok(())
+        } else if self.panes.get(&pane).is_some_and(|p| p.pty.is_some()) {
+            Err(format!("pane {pane}: input queue full ({len} bytes not sent; the program is not reading its input)"))
+        } else {
+            Err(format!("pane {pane}: the program has exited"))
+        }
     }
 
     fn pane_info(&self, pane: PaneId) -> PaneInfo<'_> {
@@ -593,17 +758,36 @@ impl Host for Rt {
     }
 
     fn detach_client(&mut self, client: ClientId, reason: DetachReason) {
+        if !self.clients.contains_key(&client) {
+            return;
+        }
+        let (why, mut message) = exit_message(&reason);
+        // A session name is user input: keep the message to a line.
+        if message.len() > 1024 {
+            let mut end = 1024;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        self.end_paste(client);
         let Some(c) = self.clients.get_mut(&client) else { return };
-        let (why, message) = exit_message(&reason);
         if let Some(mut att) = c.att.take() {
             let mut b = Vec::new();
             leave_bytes(&mut att, &mut b);
-            c.send_output(&b);
+            if c.tty_mut().is_some_and(|t| !t.dead && !t.usable()) {
+                // The terminal is the shell's now (the client was stopped
+                // without a word): the client writes the restore when it
+                // is continued, before it reads the Exit.
+                c.send_terminal_via_socket(&b);
+            } else {
+                c.send_output(&b);
+            }
             c.disarm_panic();
         }
         c.send(&ServerMsg::Exit { reason: why, message });
         c.closing = true;
-        log!("client {client} detached: {reason:?}");
+        log!("client {client} detached: {why:?}");
         self.flush_client(client);
         self.views_stale = true;
     }
@@ -763,22 +947,22 @@ pub(crate) fn read_config(path: &str) -> Result<ConfigFile, ConfigError> {
     if lif_config::looks_like_tmux_conf(path) {
         return Err(hint());
     }
-    match std::fs::metadata(&file) {
+    // Read once, with lif-config's limits: the server is one thread, so a
+    // FIFO, a device or a huge file here would stall or exhaust every session.
+    let bytes = match lif_config::read_file_limited(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ConfigError::Missing(format!("{path}: No such file or directory")));
         }
         Err(e) => return Err(ConfigError::Invalid(format!("{path}: {e}"))),
-        Ok(_) => {}
-    }
-    let cfg = lif_config::Config::load_file(&file);
+        Ok(b) => b,
+    };
+    let cfg = lif_config::Config::from_bytes(&bytes);
     // Not TOML at all, but tmux commands: point at the translator rather
     // than at a TOML syntax error.
     if cfg.commands.is_empty()
         && cfg.has_errors()
-        && let Ok(text) = std::fs::read_to_string(&file)
-        && let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'))
-        && lif_core::parse_string(first).is_ok_and(|l| !l.is_empty())
-        && !first.contains('=')
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && lif_config::looks_like_tmux_commands(text)
     {
         return Err(hint());
     }

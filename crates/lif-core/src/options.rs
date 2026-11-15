@@ -258,7 +258,7 @@ pub(crate) fn parse_value(def: &Def, current: &Value, text: Option<&str>, append
 pub(crate) fn parse_dim(s: &str) -> Option<(u16, u16)> {
     let (w, h) = s.split_once('x')?;
     let (w, h) = (w.parse::<u16>().ok()?, h.parse::<u16>().ok()?);
-    (w > 0 && h > 0).then_some((w, h))
+    (w > 0 && h > 0 && crate::model::size_allowed(w, h)).then_some((w, h))
 }
 
 /// Text form of a value, unescaped (`show-options -v`).

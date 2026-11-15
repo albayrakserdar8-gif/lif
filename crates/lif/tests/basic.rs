@@ -203,7 +203,15 @@ fn last_pane_exit_ends_everything() {
     assert!(t.screen().contains("[exited]"), "{}", t.screen());
     assert!(!t.modes().alt_screen);
     assert!(env.wait(Duration::from_secs(5), || !path_exists(&env.sock)), "socket removed");
-    assert!(!path_exists(&env.sock.with_extension("lock")));
+    // The lock file stays (removing it would let two clients starting a
+    // server each lock a different file), but nobody holds its lock.
+    // (The socket goes first; the lock goes with the process.)
+    let lock = std::fs::File::open(env.sock.with_extension("lock")).expect("lock file");
+    let free = env.wait(Duration::from_secs(5), || {
+        // SAFETY: flock on a file we opened; closing it releases the lock.
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    });
+    assert!(free, "the exited server still holds the lock");
     let o = env.run(&["ls"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&o.stderr), format!("no server running on {}\n", env.sock.display()));

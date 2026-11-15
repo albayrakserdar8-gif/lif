@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 lif-types.workspace = true
 lif-core.workspace = true
+# O_NONBLOCK / O_NOCTTY for opening config files (read_file_limited).
+libc.workspace = true
 # Spec-complete TOML parser without serde or proc macros ("parse" only):
 # about 83 KB of release binary, measured; see the crate docs.
 toml = { version = "1", default-features = false, features = ["std", "parse"] }

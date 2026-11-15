@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,9 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static FILE: Mutex<Option<(File, Option<Instant>)>> = Mutex::new(None);
 
 pub(crate) fn init(path: &Path) {
-    if let Ok(f) = File::options().create(true).append(true).open(path)
+    // The log holds commands and names: the user's eyes only. Never
+    // through a symlink someone planted at the path.
+    if let Ok(f) = File::options().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
         && let Ok(mut g) = FILE.lock()
     {
         *g = Some((f, Some(Instant::now())));

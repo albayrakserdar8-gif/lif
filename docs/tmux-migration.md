@@ -114,7 +114,7 @@ accepted without changing anything are listed in
 | `source-file` (`source`) | supported with differences | reads lif TOML files only; a `.conf` file or a file of tmux commands is refused with a pointer to `lif migrate-tmux-conf` |
 | `split-window` (`splitw`) | supported with differences | has `-b -c -d -F -h -l -p -P -t -v -Z`; no `-e`, `-f`, `-I`, `-k`, `-m`, `-W`, `-B`, `-R`, `-s`, `-S`, `-T` |
 | `start-server` (`start`) | supported | |
-| `suspend-client` (`suspendc`) | not supported | |
+| `suspend-client` (`suspendc`) | supported | |
 | `swap-pane` (`swapp`) | supported | |
 | `swap-window` (`swapw`) | supported | |
 | `switch-client` (`switchc`) | supported with differences | no `-E`, `-O`, `-r` |
@@ -235,7 +235,7 @@ commands are cut at 70 characters.
 | `M-Right` | `[repeat] resize-pane -R 5` | `[repeat] resize-pane -R 5` | same |
 | `C-b` | `send-prefix` | `send-prefix` | same |
 | `C-o` | `rotate-window` | `rotate-window` | same |
-| `C-z` | `suspend-client` |  | missing in lif |
+| `C-z` | `suspend-client` | `suspend-client` | same |
 | `C-Up` | `[repeat] if-shell -F "#{?floating_pane_flag}" { resize-pane -D -1 }...` | `[repeat] resize-pane -U` | different |
 | `C-Down` | `[repeat] resize-pane -D --` | `[repeat] resize-pane -D` | different |
 | `C-Left` | `[repeat] if-shell -F "#{?floating_pane_flag}" { resize-pane -R -1 }...` | `[repeat] resize-pane -L` | different |

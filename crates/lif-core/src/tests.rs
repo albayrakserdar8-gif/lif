@@ -33,6 +33,8 @@ struct TestHost {
     configs: HashMap<String, ConfigFile>,
     /// Clients whose parent process got SIGHUP.
     hangups: Vec<ClientId>,
+    /// spawn_pane and kill_pane calls in order, for the fuzz test.
+    events: Vec<ProcEvent>,
 }
 
 impl Host for TestHost {
@@ -41,16 +43,18 @@ impl Host for TestHost {
             return Err("fork failed: Resource temporarily unavailable".into());
         }
         self.spawned.push(spec.clone());
+        self.events.push(ProcEvent::Spawn { pane: spec.pane, respawn: spec.respawn });
         self.resized.insert(spec.pane, spec.size);
         Ok(())
     }
     fn kill_pane(&mut self, pane: PaneId) {
         self.killed.push(pane);
+        self.events.push(ProcEvent::Kill(pane));
     }
     fn resize_pane(&mut self, pane: PaneId, size: Size) {
         self.resized.insert(pane, size);
     }
-    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) {
+    fn send_to_pane(&mut self, pane: PaneId, input: PaneInput<'_>) -> Result<(), String> {
         let s = match input {
             PaneInput::Key(k) => format!("key:{}", KeyCode::from_event(k).map(|k| k.to_string()).unwrap_or_default()),
             PaneInput::Text(t) => format!("text:{t}"),
@@ -59,10 +63,11 @@ impl Host for TestHost {
             PaneInput::Reset => "reset".into(),
         };
         self.sent.push((pane, s));
+        Ok(())
     }
     fn pane_info(&self, pane: PaneId) -> PaneInfo<'_> {
         PaneInfo {
-            pid: 1000 + pane.0,
+            pid: 1000u32.wrapping_add(pane.0),
             title: self.titles.get(&pane).map(|s| s.as_str()).unwrap_or(""),
             current_command: self.commands.get(&pane).map(|s| s.as_str()).unwrap_or("zsh"),
             current_path: self.paths.get(&pane).map(|s| s.as_str()).unwrap_or(""),
@@ -210,7 +215,39 @@ fn check_model(m: &Model) {
     for c in m.clients() {
         if let Some(s) = c.session {
             assert!(m.session(s).is_some(), "client attached to a dead session");
+            let view = m.client_view(c.id).expect("an attached client has a view");
+            let w = m.window(view.window).expect("viewed window exists");
+            assert_eq!(w.session, s, "client views a window of another session");
+            for (p, _) in &view.panes {
+                assert_eq!(m.pane(*p).expect("viewed pane exists").window, w.id);
+            }
         }
+        if let Some(s) = c.last_session {
+            assert!(m.session(s).is_some(), "client's last session is dead");
+        }
+    }
+    // Every window and pane is reachable from exactly one place, every index
+    // is in range and every id came from its counter.
+    for (wid, w) in &m.windows {
+        assert_eq!(*wid, w.id);
+        assert!(w.id.0 < m.next_window && w.id.0 != u32::MAX, "window id {} not from the counter", w.id);
+        assert!(w.index <= crate::model::MAX_WINDOW_INDEX, "window index {} too big", w.index);
+        let s = m.session(w.session).expect("window's session exists");
+        assert_eq!(s.windows.get(&w.index), Some(wid), "window {wid} not linked at its index");
+    }
+    let mut owner: HashMap<PaneId, WindowId> = HashMap::new();
+    for w in m.windows.values() {
+        for p in &w.panes {
+            assert!(owner.insert(*p, w.id).is_none(), "pane {p} in two windows (or twice in one)");
+        }
+    }
+    for (pid, p) in &m.panes {
+        assert_eq!(*pid, p.id);
+        assert!(p.id.0 < m.next_pane && p.id.0 != u32::MAX, "pane id {} not from the counter", p.id);
+        assert_eq!(owner.get(pid), Some(&p.window), "pane {pid} not in the window it points at");
+    }
+    for s in m.sessions() {
+        assert!(s.id.0 < m.next_session && s.id.0 != u32::MAX, "session id {} not from the counter", s.id);
     }
 }
 
@@ -948,40 +985,243 @@ impl Rng {
     }
 }
 
-#[test]
-fn random_commands_keep_the_model_consistent() {
-    let cmds = [
-        "splitw", "splitw -h", "splitw -b -l 3", "splitw -d -h -p 70", "killp", "killp -t :.+", "neww", "neww -d", "neww -a",
-        "kill-window", "selectp -L", "selectp -R", "selectp -U", "selectp -D", "lastp", "last", "next", "prev",
-        "swapp -U", "swapp -D", "rotatew", "rotatew -D", "resizep -Z", "resizep -L 3", "resizep -D 2", "resizep -x 20%",
-        "selectl tiled", "selectl main-vertical", "selectl -E", "nextl", "breakp", "breakp -d", "movew -r",
-        "swapw -t :+", "new -d", "switchc -n", "selectw -t :^", "selectw -l", "respawnp -k", "selectl -o",
-        "set -g renumber-windows on", "set -g renumber-windows off", "neww -k -t :0", "movew -t :9",
-    ];
-    for seed in 1..40u64 {
-        let mut t = T::with_session();
-        let c = t.attach_client(1, 100, 40);
-        t.ctx = CmdContext::client(c, NOW);
-        t.ok("attach");
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        for _ in 0..200 {
-            if t.m.sessions().count() == 0 {
-                break;
-            }
-            if rng.next().is_multiple_of(10) {
-                let panes: Vec<PaneId> = t.m.panes().map(|p| p.id()).collect();
-                let p = panes[(rng.next() % panes.len() as u64) as usize];
-                t.m.pane_exited(p, Some(0), &mut t.h);
-                check_model(&t.m);
-                continue;
-            }
-            let cmd = rng.pick(&cmds);
-            let _ = t.run(cmd);
-            if t.m.client(c).and_then(|c| c.session()).is_none() && t.m.sessions().count() > 0 {
-                t.ok("attach");
+/// What the fuzz test's host saw happen to pane processes, in order.
+#[derive(Clone, Copy, Debug)]
+enum ProcEvent {
+    Spawn { pane: PaneId, respawn: bool },
+    Kill(PaneId),
+}
+
+/// Replays [`TestHost::events`] to check the model never leaks a process,
+/// never starts two for one pane and never reuses a pane id.
+#[derive(Default)]
+struct Procs {
+    /// Panes with a running process.
+    live: std::collections::HashSet<PaneId>,
+    /// Panes whose process exited (reported with `pane_exited`).
+    exited: std::collections::HashSet<PaneId>,
+    /// Every pane id ever spawned.
+    seen: std::collections::HashSet<PaneId>,
+    /// Events of `TestHost::events` already replayed.
+    done: usize,
+}
+
+impl Procs {
+    fn exited(&mut self, p: PaneId) {
+        assert!(self.live.remove(&p), "{p} exited without a process");
+        self.exited.insert(p);
+    }
+
+    fn check(&mut self, h: &TestHost, m: &Model, step: &str) {
+        for ev in &h.events[self.done..] {
+            match *ev {
+                ProcEvent::Spawn { pane, respawn } => {
+                    assert!(!self.live.contains(&pane), "{step}: spawned {pane}, which still has a process");
+                    if respawn {
+                        assert!(self.seen.contains(&pane), "{step}: respawned {pane}, which never ran");
+                    } else {
+                        assert!(self.seen.insert(pane), "{step}: pane id {pane} reused");
+                    }
+                    self.exited.remove(&pane);
+                    self.live.insert(pane);
+                }
+                ProcEvent::Kill(pane) => {
+                    // Killing a pane whose process is gone (exited, or a
+                    // failed respawn) is harmless; any other kill is not.
+                    assert!(self.live.remove(&pane) || self.exited.contains(&pane), "{step}: killed {pane}, which never ran");
+                    self.exited.insert(pane);
+                }
             }
         }
+        self.done = h.events.len();
+        for p in &self.live {
+            assert!(m.pane(*p).is_some(), "{step}: leaked the process of {p}");
+        }
+        for p in m.panes() {
+            assert!(p.is_dead() || self.live.contains(&p.id()), "{step}: {} has no process", p.id());
+        }
     }
+}
+
+#[test]
+fn random_commands_keep_the_model_consistent() {
+    // Window indices at the edges: 0, base-index values, the maximum and
+    // its neighbours, and values past it up to u32::MAX.
+    const IDX: [&str; 9] = ["0", "1", "2", "2147483646", "2147483647", "2147483648", "4294967294", "4294967295", "+1"];
+    const SESSIONS: [&str; 5] = ["a", "b", "c", "1", "2"];
+    let plain = [
+        "splitw", "splitw -h", "splitw -b -l 3", "splitw -d -h -p 70", "killp", "killp -t :.+", "killp -a", "neww", "neww -d", "neww -a",
+        "neww -b", "kill-window", "selectp -L", "selectp -R", "selectp -U", "selectp -D", "lastp", "last", "next", "prev",
+        "swapp -U", "swapp -D", "rotatew", "rotatew -D", "resizep -Z", "resizep -L 3", "resizep -D 2", "resizep -x 20%",
+        "selectl tiled", "selectl main-vertical", "selectl -E", "nextl", "breakp", "breakp -d", "breakp -a", "breakp -b -d", "movew -r",
+        "swapw -t :+", "new -d", "new -d -x 200 -y 60", "new -d -x 20 -y 5", "switchc -n", "switchc -p", "switchc -l", "selectw -t :^",
+        "selectw -l", "respawnp -k", "respawnp", "selectl -o", "joinp", "joinp -s :+", "detach", "detach -a", "attach", "attach -d",
+        "kill-session", "kill-session -a", "set -g renumber-windows on", "set -g renumber-windows off", "neww -k -t :0", "movew -t :9",
+        "set -g base-index 0", "set -g base-index 1", "set -g base-index 2147483646", "set -g base-index 2147483647", "set base-index 2",
+        "set -g remain-on-exit on", "set -g remain-on-exit off", "set -g detach-on-destroy off", "set -g detach-on-destroy on",
+        "set -g detach-on-destroy no-detached", "set -g detach-on-destroy previous", "set -g detach-on-destroy next",
+        "set -g window-size largest", "set -g window-size smallest", "set -g window-size latest",
+    ];
+    let indexed = [
+        "neww -d -t :{i}", "neww -t :{i}", "neww -a -t :{i}", "neww -b -d -t :{i}", "neww -k -t :{i}", "neww -t {s}:{i}",
+        "movew -t :{i}", "movew -a -t :{i}", "movew -b -t :{i}", "movew -k -t :{i}", "movew -s :{i} -t {s}:", "movew -t {s}:{i}",
+        "movew -d -a -s {s}: -t :{i}", "swapw -t :{i}", "swapw -s :{i} -t {s}:", "swapw -d -s {s}: -t :{i}", "selectw -t :{i}",
+        "selectw -t {s}:{i}", "breakp -t :{i}", "breakp -a -t :{i}", "breakp -d -s :{i} -t {s}:{i}", "breakp -b -t {s}:{i}",
+        "killw -t :{i}", "joinp -t :{i}", "respawnp -k -t :{i}", "kill-session -t {s}", "switchc -t {s}", "switchc -t {s}:{i}",
+        "attach -t {s}", "new -d -s {s} -x 30 -y 8", "new -d -s {s} -x 120 -y 50", "neww -t {s}:", "killp -t {s}:{i}.0",
+    ];
+    // LIF_FUZZ_SEEDS=5000 cargo test ... runs a deeper search; the default
+    // keeps the suite fast.
+    let seeds: u64 = std::env::var("LIF_FUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    for seed in 1..=seeds {
+        let mut t = T::with_session();
+        let mut procs = Procs::default();
+        procs.check(&t.h, &t.m, "start");
+        let sizes = [(100, 40), (60, 20), (200, 70)];
+        let mut connected = Vec::new();
+        for (n, (cols, rows)) in sizes.iter().enumerate() {
+            connected.push(t.attach_client(n as u32 + 1, *cols, *rows));
+        }
+        t.ctx = CmdContext::client(connected[0], NOW);
+        t.ok("attach");
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for step in 0..250 {
+            let roll = rng.next() % 100;
+            let what;
+            if t.m.sessions().count() == 0 {
+                t.ctx = CmdContext::none(NOW);
+                t.h.fail_spawn = false;
+                what = "new -d -s a".to_string();
+                t.ok(&what);
+            } else if roll < 6 {
+                let live: Vec<PaneId> = t.m.panes().filter(|p| !p.is_dead()).map(|p| p.id()).collect();
+                if live.is_empty() {
+                    continue;
+                }
+                let p = live[(rng.next() % live.len() as u64) as usize];
+                what = format!("pane_exited {p}");
+                procs.exited(p);
+                let status = if rng.next().is_multiple_of(2) { Some(0) } else { Some(1) };
+                t.m.pane_exited(p, status, &mut t.h);
+            } else if roll < 9 {
+                // A client connects, disconnects or resizes.
+                let id = (rng.next() % 4) as u32 + 1;
+                let c = ClientId(id);
+                if t.m.client(c).is_some() && rng.next().is_multiple_of(2) {
+                    what = format!("disconnect {c}");
+                    t.m.client_disconnect(c, &mut t.h);
+                } else if t.m.client(c).is_some() {
+                    let size = Size::new((rng.next() % 250) as u16 + 1, (rng.next() % 80) as u16 + 1);
+                    what = format!("resize {c} {size:?}");
+                    t.m.client_resized(c, size, &mut t.h);
+                } else {
+                    what = format!("connect {c}");
+                    t.attach_client(id, 80 + id as u16 * 10, 24 + id as u16 * 5);
+                }
+            } else if roll < 11 {
+                t.h.fail_spawn = !t.h.fail_spawn;
+                what = format!("fail_spawn {}", t.h.fail_spawn);
+            } else {
+                // Run as a random connected client, or with no client.
+                let clients: Vec<ClientId> = t.m.clients().map(|c| c.id()).collect();
+                let pick = rng.next() as usize % (clients.len() + 1);
+                t.ctx = match clients.get(pick) {
+                    Some(c) => CmdContext::client(*c, NOW),
+                    None => CmdContext::none(NOW),
+                };
+                what = if roll < 55 {
+                    rng.pick(&plain).to_string()
+                } else {
+                    rng.pick(&indexed).replace("{i}", rng.pick(&IDX)).replace("{s}", rng.pick(&SESSIONS))
+                };
+                let _ = t.run(&what);
+            }
+            let step = format!("seed {seed} step {step}: {what}");
+            check_model(&t.m);
+            procs.check(&t.h, &t.m, &step);
+        }
+    }
+}
+
+/// Window indices stop at base-index's maximum (tmux's INT_MAX). They used
+/// to wrap at u32::MAX: `neww -a` after window 4294967295 overwrote window 0
+/// in the session's index map, leaking its pane and process.
+#[test]
+fn window_indices_stop_at_the_maximum() {
+    let mut t = T::with_session();
+    let too_big = |i: &str| format!("window index too big: {i} (the largest is 2147483647)");
+    // The reported sequence: refused before any process starts.
+    assert_eq!(t.err("neww -t a:4294967295"), format!("create window failed: {}", too_big("4294967295")));
+    assert_eq!(t.err("neww -t a:2147483648"), format!("create window failed: {}", too_big("2147483648")));
+    assert_eq!(t.h.spawned.len(), 1);
+    t.ok("neww -a");
+    t.ok("breakp");
+    assert_eq!(t.ok("lsw -F '#{window_index}'"), "0\n2\n");
+    // The largest index works; nothing fits after it.
+    t.ok("neww -t a:2147483647");
+    assert_eq!(t.err("neww -a"), "create window failed: no free window index");
+    assert_eq!(t.err("neww -b"), "create window failed: no free window index");
+    assert_eq!(t.err("neww -a -t :+1"), format!("create window failed: {}", too_big("2147483648")));
+    t.ok("neww -d -t :2147483646");
+    assert_eq!(t.err("neww -b -t :2147483646"), "create window failed: no free window index");
+    assert_eq!(t.h.spawned.len(), 4, "a refused new-window must not start a process");
+    t.ok("splitw");
+    assert_eq!(t.err("breakp -a"), "no free window index");
+    assert_eq!(t.err("breakp -t :4294967295"), too_big("4294967295"));
+    assert_eq!(t.err("movew -s :0 -a -t :2147483646"), "no free window index");
+    assert_eq!(t.err("movew -s :0 -t :4294967295"), too_big("4294967295"));
+    assert_eq!(t.err("movew -s :0 -b -t :4294967295"), too_big("4294967295"));
+    assert!(t.err("selectw -t :4294967295").contains("can't find window"));
+    // Like tmux, -b shifts before the window leaves its place, so its own
+    // index does not count as room.
+    assert_eq!(t.err("movew -s :2147483647 -b -t :2147483646"), "no free window index");
+    assert_eq!(t.ok("lsw -F '#{window_index}'"), "0\n2\n2147483646\n2147483647\n");
+    // -b makes room by shifting up into the gap below the maximum.
+    t.ok("neww -d -b -t :0");
+    assert_eq!(t.ok("lsw -F '#{window_index}'"), "0\n1\n2\n2147483646\n2147483647\n");
+    assert_eq!(t.err("neww -d -a -t :2147483645"), "create window failed: no free window index");
+    // swap-window between extreme indices keeps them.
+    t.ok("swapw -s :0 -t :2147483647");
+    // With base-index at its maximum the only free index is taken.
+    t.ok("set -g base-index 2147483647");
+    assert_eq!(t.err("neww"), "create window failed: no free window index");
+    assert_eq!(t.err("breakp"), "no free window index");
+    // renumber-windows keeps every index at or below the maximum.
+    t.ok("movew -r");
+    assert_eq!(t.ok("lsw -F '#{window_index}'"), "2147483643\n2147483644\n2147483645\n2147483646\n2147483647\n");
+    t.ok("set -g base-index 0");
+    t.ok("movew -r");
+    assert_eq!(t.ok("lsw -F '#{window_index}'"), "0\n1\n2\n3\n4\n");
+    // A new session at the maximum base-index.
+    t.ok("set -g base-index 2147483647");
+    t.ok("new -d -s top");
+    assert_eq!(t.ok("lsw -t top -F '#{window_index}'"), "2147483647\n");
+    assert_eq!(t.err("neww -t top:"), "create window failed: no free window index");
+}
+
+/// Ids come from counters that are never reused; at the end of the range
+/// a command fails instead of wrapping onto a live id (or the u32::MAX
+/// placeholder the model uses for "no window yet").
+#[test]
+fn exhausted_ids_fail_cleanly() {
+    let mut t = T::with_session();
+    t.ok("splitw");
+    let spawned = t.h.spawned.len();
+    t.m.next_window = u32::MAX;
+    // break-pane must fail before it takes the pane out of its window.
+    assert_eq!(t.err("breakp"), "no free window id");
+    assert_eq!(t.m.windows.len(), 1);
+    assert_eq!(t.err("neww"), "create window failed: no free window id");
+    t.m.next_session = u32::MAX;
+    assert_eq!(t.err("new -d"), "no free session id");
+    assert_eq!(t.err("new -d -s named"), "no free session id");
+    t.m.next_pane = u32::MAX - 1;
+    t.m.next_window = u32::MAX - 1;
+    t.ok("neww");
+    assert_eq!(t.err("splitw"), "no free pane id");
+    assert_eq!(t.err("neww"), "create window failed: no free pane id");
+    assert_eq!(t.h.spawned.len(), spawned + 1, "no process for a refused command");
+    assert_eq!(t.m.sessions().count(), 1);
 }
 
 #[test]

@@ -67,6 +67,7 @@ fn parse_defaults(list: &[(&str, &str)]) -> HashMap<KeyCode, Binding> {
 const DEFAULTS: &[(&str, bool, &str)] = &[
     ("C-b", false, "send-prefix"),
     ("C-o", false, "rotate-window"),
+    ("C-z", false, "suspend-client"),
     ("Space", false, "next-layout"),
     ("!", false, "break-pane"),
     ("\"", false, "split-window"),

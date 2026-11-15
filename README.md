@@ -175,7 +175,7 @@ Checked against the command table and by running each one (they fail with
   `unlink-window`), `join-pane`, `resize-window`, `respawn-window`.
 - Environment commands (`set-environment`, `show-environment`), buffers to and
   from files (`load-buffer`, `save-buffer`), `clear-history`, locking,
-  `suspend-client`, `server-access`, prompt history.
+  `server-access`, prompt history.
 - Control mode (`-C`), marked panes, synchronized panes, pane titles set by
   `select-pane -T`, pane options (`set -p`), most of tmux's 204 options (lif
   has 60 of them, plus 2 of its own).
