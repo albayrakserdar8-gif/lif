@@ -683,11 +683,26 @@ class LifAdapter(Adapter):
         except (ValueError, IndexError):
             return None
 
+    def pane_pids(self):
+        r = self.lif("list-panes", "-a", "-F", "#{pane_pid}")
+        return [int(x) for x in r.stdout.split() if x.isdigit() and int(x) > 1] if r.returncode == 0 else []
+
     def stop(self):
         self.server_pids()
+        panes = self.pane_pids()
         self.lif("kill-server")
         if not wait_gone(self.pids):
             kill_tracked(self.pids, lambda c: self.sock() in c)
+        # A pane shell left behind would run (and may spin) through every
+        # later measurement.
+        if not wait_gone(panes, 2.0):
+            left = [p for p in panes if pid_alive(p)]
+            log(f"WARNING: pane processes outlived the lif server, killing {left}")
+            for p in left:
+                try:
+                    os.killpg(p, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def hf_create_kill(self):
         b = f"{self.binary_name()} -S {self.sock_dir}/hf.sock"

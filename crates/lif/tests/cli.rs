@@ -67,6 +67,56 @@ fn pane_process_gets_sighup() {
     assert!(env.wait(Duration::from_secs(5), || flag.exists()), "pane process did not get SIGHUP");
 }
 
+/// A pane running `script` in a second window of a new session; returns
+/// its id and the pid of its process (the leader of its process group).
+fn pane_running(env: &Env, script: &str) -> (String, u32) {
+    env.ok(&["new-session", "-d", "-s", "k"]);
+    env.ok(&["new-window", "-t", "k", script]);
+    let got = env.ok(&["display-message", "-p", "-t", "k", "#{pane_id} #{pane_pid}"]);
+    let (id, pid) = got.trim().split_once(' ').expect("pane id and pid");
+    (id.to_string(), pid.parse().expect("pane pid"))
+}
+
+/// A shell that ignores SIGHUP, and the child it waits for (which inherits
+/// that): what a hangup alone leaves running for good.
+const IGNORES_HUP: &str = "trap '' HUP; sleep 1000";
+
+#[test]
+fn kill_pane_kills_a_process_that_ignores_sighup() {
+    let env = Env::new();
+    let (id, pid) = pane_running(&env, IGNORES_HUP);
+    std::thread::sleep(Duration::from_millis(300)); // let sh install the trap
+    env.ok(&["kill-pane", "-t", &id]);
+    assert!(group_alive(pid), "killed before its grace period was over");
+    assert!(env.wait(Duration::from_secs(3), || !group_alive(pid)), "the pane's process group survived kill-pane");
+    assert_eq!(env.ok(&["display-message", "-p", "ok"]), "ok\n");
+}
+
+#[test]
+fn kill_server_kills_a_process_that_ignores_sighup() {
+    let env = Env::new();
+    let (_, pid) = pane_running(&env, IGNORES_HUP);
+    let server = env.server_pid();
+    std::thread::sleep(Duration::from_millis(300)); // let sh install the trap
+    env.ok(&["kill-server"]);
+    assert!(env.wait(Duration::from_secs(3), || !pid_alive(server)), "server did not exit");
+    assert!(!group_alive(pid), "the pane's process group outlived the server");
+}
+
+/// The wait for hung-up panes costs nothing when they exit on the hangup.
+#[test]
+fn kill_server_does_not_wait_for_panes_that_exit() {
+    let env = Env::new();
+    let (_, pid) = pane_running(&env, "exec sleep 1000");
+    let server = env.server_pid();
+    let t = std::time::Instant::now();
+    env.ok(&["kill-server"]);
+    assert!(env.wait(Duration::from_secs(3), || !pid_alive(server)), "server did not exit");
+    let took = t.elapsed();
+    assert!(took < Duration::from_millis(300), "the server took {took:?} to exit");
+    assert!(!group_alive(pid));
+}
+
 #[test]
 fn racing_clients_start_one_server() {
     for round in 0..4 {

@@ -226,6 +226,7 @@ fn a_client_restores_the_terminal_when_the_server_is_killed() {
     t.write(b"\x1b[200~"); // nothing: just make sure the server reads
     t.settle(Duration::from_millis(100));
     let pid = env.server_pid() as i32;
+    env.track_panes();
     signal(pid, libc::SIGKILL);
     let code = t.wait_exit();
     assert_eq!(code, 1);

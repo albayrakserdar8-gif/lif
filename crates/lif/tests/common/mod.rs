@@ -25,6 +25,21 @@ pub struct Env {
     pub sock: PathBuf,
     pub home: PathBuf,
     pub extra: Vec<(String, String)>,
+    /// Pane processes of a server the test ends by force, which cannot
+    /// clean up after itself: `Drop` kills them ([`Env::track_panes`]).
+    tracked: std::sync::Mutex<Vec<u32>>,
+}
+
+/// Whether process `pid` exists (a zombie counts until it is reaped).
+pub fn pid_alive(pid: u32) -> bool {
+    // SAFETY: probing a pid with signal 0.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Whether any process is left in process group `pgid`.
+pub fn group_alive(pgid: u32) -> bool {
+    // SAFETY: probing a process group with signal 0.
+    unsafe { libc::kill(-(pgid as i32), 0) == 0 }
 }
 
 impl Env {
@@ -39,7 +54,7 @@ impl Env {
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(".profile"), "PS1='$ '; export PS1\nunset PROMPT_COMMAND\n").unwrap();
-        Env { sock: dir.join("s"), dir, home, extra: Vec::new() }
+        Env { sock: dir.join("s"), dir, home, extra: Vec::new(), tracked: Default::default() }
     }
 
     /// Environment for every process the test starts.
@@ -104,6 +119,19 @@ impl Env {
             .collect()
     }
 
+    /// The process of every pane the server has (none if it does not answer).
+    pub fn pane_pids(&self) -> Vec<u32> {
+        let o = self.run(&["list-panes", "-a", "-F", "#{pane_pid}"]);
+        String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).filter(|p| *p > 1).collect()
+    }
+
+    /// Call before killing the server with SIGKILL: its panes then only get
+    /// the kernel's hangup, and what that does not end, `Drop` kills.
+    pub fn track_panes(&self) {
+        let pids = self.pane_pids();
+        self.tracked.lock().unwrap().extend(pids);
+    }
+
     pub fn server_pid(&self) -> u32 {
         let p = self.server_pids();
         assert_eq!(p.len(), 1, "expected one server, found {p:?}");
@@ -138,10 +166,27 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
+        let tracked = std::mem::take(&mut *self.tracked.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut panes = Vec::new();
         if self.sock.exists() {
+            panes = self.pane_pids();
             let _ = self.run(&["kill-server"]);
         }
+        // No pane process may outlive a server that exited in good order
+        // (issues/0001: shells left behind by the suite ran for hours).
+        let gone = self.wait(Duration::from_secs(3), || !panes.iter().chain(&tracked).any(|p| pid_alive(*p)));
         let _ = std::fs::remove_dir_all(&self.dir);
+        if gone {
+            return;
+        }
+        let left: Vec<u32> = panes.iter().copied().filter(|p| pid_alive(*p)).collect();
+        for pid in panes.iter().chain(&tracked) {
+            // SAFETY: SIGKILL for process groups this test's server started.
+            unsafe { libc::kill(-(*pid as i32), libc::SIGKILL) };
+        }
+        if !left.is_empty() && !std::thread::panicking() {
+            panic!("pane processes outlived their server: {left:?}");
+        }
     }
 }
 

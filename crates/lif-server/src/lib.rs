@@ -78,6 +78,14 @@ pub const PANE_INPUT_RESERVE: usize = 64;
 /// before it is closed.
 pub const EXIT_DRAIN: usize = 4 * PANE_READ_BUDGET;
 
+/// How long a pane's process group has to exit after its hangup (SIGHUP and
+/// the PTY closing) before it gets SIGKILL. A hangup alone is not enough:
+/// a program may ignore it, and a shell whose SIGHUP handler is not
+/// async-signal-safe (macOS's /bin/sh, bash 3.2, when the signal lands
+/// while it writes) hangs in the handler and would outlive the server for
+/// good. Long enough for a HUP trap that cleans up to run.
+pub const PANE_KILL_GRACE: Duration = Duration::from_millis(500);
+
 /// Descriptors a new pane leaves free for clients to connect with.
 pub const FD_RESERVE: usize = 32;
 

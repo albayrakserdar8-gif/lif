@@ -54,6 +54,10 @@ pub(crate) struct Rt {
     pub(crate) registry: Registry,
     pub(crate) panes: HashMap<PaneId, PaneRt>,
     pub(crate) pids: HashMap<u32, PaneId>,
+    /// Process groups that were hung up and have not been reaped, with
+    /// when each gets SIGKILL (`PANE_KILL_GRACE`). At most one entry per
+    /// killed pane whose process is still alive.
+    pub(crate) dying: Vec<(u32, std::time::Instant)>,
     pub(crate) clients: BTreeMap<ClientId, ClientRt>,
     pub(crate) reaper: ChildReaper,
     pub(crate) socket: String,
@@ -103,6 +107,7 @@ impl Rt {
             registry,
             panes: HashMap::new(),
             pids: HashMap::new(),
+            dying: Vec::new(),
             clients: BTreeMap::new(),
             reaper,
             socket,
@@ -136,6 +141,32 @@ impl Rt {
             next_pipe: 0,
             fd_limit: 0,
         }
+    }
+
+    /// Hangs up the process group of a watched child and gives it
+    /// `PANE_KILL_GRACE` to exit. The caller closes the PTY.
+    pub(crate) fn hang_up(&mut self, pid: u32) {
+        crate::sys::kill_group(pid, libc::SIGHUP);
+        self.dying.push((pid, std::time::Instant::now() + crate::PANE_KILL_GRACE));
+    }
+
+    /// A watched child was reaped: its pid may be reused from now on.
+    pub(crate) fn child_reaped(&mut self, pid: u32) {
+        self.dying.retain(|d| d.0 != pid);
+        crate::panic::pane_reaped(pid);
+    }
+
+    /// SIGKILL for hung-up process groups whose grace is over at `now`.
+    /// Their pids are still ours: an unreaped child's pid is not reused.
+    pub(crate) fn kill_overdue(&mut self, now: std::time::Instant) {
+        self.dying.retain(|&(pid, at)| {
+            if now < at {
+                return true;
+            }
+            log!("pid {pid} outlived its hangup: SIGKILL");
+            crate::sys::kill_group(pid, libc::SIGKILL);
+            false
+        });
     }
 
     /// `copy-pipe`: run `command` with `data` on its stdin, in `cwd`.
@@ -589,12 +620,13 @@ impl Host for Rt {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
         if let Err(e) = self.registry.register(&mut SourceFd(&fd), pane_token(spec.pane), Interest::READABLE) {
             // Dropping the PTY hangs the child up; the reaper collects it.
-            crate::sys::kill_group(pid, libc::SIGHUP);
+            self.hang_up(pid);
             drop(pty);
             return Err(e.to_string());
         }
         log!("pane {} spawned pid {pid} size {}x{}", spec.pane, spec.size.cols, spec.size.rows);
         self.pids.insert(pid, spec.pane);
+        crate::panic::pane_started(pid);
         let mut p = PaneRt::new(spec.pane, pty, engine, frame, spec.size);
         p.current_path = spec.cwd.clone();
         p.scrollback = crate::pane::scrollback_limits(spec.scrollback_bytes, spec.history_limit);
@@ -615,7 +647,7 @@ impl Host for Rt {
             let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
             let _ = self.registry.deregister(&mut SourceFd(&fd));
             if self.pids.remove(&p.pid).is_some() {
-                crate::sys::kill_group(p.pid, libc::SIGHUP);
+                self.hang_up(p.pid);
             }
             drop(pty);
         }

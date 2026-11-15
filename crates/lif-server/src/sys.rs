@@ -181,6 +181,14 @@ pub(crate) fn kill_group(pgid: u32, sig: libc::c_int) {
     }
 }
 
+/// Blocks until `fd` is readable, a signal arrives or `timeout_ms` passed.
+/// Only for shutdown.
+pub(crate) fn wait_readable(fd: RawFd, timeout_ms: i32) {
+    let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd.
+    unsafe { libc::poll(&mut p, 1, timeout_ms) };
+}
+
 /// Blocking-ish write of all of `buf` to a non-blocking fd, waiting at
 /// most `timeout_ms` in total. Only for shutdown and the panic hook.
 pub(crate) fn write_all_timeout(fd: RawFd, mut buf: &[u8], timeout_ms: i32) -> bool {

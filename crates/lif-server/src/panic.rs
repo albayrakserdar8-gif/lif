@@ -21,6 +21,54 @@ struct Emergency {
 
 static EMERGENCY: Mutex<Option<HashMap<RawFd, Emergency>>> = Mutex::new(None);
 
+/// Pane processes not yet reaped (one per live pane, plus killed panes
+/// still exiting). An abort closes their PTYs, which hangs them up, but
+/// nothing would be left to SIGKILL the ones a hangup does not end
+/// (`PANE_KILL_GRACE`), so the hook does it.
+static PANES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// How long the hook gives hung-up pane processes before SIGKILL. Shorter
+/// than `PANE_KILL_GRACE`: clients are waiting for a crashed server to go.
+const PANIC_GRACE_MS: u32 = 200;
+
+pub(crate) fn pane_started(pid: u32) {
+    if let Ok(mut g) = PANES.lock() {
+        g.push(pid);
+    }
+}
+
+pub(crate) fn pane_reaped(pid: u32) {
+    if let Ok(mut g) = PANES.lock() {
+        g.retain(|p| *p != pid);
+    }
+}
+
+/// Hangs up every pane's process group, waits up to `PANIC_GRACE_MS` for
+/// them to exit and SIGKILLs the rest. Only for the panic hook.
+fn end_panes(pids: &[u32]) {
+    for &pid in pids {
+        crate::sys::kill_group(pid, libc::SIGHUP);
+    }
+    // waitpid, not kill(pid, 0): an exited child stays a zombie (and
+    // signalable) for as long as this process does not reap it.
+    let exited = |pid: u32| {
+        let mut status = 0;
+        // SAFETY: non-blocking wait for a child of this process.
+        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) != 0 }
+    };
+    let mut left: Vec<u32> = pids.to_vec();
+    for _ in 0..PANIC_GRACE_MS / 5 {
+        left.retain(|&pid| !exited(pid));
+        if left.is_empty() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for pid in left {
+        crate::sys::kill_group(pid, libc::SIGKILL);
+    }
+}
+
 pub(crate) fn set(fd: RawFd, bytes: Vec<u8>) {
     if let Ok(mut g) = EMERGENCY.lock() {
         let m = g.get_or_insert_with(HashMap::new);
@@ -61,6 +109,9 @@ pub(crate) fn install_hook() {
                     crate::sys::write_all_timeout(*fd, &e.bytes, 200);
                 }
             }
+        }
+        if let Ok(g) = PANES.try_lock() {
+            end_panes(&g);
         }
         std::process::abort();
     }));

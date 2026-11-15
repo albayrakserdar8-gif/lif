@@ -299,6 +299,7 @@ impl Server {
             self.read_tty(c, now);
         }
         self.scratch_clients = clients;
+        self.rt.kill_overdue(now);
         self.timers(now);
         self.step_searches();
         self.sync_views();
@@ -363,6 +364,7 @@ impl Server {
                 }
             }
         }
+        min(self.rt.dying.iter().map(|d| d.1).min());
         d
     }
 
@@ -578,6 +580,7 @@ impl Server {
 
     fn reap(&mut self, now: Instant) {
         for (pid, status) in self.rt.reaper.reap() {
+            self.rt.child_reaped(pid);
             let Some(id) = self.rt.pids.remove(&pid) else { continue };
             log!("pane {id} pid {pid} exited: {status:?}");
             // Output the program wrote just before exiting is still in the
@@ -1079,6 +1082,23 @@ impl Server {
         self.sync_views();
     }
 
+    /// Waits for every hung-up process to exit, at most until the last of
+    /// them is due its SIGKILL, and sends that to those still there: once
+    /// the server is gone nothing else would. Programs that exit on the
+    /// hangup do so within milliseconds, which is all this then takes.
+    fn await_hung_up(&mut self) {
+        loop {
+            for (pid, _) in self.rt.reaper.reap() {
+                self.rt.child_reaped(pid);
+            }
+            let now = Instant::now();
+            self.rt.kill_overdue(now);
+            let Some(next) = self.rt.dying.iter().map(|d| d.1).min() else { return };
+            let ms = next.saturating_duration_since(now).as_millis() as i32;
+            sys::wait_readable(self.rt.reaper.as_raw_fd(), ms.max(1));
+        }
+    }
+
     /// Orderly exit: deliver what is pending to clients, hang up every
     /// pane, remove the socket and lock file.
     fn finish(&mut self) {
@@ -1089,6 +1109,7 @@ impl Server {
         for p in panes {
             lif_core::Host::kill_pane(&mut self.rt, p);
         }
+        self.await_hung_up();
         self.rt.respawn_stash = None;
         // Only our own socket: if another server was started on this path
         // (it could only after this one stopped holding the lock, but a
