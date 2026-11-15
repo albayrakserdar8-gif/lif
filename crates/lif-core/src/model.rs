@@ -47,6 +47,8 @@ pub struct Session {
     pub(crate) options: OptionSet,
     /// Window size used while no client is attached.
     pub(crate) size: Size,
+    pub(crate) hooks: crate::hooks::HookSet,
+    pub(crate) environ: crate::environ::Environ,
 }
 
 impl Session {
@@ -99,6 +101,7 @@ pub struct Window {
     pub(crate) last_preset: Option<Preset>,
     pub(crate) old_layout: Option<Layout>,
     pub(crate) size: Size,
+    pub(crate) hooks: crate::hooks::HookSet,
 }
 
 impl Window {
@@ -169,6 +172,7 @@ pub struct Pane {
     /// Title set by `select-pane -T`; a title the program sets later
     /// replaces it, as in tmux.
     pub(crate) title: Option<String>,
+    pub(crate) hooks: crate::hooks::HookSet,
 }
 
 impl Pane {
@@ -272,6 +276,13 @@ pub struct CmdOutput {
     /// Text for the client's stdout (for a key binding run by an attached
     /// client tmux shows it in a view; the server decides).
     pub stdout: String,
+    /// The exit status for a client that ran the command from a shell: 0,
+    /// or the status of a failed `run-shell` command (tmux exits with it).
+    pub status: i32,
+    /// The commands are not finished: one of them waits for a shell command
+    /// or a `wait-for` channel. `stdout` is empty; the outcome arrives
+    /// later through [`Model::take_finished`].
+    pub pending: bool,
 }
 
 /// What an attached client should show.
@@ -336,6 +347,16 @@ pub struct Model {
     pub(crate) socket_path: String,
     /// The message log (`show-messages`), oldest first.
     pub(crate) messages: std::collections::VecDeque<String>,
+    /// Commands that wait, and what they wait for (`crate::queue`).
+    pub(crate) q: crate::queue::Queue,
+    /// `#()` commands and their last output. Behind a `RefCell` because
+    /// formats are expanded with `&self` (while rendering).
+    pub(crate) fjobs: std::cell::RefCell<crate::queue::FormatJobs>,
+    pub(crate) hooks: crate::hooks::Hooks,
+    /// The global environment overrides (`set-environment -g`).
+    pub(crate) environ: crate::environ::Environ,
+    /// What the command being run last resolved a target to.
+    pub(crate) last_found: std::cell::Cell<Option<crate::target::Found>>,
 }
 
 /// The largest window index: `base-index`'s maximum, tmux's INT_MAX. Every
@@ -376,6 +397,11 @@ impl Model {
             server_pid: 0,
             socket_path: String::new(),
             messages: std::collections::VecDeque::new(),
+            q: Default::default(),
+            fjobs: Default::default(),
+            hooks: Default::default(),
+            environ: Default::default(),
+            last_found: Default::default(),
         }
     }
 
@@ -653,6 +679,9 @@ impl Model {
                 host.resize_pane(p, r.size());
             }
         }
+        if self.any_hooks() {
+            self.notify("window-layout-changed", None, None, Some(wid), None);
+        }
         host.redraw(Redraw::Window(wid));
     }
 
@@ -672,6 +701,7 @@ impl Model {
             w.bell = false;
             w.activity = false;
         }
+        self.notify("session-window-changed", None, Some(sid), Some(wid), None);
         host.redraw(Redraw::Session(sid));
         true
     }
@@ -692,6 +722,7 @@ impl Model {
             p.active_point = point;
         }
         self.update_window_name(wid, host);
+        self.notify("window-pane-changed", None, Some(sid), Some(wid), Some(pid));
         host.redraw(Redraw::Window(wid));
         host.redraw(Redraw::Status(sid));
         true
@@ -747,6 +778,7 @@ impl Model {
     /// [`Model::remove_window`]; `renumber` is false when the caller is
     /// about to reuse the index (`-k`), as tmux does not renumber then.
     pub(crate) fn remove_window_inner(&mut self, wid: WindowId, exited: Option<PaneId>, renumber: bool, host: &mut dyn Host) {
+        self.notify("window-unlinked", None, None, Some(wid), None);
         let Some(w) = self.windows.remove(&wid) else { return };
         for p in &w.panes {
             if Some(*p) != exited {
@@ -805,6 +837,7 @@ impl Model {
     /// kill its panes, and shut down if it was the last one and
     /// `exit-empty` is on.
     pub(crate) fn destroy_session(&mut self, sid: SessionId, host: &mut dyn Host) {
+        self.notify("session-closed", None, Some(sid), None, None);
         let Some(s) = self.sessions.remove(&sid) else { return };
         for wid in s.windows.values() {
             if let Some(w) = self.windows.remove(wid) {
@@ -887,6 +920,11 @@ impl Model {
             s.activity = tick;
         }
         host.attach_client(cid, sid);
+        match old {
+            None => self.notify("client-attached", Some(cid), Some(sid), None, None),
+            Some(o) if o != sid => self.notify("client-session-changed", Some(cid), Some(sid), None, None),
+            Some(_) => {}
+        }
         self.recalc_session(sid, host);
         if let Some(o) = old
             && o != sid
@@ -900,6 +938,7 @@ impl Model {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let Some(sid) = c.session.take() else { return };
         c.keys = KeyState::default();
+        self.notify("client-detached", Some(cid), Some(sid), None, None);
         host.detach_client(cid, reason);
         self.recalc_session(sid, host);
     }
@@ -917,6 +956,7 @@ impl Model {
     /// A client's connection closed. Its attachment ends without a
     /// `detach_client` call (there is nobody to tell).
     pub fn client_disconnect(&mut self, id: ClientId, host: &mut dyn Host) {
+        self.forget_waiter(id);
         if let Some(c) = self.clients.remove(&id)
             && let Some(sid) = c.session
         {
@@ -933,6 +973,7 @@ impl Model {
         c.activity = tick;
         if let Some(sid) = c.session {
             self.recalc_session(sid, host);
+            self.notify("client-resized", Some(id), Some(sid), None, None);
             host.redraw(Redraw::Client(id));
         }
     }
@@ -997,10 +1038,12 @@ impl Model {
             let p = self.panes.get_mut(&pane).expect("pane");
             p.dead = true;
             p.exit_status = status;
+            self.notify("pane-died", None, None, Some(wid), Some(pane));
             self.update_window_name(wid, host);
             host.redraw(Redraw::Window(wid));
             return;
         }
+        self.notify("pane-exited", None, None, Some(wid), Some(pane));
         self.remove_pane(pane, false, host);
     }
 
@@ -1018,6 +1061,7 @@ impl Model {
             let w = self.windows.get_mut(&wid).expect("window");
             if !w.bell {
                 w.bell = true;
+                self.notify("alert-bell", None, Some(sid), Some(wid), Some(pane));
                 host.redraw(Redraw::Status(sid));
             }
         }
@@ -1048,6 +1092,7 @@ impl Model {
             let w = self.windows.get_mut(&wid).expect("window");
             if !w.activity {
                 w.activity = true;
+                self.notify("alert-activity", None, Some(sid), Some(wid), Some(pane));
                 host.redraw(Redraw::Status(sid));
             }
         }
@@ -1142,6 +1187,28 @@ impl Model {
         }
         let def = options::DEFS.iter().find(|d| d.name == name && d.scope == Scope::Window)?;
         Some(options::value_text(def, self.popt(pane, def.name)))
+    }
+
+    /// The panes that get what is typed into `pane` as well, appended to
+    /// `out`: with `synchronize-panes` on for `pane`, the other live
+    /// panes of its window that have it on too. Whether one of them is in
+    /// a mode (and so takes no input) is for the caller to check.
+    pub fn synchronized_panes(&self, pane: PaneId, out: &mut Vec<PaneId>) {
+        let Some(p) = self.panes.get(&pane) else { return };
+        if !self.popt(pane, "synchronize-panes").as_flag() {
+            return;
+        }
+        let Some(w) = self.windows.get(&p.window) else { return };
+        // A zoomed window shows one pane: the hidden ones are left alone,
+        // as tmux leaves panes that are not visible.
+        if w.layout.zoomed().is_some() {
+            return;
+        }
+        for o in &w.panes {
+            if *o != pane && self.panes.get(o).is_some_and(|x| !x.dead) && self.popt(*o, "synchronize-panes").as_flag() {
+                out.push(*o);
+            }
+        }
     }
 
     /// The program in `pane` set its title: it replaces one set with
@@ -1280,6 +1347,7 @@ impl Model {
             client,
             respawn,
             tmux_compat: self.gopt("tmux-compat").as_flag(),
+            env: self.environ_overrides(Some(session)),
         }
     }
 }
@@ -1305,12 +1373,23 @@ impl Vars for Fctx<'_> {
         self.now
     }
 
+    fn shell(&self, command: &str) -> Option<String> {
+        let interval = self.m.sopt(self.s, "status-interval").as_num();
+        Some(self.m.fjobs.borrow_mut().expand(command, self.s, self.now.unix_secs, interval))
+    }
+
     fn var(&self, name: &str) -> Option<String> {
         let m = self.m;
         let s = self.s.and_then(|s| m.sessions.get(&s));
         let w = self.w.and_then(|w| m.windows.get(&w));
         let p = self.p.and_then(|p| m.panes.get(&p));
         let c = self.c.and_then(|c| m.clients.get(&c));
+        if name.starts_with("hook")
+            && let Some(h) = &m.hooks.current
+            && let Some(v) = h.var(name)
+        {
+            return Some(v);
+        }
         if let Some(rest) = name.strip_prefix("session_") {
             let s = s?;
             return match rest {
@@ -1408,6 +1487,7 @@ impl Vars for Fctx<'_> {
                 "dead" => flag(p.dead),
                 "dead_status" => Some(p.exit_status.map(|s| s.to_string()).unwrap_or_default()),
                 "in_mode" => flag(info.in_mode),
+                "synchronized" => flag(m.popt(p.id, "synchronize-panes").as_flag()),
                 "start_command" => Some(p.command.display()),
                 "start_path" => Some(p.cwd.clone()),
                 "left" => rect.map(|r| r.x.to_string()),
@@ -1419,7 +1499,7 @@ impl Vars for Fctx<'_> {
                 "at_right" => flag(rect.is_some_and(|r| r.right() == wsize.cols)),
                 "at_bottom" => flag(rect.is_some_and(|r| r.bottom() == wsize.rows)),
                 "format" => flag(true),
-                "marked" | "marked_set" | "synchronized" | "input_off" | "pipe" => flag(false),
+                "marked" | "marked_set" | "input_off" | "pipe" => flag(false),
                 _ => None,
             };
         }

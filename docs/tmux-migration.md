@@ -1,28 +1,28 @@
 # Moving from tmux to lif
 
 This guide is for someone who uses tmux today. Everything in it was checked
-against lif 0.1.0's command table and by running the commands; the tmux side is
+against lif 0.2.0's command table and by running the commands; the tmux side is
 tmux 3.8 (`tmux list-commands`, `tmux list-keys` with an empty configuration).
 
 In short: the commands, flags, targets, formats and default keys you use every
 day are the same. The configuration file is not: lif reads TOML, and
-`lif migrate-tmux-conf` translates the common part of a `.tmux.conf`. Anything
-that runs shell commands (`run-shell`, `if-shell`, `#()`, hooks, plugins)
-does not exist in lif.
+`lif migrate-tmux-conf` translates the common part of a `.tmux.conf`. Shell
+commands (`run-shell`, `if-shell`, `#()`), `wait-for` and hooks work as in
+tmux, with the differences listed under [Scripting](#scripting).
 
 ## Commands
 
-58 of tmux 3.8's 92 commands exist in lif (22 with the same flags, 36 with some
-difference, usually missing flags); 34 do not. Command names, aliases and unambiguous prefixes
+70 of tmux 3.8's 92 commands exist in lif (28 with the same flags, 42 with some
+difference, usually missing flags); 22 do not. Command names, aliases and unambiguous prefixes
 resolve as in tmux (`lif splitw`, `lif new`, `lif a`). An unimplemented
 command fails with exit status 1:
 
 ```
-$ lif run-shell 'echo hi'
-unsupported command: run-shell
+$ lif choose-tree
+unsupported command: choose-tree
 ```
 
-A flag lif does not know fails the same way (`command split-window: unknown flag -e`).
+A flag lif does not know fails the same way (`command split-window: unknown flag -f`).
 A few tmux flags that lif cannot honor fail with an explicit `not supported`
 error instead (`new-session -E`, `command-prompt -i`). The flags that are
 accepted without changing anything are listed in
@@ -37,7 +37,7 @@ accepted without changing anything are listed in
 | `choose-buffer` | not supported | |
 | `choose-client` | not supported | |
 | `choose-tree` | not supported | |
-| `clear-history` (`clearhist`) | not supported | |
+| `clear-history` (`clearhist`) | supported | `-H` changes nothing (see below) |
 | `clear-prompt-history` (`clearphist`) | not supported | |
 | `clock-mode` | not supported | |
 | `command-prompt` | supported with differences | no `-b`, `-C`, `-e`, `-l`; `-i` fails with `not supported` (incremental prompts exist only for copy-mode searches); `-P`, `-T` change nothing (see below) |
@@ -52,8 +52,8 @@ accepted without changing anything are listed in
 | `display-popup` (`popup`) | not supported | |
 | `find-window` (`findw`) | not supported | |
 | `has-session` (`has`) | supported | |
-| `if-shell` (`if`) | not supported | |
-| `join-pane` (`joinp`) | not supported | |
+| `if-shell` (`if`) | supported | the shell command runs with `/bin/sh` |
+| `join-pane` (`joinp`) | supported with differences | no `-f` (full-size split); `-p` percentage is also accepted |
 | `kill-pane` (`killp`) | supported with differences | no `-f` (filter) |
 | `kill-server` | supported | |
 | `kill-session` | supported with differences | no `-f`, `-g` |
@@ -75,8 +75,8 @@ accepted without changing anything are listed in
 | `move-pane` (`movep`) | not supported | |
 | `move-window` (`movew`) | supported | |
 | `new-pane` (`newp`) | not supported | |
-| `new-session` (`new`) | supported with differences | no `-e`, `-f`, `-t` (no session groups); `-E` fails with `not supported` (lif has no `update-environment`) |
-| `new-window` (`neww`) | supported with differences | no `-e`, `-E` |
+| `new-session` (`new`) | supported with differences | no `-f`, `-t` (no session groups); `-E` fails with `not supported` (lif has no `update-environment`) |
+| `new-window` (`neww`) | supported with differences | no `-E` |
 | `next-layout` (`nextl`) | supported | |
 | `next-window` (`next`) | supported | |
 | `paste-buffer` (`pasteb`) | supported with differences | no `-S` |
@@ -88,10 +88,10 @@ accepted without changing anything are listed in
 | `rename-window` (`renamew`) | supported | |
 | `resize-pane` (`resizep`) | supported with differences | no `-M` (mouse), `-T` |
 | `resize-window` (`resizew`) | not supported | |
-| `respawn-pane` (`respawnp`) | supported with differences | no `-e`, `-E` |
+| `respawn-pane` (`respawnp`) | supported with differences | no `-E` |
 | `respawn-window` (`respawnw`) | not supported | |
 | `rotate-window` (`rotatew`) | supported | |
-| `run-shell` (`run`) | not supported | |
+| `run-shell` (`run`) | supported with differences | no arguments after the shell command; it runs with `/bin/sh`; output of a command run from a key is shown as a message (one line) or in view mode |
 | `save-buffer` (`saveb`) | supported | `-` writes to standard output |
 | `select-layout` (`selectl`) | supported | |
 | `select-pane` (`selectp`) | supported with differences | no `-d`, `-e` (input on/off), `-m`, `-M` (marked pane); `-T` takes the title literally (no format expansion) |
@@ -100,19 +100,19 @@ accepted without changing anything are listed in
 | `send-prefix` | supported | |
 | `server-access` | not supported | |
 | `set-buffer` (`setb`) | supported with differences | no `-t`, `-w` |
-| `set-environment` (`setenv`) | not supported | |
-| `set-hook` | not supported | |
+| `set-environment` (`setenv`) | supported | see [Scripting](#scripting) for what the environment holds |
+| `set-hook` | supported with differences | no `-B`, `-E`, `-T`; not every hook runs (see [Scripting](#scripting)) |
 | `set-option` (`set`) | supported with differences | only the options listed below; no `-U`. `-p` sets window options per pane, as in tmux; the ones a pane's value changes are `remain-on-exit`, `allow-passthrough`, `window-style`, `window-active-style`, `pane-border-format` and the border styles of its `pane-border-status` line (border lines themselves keep the window's style) |
 | `set-window-option` (`setw`) | supported | |
 | `show-buffer` (`showb`) | supported | |
-| `show-environment` (`showenv`) | not supported | |
-| `show-hooks` | not supported | |
+| `show-environment` (`showenv`) | supported | lists what `set-environment` set, not the whole environment |
+| `show-hooks` | supported with differences | no `-B`, `-F` |
 | `show-messages` (`showmsgs`) | supported | |
 | `show-options` (`show`) | supported with differences | no `-A`, `-F`, `-H` |
 | `show-prompt-history` (`showphist`) | not supported | |
 | `show-window-options` (`showw`) | supported with differences | no `-F` |
 | `source-file` (`source`) | supported with differences | reads lif TOML files only; a `.conf` file or a file of tmux commands is refused with a pointer to `lif migrate-tmux-conf` |
-| `split-window` (`splitw`) | supported with differences | has `-b -c -d -F -h -l -p -P -t -v -Z`; no `-e`, `-f`, `-I`, `-k`, `-m`, `-W`, `-B`, `-R`, `-s`, `-S`, `-T` |
+| `split-window` (`splitw`) | supported with differences | has `-b -c -d -e -F -h -l -p -P -t -v -Z`; no `-f`, `-I`, `-k`, `-m`, `-W`, `-B`, `-R`, `-s`, `-S`, `-T` |
 | `start-server` (`start`) | supported | |
 | `suspend-client` (`suspendc`) | supported | |
 | `swap-pane` (`swapp`) | supported | |
@@ -121,7 +121,7 @@ accepted without changing anything are listed in
 | `switch-mode` | not supported | |
 | `unbind-key` (`unbind`) | supported | |
 | `unlink-window` (`unlinkw`) | not supported | |
-| `wait-for` (`wait`) | not supported | |
+| `wait-for` (`wait`) | supported with differences | has `-L -S -U`; no `-E`, `-l`, `-v`, `-F`, `-w` |
 
 The commands `check-config`, `print-config` and `migrate-tmux-conf`
 are lif's own; they run without a server (see [configuration.md](configuration.md)).
@@ -139,6 +139,8 @@ behaves (or something lif does not have):
 - `command-prompt -T`: the prompt type chooses Tab completions in tmux; lif's
   prompt has no completion.
 - `lif -2`, `lif -u`: 256 colors and UTF-8 are always on.
+- `clear-history -H`: in tmux it also removes the pane's hyperlinks; lif
+  clears the history with or without it.
 
 `display-panes -b` is not a tmux 3.8 flag and fails as unknown, as in tmux.
 
@@ -150,7 +152,7 @@ commands or flags lif lacks). Mouse
 bindings are not in lif's tables at all (see [Mouse](#mouse)). Long tmux
 commands are cut at 70 characters.
 
-| Key | tmux 3.8 | lif 0.1.0 | |
+| Key | tmux 3.8 | lif 0.2.0 | |
 |---|---|---|---|
 | `Tab` | `new-pane -E -X 0 -Y 0 -x "75%" -y "30%" \; move-pane -P bottom-cent...` |  | missing in lif |
 | `Space` | `next-layout` | `next-layout` | same |
@@ -256,7 +258,7 @@ The copy-mode tables are compared in [copy-mode.md](copy-mode.md#differences-fro
 
 ## Options
 
-lif has 70 options: 67 with tmux's names, scopes and (except for colors that
+lif has 71 options: 68 with tmux's names, scopes and (except for colors that
 tmux 3.8 expresses with theme colors, `pane-border-format`, and
 `escape-time` and `history-limit`) tmux 3.8's defaults, plus three of its
 own, `scrollback-bytes`, `mouse-drag-end` and `tmux-compat`. `set-option`, `set-window-option`, `show-options`
@@ -322,6 +324,7 @@ silences it).
 | `status-right-length` | session | number | `40` | `[status] right-length` |
 | `status-right-style` | session | string | `default` | `[theme] status-right` |
 | `status-style` | session | string | `bg=green,fg=black` | `[theme] status` |
+| `synchronize-panes` | window | on/off | `off` | `synchronize-panes` |
 | `tiled-layout-max-columns` | window | number | `0` | `tiled-layout-max-columns` |
 | `tmux-compat` (lif only) | server | on/off | `off` | `tmux-compat` |
 | `visual-bell` | session | one of: off, on, both | `off` | `visual-bell` |
@@ -341,7 +344,7 @@ silences it).
 
 Some tmux options people often set and lif does not have: `default-terminal`,
 `terminal-overrides`, `terminal-features`, `focus-events`,
-`extended-keys`, `update-environment`, `synchronize-panes`,
+`extended-keys`, `update-environment`,
 `status-keys`, `aggressive-resize`, `allow-rename`, `message-command-style`,
 `clock-mode-*`, `lock-*`. The behavior several of these exist to turn on
 (true color, focus events, extended keys, OSC 52) is on or automatic in lif.
@@ -362,7 +365,9 @@ Supported syntax: `#{name}`, `#S #I #W #P #T #D #F #H #h ##`,
 `>=` `||` `&&` `#{!:x}`, `#{m:glob,s}`, `#{e|op|:a,b}` (`+ - * / % ==`...),
 and the modifiers `=N`, `=-N`, `=/N/marker`, `pN`, `t:`, `b:`, `d:`,
 `l:`, `E:`, `T:`, `q:`, `n:`, `w:`, `s/from/to/:` (literal, not a regex).
-`#[style]` is passed to the status line. `#(command)` expands to nothing.
+`#[style]` is passed to the status line. `#(command)` expands to the last
+line the shell command printed when it last ran (nothing the first time);
+see [Scripting](#scripting).
 An unknown variable expands to an empty string. As in tmux, a name that is not
 a variable is looked up as an option (`#{status-left}`, `#{@myopt}`).
 
@@ -371,10 +376,11 @@ a variable is looked up as an option (`#{status-left}`, `#{@myopt}`).
 | Server | `host`, `host_short`, `pid`, `socket_path`, `version` |
 | Session | `session_name`, `session_id`, `session_windows`, `session_attached`, `session_many_attached`, `session_created`, `session_activity` (same value as `session_created`), `session_path`, `session_alerts`, `session_format`; `session_grouped` is always 0 and `session_group` empty |
 | Window | `window_index`, `window_name`, `window_id`, `window_flags`, `window_raw_flags`, `window_active`, `window_last_flag`, `window_bell_flag`, `window_activity_flag`, `window_zoomed_flag`, `window_panes`, `window_width`, `window_height`, `window_layout`, `window_visible_layout`, `window_start_flag`, `window_end_flag`, `window_format`; `window_silence_flag`, `window_bigger`, `window_marked_flag`, `window_linked` are always 0 and `window_offset_x/y` 0 |
-| Pane | `pane_index`, `pane_id`, `pane_title` (the host name until a program sets a title), `pane_current_command`, `pane_current_path`, `pane_width`, `pane_height`, `pane_active`, `pane_last`, `pane_pid`, `pane_dead`, `pane_dead_status`, `pane_in_mode`, `pane_start_command`, `pane_start_path`, `pane_left`, `pane_top`, `pane_right`, `pane_bottom`, `pane_at_left`, `pane_at_top`, `pane_at_right`, `pane_at_bottom`, `pane_format`; `pane_marked`, `pane_marked_set`, `pane_synchronized`, `pane_input_off`, `pane_pipe` are always 0 |
+| Pane | `pane_index`, `pane_id`, `pane_title` (the host name until a program sets a title), `pane_current_command`, `pane_current_path`, `pane_width`, `pane_height`, `pane_active`, `pane_last`, `pane_pid`, `pane_dead`, `pane_dead_status`, `pane_in_mode`, `pane_start_command`, `pane_start_path`, `pane_left`, `pane_top`, `pane_right`, `pane_bottom`, `pane_at_left`, `pane_at_top`, `pane_at_right`, `pane_at_bottom`, `pane_synchronized`, `pane_format`; `pane_marked`, `pane_marked_set`, `pane_input_off`, `pane_pipe` are always 0 |
 | History | `history_size` (lines), `history_bytes` (lif only: bytes used), `history_limit` |
 | Client | `client_name`, `client_tty` (same as the name, e.g. `client-58982`), `client_termname`, `client_width`, `client_height`, `client_pid`, `client_session`, `client_last_session`, `client_prefix`, `client_key_table`, `client_flags`, `client_cwd` |
 | Buffer | `buffer_name`, `buffer_size`, `buffer_sample` (in `list-buffers -F`) |
+| Hook | `hook`, `hook_session`, `hook_session_name`, `hook_window`, `hook_window_name`, `hook_pane`, `hook_client` (in the commands of a hook) |
 
 Not available, among others: `pane_tty`, `pane_mode`, `alternate_on`,
 `cursor_x`/`cursor_y`, `mouse_*`, and the copy-mode variables
@@ -383,6 +389,79 @@ Not available, among others: `pane_tty`, `pane_mode`, `alternate_on`,
 `display-message`. The copy-mode key bindings that use `copy_cursor_word` and
 `pane_search_string` are handled inside copy mode and work.
 
+## Scripting
+
+`run-shell`, `if-shell`, `wait-for`, `#()`, hooks and the environment
+commands print what tmux 3.8 prints and exit as it does:
+
+```
+$ lif run-shell 'echo hi; exit 3'; echo "status $?"
+hi
+'echo hi; exit 3' returned 3
+status 3
+$ lif if-shell 'test -d /tmp' 'display -p yes' 'display -p no'
+yes
+$ lif wait-for -U nolock
+channel nolock not locked
+```
+
+What is the same: a list waits for `run-shell` and `if-shell` (`run-shell
+'sleep 1' \; display done` shows `done` after a second) unless `-b` is
+given; the shell command is a format (`run-shell 'echo #{session_name}'`);
+it runs in the directory of the client that ran it from a shell, else the
+session's, or `-c`'s; `-d` delays in seconds with a fraction; `-C` runs lif
+commands; `if-shell -F` tests a format; only the branch taken is parsed;
+`wait-for -S` with nobody waiting is remembered for the next `wait-for`;
+a hook's commands print as tmux parsed them (`after-new-window[0]
+display-message -p hi`) and unknown hook names are `invalid option: NAME`.
+
+What differs:
+
+- **`/bin/sh`.** Shell commands run as `/bin/sh -c command`, as the
+  server's user, with standard input from `/dev/null`. tmux uses
+  `default-shell`. Their environment is the server's with
+  `set-environment`'s variables, `LIF` (so `lif` inside the command
+  talks to this server) and `LIF_PANE` for the target pane; `TMUX` and
+  `TMUX_PANE` too when `tmux-compat` is on.
+- **Limits.** At most 64 shell commands run at once (one more fails with
+  `64 shell commands are still running; not running COMMAND`), 1 MiB of a
+  command's output is kept, and at most 1024 command lists wait at a time.
+  Commands still running when the server exits are hung up.
+- **Output of commands run from keys.** One line is shown as a message;
+  more open view mode in the active pane (as other commands' output does
+  in lif). Output of `run-shell -b` from a shell is dropped.
+- **`#()`.** Expands to the last line of the command's previous run, as in
+  tmux, and does so in every format (tmux 3.8's `display-message -p
+  '#(echo hi)'` printed an empty line each time). The command is run again when a format using it is expanded and
+  its last run started `status-interval` seconds ago or more (at least
+  one; tmux: one second). A status line with `#()` is redrawn every
+  `status-interval`; lif remembers the 64 commands used most recently.
+- **Hooks.** Every tmux 3.8 hook name can be set, globally (`-g`), on a
+  session, or for window hooks on a window or a pane (`-p`). The ones lif
+  runs are the `after-` hooks of the commands it has, `session-created`,
+  `session-closed`, `session-renamed`, `session-window-changed`,
+  `window-linked`, `window-unlinked`, `window-renamed` (for
+  `rename-window`, not automatic names), `window-layout-changed`,
+  `window-pane-changed`, `client-attached`, `client-detached`,
+  `client-session-changed`, `client-resized`, `pane-exited`,
+  `pane-died`, `alert-bell` and `alert-activity`. The others are kept and
+  never run. A hook holds at most 64 commands. Commands run by a hook fire
+  no hooks, as in tmux; a hook's error goes to `show-messages`.
+- **Environment.** Panes get the server's environment (that of the client
+  that started it) plus `SSH_AUTH_SOCK`, `DISPLAY` and a few more from the
+  client that creates the session. `set-environment` adds to that or, with
+  `-r`, removes from it, for panes and shell commands started afterwards:
+  the global set (`-g`), then the session's, then `-e` of `new-session`,
+  `new-window`, `split-window` or `respawn-pane`. `show-environment`
+  lists only what was set this way (tmux lists everything, with the
+  `update-environment` variables). Hidden variables (`-h`) are listed
+  with `show-environment -h` and not passed on.
+- **`synchronize-panes`.** Typed keys, pastes and `send-keys` go to every
+  pane of the window that has the option on and is not in a mode; panes
+  hidden by a zoomed pane are left alone. Mouse events go to one pane.
+- **`join-pane`.** Without `-s` the source is the current pane (tmux: the
+  marked pane, which lif does not have).
+
 ## Translating a .tmux.conf
 
 lif never reads `~/.tmux.conf`. `lif migrate-tmux-conf [file]` (default
@@ -390,8 +469,9 @@ lif never reads `~/.tmux.conf`. `lif migrate-tmux-conf [file]` (default
 error, one line per command it did not translate, with the reason. It
 translates `set`/`set-option`/`setw` with `-g` or `-s` for options lif has,
 `bind`/`bind-key` with `-n`, `-r`, `-T`, `-N`, `unbind`, a copy-mode table's
-`MouseDragEnd1Pane` (as `mouse-drag-end`), and comments directly above a
-translated line. It never guesses. It exits 0 even when
+`MouseDragEnd1Pane` (as `mouse-drag-end`), `set-hook -g` (with `-a` and
+`-u`, as `[hooks]`), `set-environment -g` (with `-r`, as `[env]`), and
+comments directly above a translated line. It never guesses. It exits 0 even when
 lines were left out.
 
 Input, `tmux.conf`:
@@ -442,9 +522,8 @@ tmux.conf:13: not translated (set-option -a has no config.toml equivalent): set 
 tmux.conf:28: not translated (source-file of a tmux configuration file: lif reloads its own config.toml (source-file ~/.config/lif/config.toml)): bind r source-file ~/.tmux.conf \; display "reloaded"
 tmux.conf:31: not translated (lif pipes mouse copies to the copy-command option, which also serves copy-pipe keys without a command of their own (Enter in vi, M-w in emacs): add copy-command = "pbcopy" if that is what you want): bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
 tmux.conf:33: not translated (user options (@name) have no config.toml equivalent): set -g @plugin 'tmux-plugins/tpm'
-tmux.conf:34: not translated (unsupported command: run-shell): run '~/.tmux/plugins/tpm/tpm'
-tmux.conf:35: not translated (unsupported command: if-shell): if-shell "test -f ~/.tmux.local" "source ~/.tmux.local"
-tmux.conf:36: not translated (unsupported command: set-hook): set-hook -g after-new-window 'display hi'
+tmux.conf:34: not translated (run-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])): run '~/.tmux/plugins/tpm/tpm'
+tmux.conf:35: not translated (if-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])): if-shell "test -f ~/.tmux.local" "source ~/.tmux.local"
 ```
 
 The resulting `config.toml`:
@@ -485,6 +564,9 @@ M-Left = "select-pane -L"
 [keys.copy-mode-vi]
 v = "send -X begin-selection"
 y = "send -X copy-pipe-and-cancel pbcopy"
+
+[hooks]
+after-new-window = "display hi"
 ```
 
 `lif check-config` reports no problems with it. Things to review by hand
@@ -504,7 +586,11 @@ after a migration:
   `copy-command`, which also serves the default copy keys. Add
   `copy-command = "pbcopy"` to pipe every copy.
 - Reload bindings: `bind r source-file ~/.config/lif/config.toml`.
-- Plugins, `run-shell`, `if-shell` and hooks have no replacement.
+- `run-shell` and `if-shell` lines are not translated: the configuration
+  file has no commands that run at start-up. Both work in key bindings and
+  hooks (`r = "run-shell '~/bin/x'"`, or a `session-created` hook for what
+  should happen once a session exists). Plugins that are loaded this way
+  (TPM) are not loaded.
 
 ## Behavior differences you will notice
 
@@ -568,8 +654,10 @@ after a migration:
   stays in copy mode with the selection shown, `none` only selects); after a
   double or triple click lif copies at once, where tmux shows the selection
   for 0.3 s first; there are no right-click menus.
-- **No shell from lif.** `#()` in the status line is empty, so status bars
-  built on shell commands (battery, load, git) need another approach.
+- **Shell commands.** `run-shell`, `if-shell` and `#()` work; they run
+  with `/bin/sh` rather than `default-shell`, and `#()` in the status line
+  is refreshed every `status-interval` rather than every second. See
+  [Scripting](#scripting).
 - **Status line styles.** `fg=`, `bg=`, `us=` and attributes work;
   `align=`, `fill=`, `list=`, `range=` and theme colors (`themegreen`)
   are not supported.

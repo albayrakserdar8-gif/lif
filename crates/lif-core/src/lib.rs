@@ -12,6 +12,9 @@
 //!   [`Model::pane_activity`], [`Model::pane_changed`],
 //!   [`Model::client_connect`], [`Model::client_disconnect`],
 //!   [`Model::client_resized`];
+//! - commands that wait (`run-shell`, `if-shell`, `wait-for`): the list
+//!   is parked ([`CmdOutput::pending`]) until the server reports
+//!   [`Model::job_done`]; outcomes come out of [`Model::take_finished`];
 //! - keys: [`Model::handle_key`] runs the prefix state machine and says
 //!   whether a key goes to the pane, runs commands, or is swallowed;
 //! - rendering: [`Model::client_view`] gives pane rectangles and borders,
@@ -25,14 +28,17 @@
 
 pub mod bindings;
 pub mod cmd;
+mod environ;
 mod exec;
 pub mod format;
+mod hooks;
 pub mod host;
 pub mod ids;
 pub mod keys;
 pub mod layout;
 mod model;
 pub mod options;
+mod queue;
 pub(crate) mod status;
 mod target;
 pub mod time;
@@ -41,9 +47,11 @@ pub use bindings::{Binding, KeyBindings, KeyDecision, KeyState};
 pub use cmd::{Arg, Args, CmdError, Command, CommandList, escape_arg, parse, parse_list, parse_string};
 pub use exec::expand_prompt_template;
 pub use host::{
-    CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, LinePos, PaneInfo, PaneInput, Prompt,
-    Redraw, SpawnCommand, SpawnSpec,
+    CaptureRange, ConfigError, ConfigFile, CopyModeOptions, DetachReason, Host, JobSpec, JobStatus, LinePos, PaneInfo,
+    PaneInput, Prompt, Redraw, SpawnCommand, SpawnSpec,
 };
+pub use hooks::hook_names;
+pub use queue::Finished;
 pub use ids::{ClientId, PaneId, SessionId, WindowId};
 pub use keys::KeyCode;
 pub use layout::{Axis, Direction, Geometry, Layout, LayoutError, Preset, PresetParams, SizeSpec, SplitSize};

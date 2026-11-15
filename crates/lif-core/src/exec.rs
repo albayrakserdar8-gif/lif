@@ -119,7 +119,7 @@ fn ok() -> R {
 }
 
 fn text(s: String) -> R {
-    Ok(CmdOutput { stdout: s })
+    Ok(CmdOutput { stdout: s, ..CmdOutput::default() })
 }
 
 fn err<T>(s: impl Into<String>) -> Result<T, CmdError> {
@@ -260,6 +260,15 @@ impl Model {
                 let cid = self.attached_client(ctx, a.get('t'))?;
                 host.suspend_client(cid).map(|()| CmdOutput::default()).map_err(CmdError)
             }
+            "clear-history" => {
+                let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+                host.clear_history(need_pane(&f)?);
+                ok()
+            }
+            "join-pane" => self.cmd_join_pane(a, ctx, host),
+            "if-shell" => self.cmd_if_shell(a, ctx, host),
+            "run-shell" => self.cmd_run_shell(a, ctx, host),
+            "wait-for" => self.cmd_wait_for(a, ctx),
             "has-session" => self.find_target(ctx, a.get('t'), Kind::Session, Flags::default()).map(|_| CmdOutput::default()),
             "kill-pane" => {
                 let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
@@ -450,6 +459,7 @@ impl Model {
                     return err(format!("duplicate session: {name}"));
                 }
                 self.sessions.get_mut(&f.s).expect("session").name = name;
+                self.notify("session-renamed", ctx.client, Some(f.s), None, None);
                 host.redraw(Redraw::Status(f.s));
                 ok()
             }
@@ -460,6 +470,7 @@ impl Model {
                 let win = self.windows.get_mut(&w).expect("window");
                 win.name = name;
                 win.options.set("automatic-rename", Value::Flag(false));
+                self.notify("window-renamed", ctx.client, Some(f.s), Some(w), None);
                 host.redraw(Redraw::Status(f.s));
                 ok()
             }
@@ -506,6 +517,10 @@ impl Model {
             "set-buffer" => self.cmd_set_buffer(a),
             "load-buffer" => self.cmd_load_buffer(a, ctx, host),
             "save-buffer" => self.cmd_save_buffer(a, ctx, host),
+            "set-environment" => self.cmd_set_environment(a, ctx, host),
+            "set-hook" => self.cmd_set_hook(a, ctx),
+            "show-environment" => self.cmd_show_environment(a, ctx),
+            "show-hooks" => self.cmd_show_hooks(a, ctx),
             "set-option" => self.cmd_set_option(a, a.has('w'), ctx, host),
             "set-window-option" => self.cmd_set_option(a, true, ctx, host),
             "show-buffer" => {
@@ -555,15 +570,29 @@ impl Model {
         }
     }
 
-    /// Run a list of commands in order, stopping at the first error. The
-    /// output of the commands that ran is concatenated.
-    pub fn execute_list(&mut self, list: &CommandList, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        let mut out = CmdOutput::default();
-        for c in list.commands() {
-            let o = self.execute(c, ctx, host)?;
-            out.stdout.push_str(&o.stdout);
+    /// The directory of a `run-shell` / `if-shell` job: `-c`, the
+    /// client's when it runs from a shell, else the session's.
+    pub(crate) fn job_cwd(&self, a: &Args, f: Option<&Found>, ctx: &CmdContext, host: &dyn Host) -> String {
+        let default = self.default_cwd(ctx, f.map(|f| f.s));
+        self.cwd_arg(a, f, ctx, host, default)
+    }
+
+    /// What a job's environment gets on top of the server's.
+    pub(crate) fn job_env(&self, session: Option<SessionId>) -> Vec<(String, Option<String>)> {
+        self.environ_overrides(session)
+    }
+
+    /// `cmd` ran without an error as part of a list: its `after-` hook,
+    /// for the target it resolved (or the pane it created).
+    pub(crate) fn command_ran(&mut self, cmd: &Command, ctx: &CmdContext) {
+        let found = self.last_found.take();
+        if !self.any_hooks() {
+            return;
         }
-        Ok(out)
+        let name = cmd.name();
+        let Some(hook) = crate::hooks::SESSION_HOOKS.iter().find(|h| h.strip_prefix("after-") == Some(name)) else { return };
+        let found = found.or_else(|| self.current_state(ctx, false).ok());
+        self.notify(hook, ctx.client, found.map(|f| f.s), found.and_then(|f| f.w), found.and_then(|f| f.p));
     }
 
     /// Store a paste buffer (copy mode uses this). With no name it gets an
@@ -607,6 +636,8 @@ impl Model {
 
     #[allow(clippy::too_many_arguments)]
     fn print_new(&self, a: &Args, default: &str, s: SessionId, w: WindowId, p: PaneId, ctx: &CmdContext, host: &dyn Host) -> R {
+        // What was made is what the command's after-hook is about.
+        self.last_found.set(Some(Found { s, w: Some(w), p: Some(p), idx: None }));
         if !a.has('P') {
             return ok();
         }
@@ -866,6 +897,7 @@ impl Model {
         let w = self.windows.get_mut(&wid).expect("window");
         w.index = idx;
         w.session = sid;
+        self.notify("window-linked", None, Some(sid), Some(wid), None);
     }
 
     /// Default directory for a new window / session: the client's when it is
@@ -900,7 +932,7 @@ impl Model {
     /// Create a window holding one new pane and start its process. On
     /// failure nothing remains. The window is not linked into the session.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_window(&mut self, sid: SessionId, name: Option<String>, args: &[String], cwd: String, size: Size, client: Option<ClientId>, host: &mut dyn Host) -> Result<(WindowId, PaneId), CmdError> {
+    fn spawn_window(&mut self, sid: SessionId, name: Option<String>, args: &[String], cwd: String, size: Size, client: Option<ClientId>, env: Vec<(String, Option<String>)>, host: &mut dyn Host) -> Result<(WindowId, PaneId), CmdError> {
         let failed = |e: CmdError| CmdError(format!("create window failed: {}", e.0));
         let pid = self.alloc_pane().map_err(failed)?;
         let wid = self.alloc_window().map_err(failed)?;
@@ -931,13 +963,15 @@ impl Model {
                 last_preset: None,
                 old_layout: None,
                 size,
+                hooks: Default::default(),
             },
         );
         self.panes.insert(
             pid,
-            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None },
+            Pane { id: pid, window: wid, size: psize, command: command.clone(), cwd: cwd.clone(), dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default() },
         );
-        let spec = self.spawn_spec(pid, wid, sid, command, cwd, psize, client, false);
+        let mut spec = self.spawn_spec(pid, wid, sid, command, cwd, psize, client, false);
+        spec.env.extend(env);
         if let Err(e) = host.spawn_pane(&spec) {
             self.windows.remove(&wid);
             self.panes.remove(&pid);
@@ -1038,11 +1072,13 @@ impl Model {
                 cwd: cwd.clone(),
                 options: OptionSet::default(),
                 size,
+                hooks: Default::default(),
+                environ: Default::default(),
             },
         );
         let wname = a.get('n').map(|n| format::expand(n, &self.fctx(&*host, Some(id), None, None, ctx.client, ctx.now)));
         let args = a.strings(0);
-        let (wid, pid) = match self.spawn_window(id, wname, &args, cwd, size, ctx.client, host) {
+        let (wid, pid) = match self.spawn_window(id, wname, &args, cwd, size, ctx.client, crate::environ::flag_env(a), host) {
             Ok(x) => x,
             Err(e) => {
                 self.sessions.remove(&id);
@@ -1052,6 +1088,7 @@ impl Model {
         let base = self.base_index(id);
         self.insert_window(id, base, wid);
         self.sessions.get_mut(&id).expect("session").current = wid;
+        self.notify("session-created", ctx.client, Some(id), Some(wid), Some(pid));
         if !detached && let Some((cid, _, _)) = client {
             self.switch_client(cid, id, host);
         }
@@ -1280,7 +1317,7 @@ impl Model {
         let cwd_default = self.default_cwd(ctx, Some(sid));
         let cwd = self.cwd_arg(a, Some(&f), ctx, &*host, cwd_default);
         let size = self.new_window_size(sid);
-        let (wid, pid) = self.spawn_window(sid, name, &a.strings(0), cwd, size, ctx.client, host)?;
+        let (wid, pid) = self.spawn_window(sid, name, &a.strings(0), cwd, size, ctx.client, crate::environ::flag_env(a), host)?;
         let (idx, displaced) = match self.place_index(&f, a, None, "create window failed: ", host) {
             Ok(x) => x,
             Err(e) => {
@@ -1523,7 +1560,8 @@ impl Model {
         }
         let psize = self.windows[&wid].layout.unzoomed_geometry().rect(pid).map(|r| r.size()).unwrap_or_default();
         let command = self.spawn_command(f.s, &a.strings(0));
-        let spec = self.spawn_spec(pid, wid, f.s, command.clone(), cwd.clone(), psize, ctx.client, false);
+        let mut spec = self.spawn_spec(pid, wid, f.s, command.clone(), cwd.clone(), psize, ctx.client, false);
+        spec.env.extend(crate::environ::flag_env(a));
         if let Err(e) = host.spawn_pane(&spec) {
             let w = self.windows.get_mut(&wid).expect("window");
             w.layout = saved;
@@ -1533,7 +1571,7 @@ impl Model {
             return err(format!("create pane failed: {e}"));
         }
         let point = self.tick();
-        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None });
+        self.panes.insert(pid, Pane { id: pid, window: wid, size: psize, command, cwd, dead: false, exit_status: None, active_point: point, options: OptionSet::default(), title: None, hooks: Default::default() });
         let w = self.windows.get_mut(&wid).expect("window");
         let pos = w.panes.iter().position(|p| *p == target).expect("target in window");
         w.panes.insert(if before { pos } else { pos + 1 }, pid);
@@ -1781,6 +1819,7 @@ impl Model {
                 last_preset: None,
                 old_layout: None,
                 size,
+                hooks: Default::default(),
             },
         );
         self.panes.get_mut(&p).expect("pane").window = wid;
@@ -1792,6 +1831,87 @@ impl Model {
         self.sync_window(wid, host);
         host.redraw(Redraw::Session(dst.s));
         self.print_new(a, NEW_WINDOW, dst.s, wid, p, ctx, &*host)
+    }
+
+    /// `join-pane`: take the source pane out of its window and put it
+    /// next to the target pane by splitting that, as `split-window` would
+    /// for a new pane. A window left without panes goes away.
+    fn cmd_join_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let dst = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
+        let src = self.find_target(ctx, a.get('s'), Kind::Pane, Flags::default())?;
+        let (dw, target) = (need_window(&dst)?, need_pane(&dst)?);
+        let (sw, p) = (need_window(&src)?, need_pane(&src)?);
+        if p == target {
+            return err("source and target panes must be different");
+        }
+        let axis = if a.has('h') { Axis::LeftRight } else { Axis::TopBottom };
+        let size = if let Some(l) = a.get('l') {
+            match SizeSpec::parse(l) {
+                Some(SizeSpec::Cells(n)) => SplitSize::Cells(n),
+                Some(SizeSpec::Percent(p)) => SplitSize::Percent(p),
+                None => return err("size invalid"),
+            }
+        } else if let Some(pc) = a.get('p') {
+            match pc.parse::<u32>() {
+                Ok(pc) if pc <= 100 => SplitSize::Percent(pc),
+                _ => return err("percentage invalid"),
+            }
+        } else {
+            SplitSize::Half
+        };
+        let before = a.has('b');
+        // Both layouts as they are, to put back if the pane does not fit.
+        let saved_src = self.windows[&sw].layout.clone();
+        let saved_dst = self.windows[&dw].layout.clone();
+        let last_of_window = self.windows[&sw].panes.len() == 1;
+        if !last_of_window {
+            let w = self.windows.get_mut(&sw).expect("window");
+            w.layout.unzoom();
+            w.layout.remove(p);
+        }
+        let w = self.windows.get_mut(&dw).expect("window");
+        w.layout.unzoom();
+        if let Err(e) = w.layout.split(target, p, axis, size, before) {
+            self.windows.get_mut(&dw).expect("window").layout = saved_dst;
+            self.windows.get_mut(&sw).expect("window").layout = saved_src;
+            return err(e.to_string());
+        }
+        // The pane leaves its window's list (and that window, if empty).
+        {
+            let w = self.windows.get_mut(&sw).expect("window");
+            let pos = w.panes.iter().position(|x| *x == p).expect("pane");
+            w.last_panes.retain(|x| *x != p);
+            if w.active == p {
+                let next = w.last_panes.first().copied().or_else(|| if pos > 0 { Some(w.panes[pos - 1]) } else { w.panes.get(pos + 1).copied() });
+                if let Some(n) = next {
+                    w.active = n;
+                    w.last_panes.retain(|x| *x != n);
+                }
+            }
+            w.panes.remove(pos);
+        }
+        let w = self.windows.get_mut(&dw).expect("window");
+        let pos = w.panes.iter().position(|x| *x == target).expect("target in window");
+        w.panes.insert(if before { pos } else { pos + 1 }, p);
+        self.panes.get_mut(&p).expect("pane").window = dw;
+        if last_of_window {
+            // Nothing left in it to kill; this unlinks it and ends its
+            // session if it was the last window there.
+            self.remove_window(sw, None, host);
+        } else {
+            self.sync_window(sw, host);
+            self.update_window_name(sw, host);
+            host.redraw(Redraw::Status(src.s));
+        }
+        if !a.has('d') {
+            self.set_active_pane(dw, p, host);
+            self.select_window(dst.s, dw, host);
+        }
+        self.sync_window(dw, host);
+        self.update_window_name(dw, host);
+        host.redraw(Redraw::Session(dst.s));
+        self.last_found.set(Some(Found { s: dst.s, w: Some(dw), p: Some(p), idx: None }));
+        ok()
     }
 
     fn cmd_respawn(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
@@ -1809,7 +1929,8 @@ impl Model {
         let cwd = self.cwd_arg(a, Some(&f), ctx, &*host, start);
         host.kill_pane(p);
         let size = self.panes[&p].size;
-        let spec = self.spawn_spec(p, wid, f.s, command.clone(), cwd.clone(), size, ctx.client, true);
+        let mut spec = self.spawn_spec(p, wid, f.s, command.clone(), cwd.clone(), size, ctx.client, true);
+        spec.env.extend(crate::environ::flag_env(a));
         let r = host.spawn_pane(&spec);
         let pane = self.panes.get_mut(&p).expect("pane");
         match r {
@@ -1960,9 +2081,18 @@ impl Model {
         if items.is_empty() && raw.is_empty() {
             return ok();
         }
+        // With synchronize-panes the keys also go to the window's other
+        // panes, as in tmux (not to ones in a mode). Only the target's
+        // full input queue is an error.
+        let mut others = Vec::new();
+        self.synchronized_panes(p, &mut others);
+        others.retain(|o| !host.pane_info(*o).in_mode);
         for _ in 0..count {
             if !raw.is_empty() {
                 host.send_to_pane(p, PaneInput::Bytes(&raw)).map_err(CmdError)?;
+                for o in &others {
+                    let _ = host.send_to_pane(*o, PaneInput::Bytes(&raw));
+                }
             }
             for i in &items {
                 let input = match i {
@@ -1970,6 +2100,9 @@ impl Model {
                     Item::Text(t) => PaneInput::Text(t),
                 };
                 host.send_to_pane(p, input).map_err(CmdError)?;
+                for o in &others {
+                    let _ = host.send_to_pane(*o, input);
+                }
             }
         }
         ok()

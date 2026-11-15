@@ -183,6 +183,21 @@ impl Server {
             self.key_to_mode(client, pane, key);
             return;
         }
+        // synchronize-panes: the window's other panes get the key too,
+        // each encoded for its own program. A full input queue there
+        // drops it without a word; the pane typed into reports its own.
+        let mut others = std::mem::take(&mut self.scratch_panes);
+        others.clear();
+        self.model.synchronized_panes(pane, &mut others);
+        for &o in &others {
+            let Some(p) = self.rt.panes.get_mut(&o).filter(|p| p.mode.is_none()) else { continue };
+            let mut b = std::mem::take(&mut self.replies);
+            b.clear();
+            p.engine.encode_key(key, &mut b);
+            self.rt.write_input(o, &b);
+            self.replies = b;
+        }
+        self.scratch_panes = others;
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
         let mut b = std::mem::take(&mut self.replies);
         b.clear();
@@ -401,7 +416,7 @@ impl Server {
         }
     }
 
-    fn display_time(&self) -> u64 {
+    pub(crate) fn display_time(&self) -> u64 {
         self.model.option_text("display-time", None, None).and_then(|v| v.parse().ok()).unwrap_or(750)
     }
 
@@ -710,6 +725,18 @@ impl Server {
         b.clear();
         p.engine.encode_paste_chunk(data, &mut b);
         let queued = self.rt.write_input(pane, &b);
+        // synchronize-panes: each other pane gets this part as a paste of
+        // its own (bracketed if its program asked for that).
+        let mut others = std::mem::take(&mut self.scratch_panes);
+        others.clear();
+        self.model.synchronized_panes(pane, &mut others);
+        for &o in &others {
+            let Some(p) = self.rt.panes.get_mut(&o).filter(|p| p.mode.is_none()) else { continue };
+            b.clear();
+            p.engine.encode_paste(data, &mut b);
+            self.rt.write_input(o, &b);
+        }
+        self.scratch_panes = others;
         self.replies = b;
         if !queued {
             if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {

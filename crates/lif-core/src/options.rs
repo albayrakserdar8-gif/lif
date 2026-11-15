@@ -138,6 +138,7 @@ pub(crate) static DEFS: &[Def] = &[
     d("status-right-length", Session, Number(0, i16::MAX as i64), "40"),
     d("status-right-style", Session, Str, "default"),
     d("status-style", Session, Str, "bg=green,fg=black"),
+    d("synchronize-panes", Window, Flag, "off"),
     d("tiled-layout-max-columns", Window, Number(0, MAXI), "0"),
     d("tmux-compat", Server, Flag, "off"),
     d("visual-bell", Session, Choice(&["off", "on", "both"]), "off"),

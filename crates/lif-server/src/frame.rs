@@ -454,18 +454,32 @@ impl Server {
         }
         self.prepare_title(id, sid);
         let wall = crate::sys::wall_clock();
+        let uses = self.model.format_job_uses();
         let line = self.model.status_line(sid, width, wall, &self.rt);
         let clock = ["status-left", "status-right"]
             .iter()
             .any(|o| self.model.option_text(o, Some(sid), None).is_some_and(|v| v.contains('%')));
+        // A status line with #() is drawn again every status-interval (its
+        // commands run again then); one without never is.
+        let interval = if self.model.format_job_uses() != uses {
+            self.model.start_format_jobs(wall, &mut self.rt);
+            self.model.option_text("status-interval", Some(sid), None).and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0)
+        } else {
+            None
+        };
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
         a.status = line;
         a.status_stale = false;
-        a.clock = clock;
-        a.clock_deadline = clock.then(|| {
+        a.clock = clock || interval.is_some();
+        let minute = clock.then(|| {
             let into = wall.unix_secs.rem_euclid(60) as u64;
             now + Duration::from_secs(60 - into)
         });
+        let again = interval.map(|s| now + Duration::from_secs(s));
+        a.clock_deadline = match (minute, again) {
+            (Some(m), Some(i)) => Some(m.min(i)),
+            (m, i) => m.or(i),
+        };
     }
 }
 

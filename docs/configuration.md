@@ -64,6 +64,12 @@ status = { bg = "black", fg = "white" }
 
 [keys.copy-mode]        # copy mode, mode-keys = "emacs"
 [keys.copy-mode-vi]     # copy mode, mode-keys = "vi"
+
+[hooks]                 # commands run when something happens
+after-split-window = "select-layout tiled"
+
+[env]                   # environment of new panes and shell commands
+EDITOR = "nvim"
 ```
 
 Keys not mentioned keep their defaults. Names are lower case with dashes, the
@@ -114,6 +120,7 @@ Value types used below:
 | `automatic-rename` | bool | `true` | Name windows after what runs in them. | `automatic-rename` |
 | `automatic-rename-format` | string | `"#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}"` | The format used for automatic names. | `automatic-rename-format` |
 | `remain-on-exit` | choice: `"off"`, `"on"`, `"failed"` | `"off"` | Keep a pane open after its program exits (`failed`: only on a non-zero status). | `remain-on-exit` |
+| `synchronize-panes` | bool | `false` | Send what is typed (keys, pastes, `send-keys`) to every pane of the window. Usually set for one window: `set -w synchronize-panes on`. | `synchronize-panes` |
 | `bell-action` | choice: `"none"`, `"any"`, `"current"`, `"other"` | `"any"` | Which windows' bells are passed on. | `bell-action` |
 | `visual-bell` | choice: `"off"`, `"on"`, `"both"` | `"off"` | Show a bell as a message instead of (`on`) or as well as (`both`) ringing. | `visual-bell` |
 | `monitor-bell` | bool | `true` | Flag windows that rang the bell. | `monitor-bell` |
@@ -146,7 +153,7 @@ gives `value is too small: -5`.
 | `enabled` | bool | `true` | Show the status line. | `status` |
 | `position` | choice: `"top"`, `"bottom"` | `"bottom"` | Where it is. | `status-position` |
 | `justify` | choice: `"left"`, `"centre"`, `"right"`, `"absolute-centre"` | `"left"` | Where the window list goes. | `status-justify` |
-| `interval` | integer (s) | `15` | Seconds between refreshes (for clocks); 0 never. | `status-interval` |
+| `interval` | integer (s) | `15` | Seconds between refreshes of a status line that uses `#(command)`, whose commands run again then; 0 never. (A clock is redrawn on the minute whatever this is.) | `status-interval` |
 | `left` | string (format) | `"[#{session_name}] "` | Left part. | `status-left` |
 | `left-length` | integer | `10` | Its maximum width in columns. | `status-left-length` |
 | `right` | string (format) | `'#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:pane_title}" %H:%M %d-%b-%y'` | Right part. | `status-right` |
@@ -157,7 +164,10 @@ gives `value is too small: -5`.
 
 Status formats expand strftime sequences (`%H:%M`) and can use
 `#[fg=...,bg=...,bold]` to change style mid-string. `#(shell command)`
-expands to nothing. Alignment, fill, list and range directives
+expands to the last line the command printed when it last ran (`/bin/sh
+-c`; nothing until it has run once), and the command runs again every
+`interval` seconds: `right = "#(uptime | sed 's/.*load/load/') %H:%M"`.
+Alignment, fill, list and range directives
 (`#[align=right]` and the like) are ignored in the status line and rejected
 in `[theme]`.
 
@@ -272,6 +282,47 @@ Key names are tmux's:
   in tmux.
 
 Modifier words such as `Ctrl-a` or `Alt-x` are rejected with a hint.
+
+## Hooks
+
+`[hooks]` sets the global hooks, what `set-hook -g` sets: commands lif runs
+when something happens. Each entry is `HOOK = VALUE`:
+
+| Value | Meaning | Becomes |
+|---|---|---|
+| `"select-layout tiled"` | a lif command string | `set-hook -g HOOK 'select-layout tiled'` |
+| `["display-message one", "run-shell '~/bin/two'"]` | several, each run in turn | `set-hook -g HOOK ...`, then `set-hook -ga HOOK ...` for the others |
+| `false` | no commands | `set-hook -gu HOOK` |
+
+Hook names are tmux's (`lif show-hooks -g` and `lif show-hooks -gw` list
+them); an unknown name is an error with a suggestion. The hooks lif runs,
+and the `#{hook_...}` variables their commands can use, are listed in
+[tmux-migration.md](tmux-migration.md#scripting). Reloading the file sets
+each hook again from scratch.
+
+```toml
+[hooks]
+after-split-window = "select-layout tiled"
+session-created = "run-shell 'echo #{hook_session_name} >> ~/.lif-sessions'"
+client-attached = ["display-message 'welcome back'", "refresh-client -S"]
+```
+
+## Environment
+
+`[env]` sets variables for panes and shell commands started from then on
+(`set-environment -g`). A string sets the variable; `false` removes it from
+their environment (`set-environment -gr`). Other value types are errors, so
+numbers are written as strings.
+
+```toml
+[env]
+EDITOR = "nvim"
+COLUMNS_HINT = "200"
+SSH_ASKPASS = false
+```
+
+Variables set for one session (`lif set-environment -t work NAME value`)
+and `-e NAME=value` of the commands that create panes come on top of these.
 
 ## Diagnostics
 

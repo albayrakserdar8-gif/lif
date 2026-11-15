@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+Scripting: lif runs shell commands and hooks. 70 of tmux 3.8's 92 commands
+now exist (9 more).
+
+- `run-shell` (`-b`, `-C`, `-c`, `-d`, `-E`, `-t`): the command's output is
+  the command's, a failing command prints `'cmd' returned N` and gives the
+  client its exit status, and the commands after it in the list wait for
+  it, as in tmux.
+- `if-shell` (`-b`, `-F`, `-t`); the branch runs in place, before the
+  commands that follow.
+- `wait-for` with channels (`wait-for name`, `-S`) and locks (`-L`,
+  `-U`).
+- `#(command)` in formats: the last line of the command's output; a status
+  line that uses it is redrawn every `status-interval`.
+- Hooks: `set-hook` (`-a`, `-g`, `-p`, `-R`, `-u`, `-w`) and `show-hooks`
+  with tmux 3.8's hook names and the `hook`, `hook_session`,
+  `hook_session_name`, `hook_window`, `hook_window_name`, `hook_pane` and
+  `hook_client` variables. The `after-` hooks and 17 event hooks run (the
+  list is in the README).
+- `set-environment`, `show-environment`, and `-e VARIABLE=value` on
+  `new-session`, `new-window`, `split-window` and `respawn-pane`.
+- `join-pane`, `clear-history`, and the `synchronize-panes` option (typed
+  keys, pastes and `send-keys`), with `#{pane_synchronized}`.
+- Configuration file: `[hooks]` and `[env]` sections and
+  `synchronize-panes`; `lif migrate-tmux-conf` translates `set-hook -g`
+  and `set-environment -g`.
+- Shell commands run as `/bin/sh -c` in their own process group, at most 64
+  at once, with 1 MiB of output kept; they are hung up when the server
+  exits. Nothing is polled: a server whose status line has no `#()` still
+  makes no wakeups while idle.
+- Fixed: `lif new-window` typed in a pane's shell failed with
+  `create window failed: index N in use` (issues/0002).
+- Model interface: `Host::start_job`, `Host::start_timer`,
+  `Host::clear_history`, `Model::job_done`, `Model::take_finished`,
+  `Model::run_hooks`; `CmdOutput` has `status` and `pending`; `SpawnSpec`
+  has `env`. The wire protocol is unchanged.
+
 ## 0.1.0 (unreleased)
 
 First version.
@@ -18,8 +56,8 @@ First version.
   panes at most once per 8 ms, skipping intermediate frames instead of
   queueing output; the echo of typed input is drawn at once; synchronized
   output (mode 2026) when the terminal has it.
-- 58 of tmux 3.8's commands with tmux's names, aliases, flags (most of them),
-  targets, formats and error messages; the other 34 are recognized and
+- 61 of tmux 3.8's commands with tmux's names, aliases, flags (most of them),
+  targets, formats and error messages; the other 31 are recognized and
   reported as unsupported. See docs/tmux-migration.md.
 - tmux 3.8's default prefix bindings for those commands (61 of 93 identical),
   and its copy-mode and copy-mode-vi tables.

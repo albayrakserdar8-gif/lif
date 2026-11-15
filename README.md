@@ -8,7 +8,7 @@ scripts know about tmux works unchanged. It is a single-threaded Rust server
 built on Ghostty's terminal engine (libghostty-vt), aimed at high output
 throughput, low idle cost and a small self-contained binary.
 
-Status: version 0.1.0. Enough of tmux is implemented for daily use; the list of
+Status: version 0.2.0. Enough of tmux is implemented for daily use; the list of
 what is missing is below and in [docs/tmux-migration.md](docs/tmux-migration.md).
 
 ## Benchmarks
@@ -114,10 +114,15 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   `{next}`, `+N`/`-N`, `{top}`/`{bottom}`/`{left}`/`{right}`, globs.
 - Formats: `#{variable}`, `#S #I #W #P #T #D #F #H #h`, conditionals,
   comparisons and the common modifiers (`=N`, `pN`, `t:`, `b:`, `d:`, `l:`,
-  `E:`, `T:`, `q:`, `n:`, `w:`, `s/a/b/:`, `m:`, `e|op|:`) and
-  strftime in the status line.
+  `E:`, `T:`, `q:`, `n:`, `w:`, `s/a/b/:`, `m:`, `e|op|:`),
+  strftime in the status line, and `#(shell command)`.
+- Scripting: `run-shell` (output, exit status, `-b`, `-d`, `-C`),
+  `if-shell` (also `-F`), `wait-for` (channels and locks), hooks
+  (`set-hook`, `show-hooks`, tmux's hook names) and the environment
+  commands (`set-environment`, `show-environment`, `-e` on the commands
+  that create panes), with tmux's output and messages.
 - Option names, scopes (`-s`, `-g`, `-w`, `-p`, per session, window and
-  pane) and the defaults of the 67 tmux options lif has (except
+  pane) and the defaults of the 68 tmux options lif has (except
   `escape-time`, `history-limit` and `pane-border-format`), plus user
   options (`@name`).
 - Layouts: `even-horizontal`, `even-vertical`, `main-horizontal`,
@@ -158,11 +163,28 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   panes inherit). `lif` run inside a pane talks to that pane's server
   through `$LIF` unless `-S` or `-L` is given, and refuses to attach unless
   `$LIF` is unset, as tmux does with `$TMUX`.
-- **Almost no shell commands from lif.** `#(command)` in formats expands to
-  nothing and there is no `run-shell` or `if-shell`. The exception is copying:
-  `copy-pipe-and-cancel "pbcopy"` runs `pbcopy` with the selection, and the
-  `copy-command` option does the same for the default copy keys and mouse
-  copies, as in tmux.
+- **Shell commands run with `/bin/sh`**, whatever `default-shell` is (tmux
+  uses `default-shell`): `run-shell`, `if-shell`, `#()` and `copy-pipe`.
+  At most 64 commands of the first three run at once and 1 MiB of a
+  command's output is kept. A `#()`
+  command runs again when the status line is redrawn and its last run
+  started `status-interval` seconds ago or more (tmux: one second), and
+  only a status line that uses `#()` is redrawn on that interval; an idle
+  server still wakes for nothing else.
+- **`set-environment` holds only what you set.** Panes get the server's
+  environment plus a few variables of the client that creates the session;
+  `set-environment` (and `[env]` in the configuration file) adds to or
+  removes from that, and `show-environment` lists just those entries
+  (tmux lists the whole environment). There is no `update-environment`
+  option.
+- **Hooks that exist but never run.** `set-hook` takes every tmux 3.8 hook
+  name; the ones lif runs are the `after-` hooks of the commands it has
+  and `session-created`, `session-closed`, `session-renamed`,
+  `session-window-changed`, `window-linked`, `window-unlinked`,
+  `window-renamed`, `window-layout-changed`, `window-pane-changed`,
+  `client-attached`, `client-detached`, `client-session-changed`,
+  `client-resized`, `pane-exited`, `pane-died`, `alert-bell` and
+  `alert-activity`.
 - **Mouse handling is built in**: mouse support is on by default (as in tmux
   3.8) and does what tmux's default mouse bindings do (a drag or a double or
   triple click copies and leaves copy mode), but mouse events cannot be bound.
@@ -183,21 +205,19 @@ tmux: `lif install-tmux-shim` and `tmux-compat = true` make lif answer for
 Checked against the command table and by running each one (they fail with
 `unsupported command: NAME`):
 
-- Running shell commands: `run-shell`, `if-shell`, `pipe-pane`, `#()` in
-  formats.
-- Hooks (`set-hook`, `show-hooks`) and `wait-for`.
+- `pipe-pane`.
 - Popups and menus (`display-popup`, `display-menu`), floating panes
   (`new-pane`, `move-pane`).
 - Tree and chooser modes: `choose-tree`, `choose-buffer`, `choose-client`,
   `customize-mode`, `find-window`, `clock-mode`, `switch-mode`.
 - Session groups and linked windows (`new-session -t`, `link-window`,
-  `unlink-window`), `join-pane`, `resize-window`, `respawn-window`.
-- Environment commands (`set-environment`, `show-environment`),
-  `clear-history`, locking, `server-access`, prompt history.
-- Control mode (`-C`), marked panes, synchronized panes, most of tmux's 204
-  options (lif has 67 of them, plus 3 of its own).
-- Images (sixel, kitty graphics), plugins (TPM and anything that needs
-  `run-shell`), Windows.
+  `unlink-window`), `resize-window`, `respawn-window`.
+- Locking, `server-access`, prompt history.
+- Control mode (`-C`), marked panes, most of tmux's 204 options (lif has 68
+  of them, plus 3 of its own).
+- Images (sixel, kitty graphics), Windows. Plugins are untested: TPM is
+  loaded from `.tmux.conf` with `run`, and lif's configuration file has
+  no place for a command run at start-up.
 
 ## Configuration in brief
 
@@ -223,6 +243,12 @@ h = { command = "select-pane -L", repeat = true }
 
 [keys.copy-mode-vi]
 v = "send-keys -X begin-selection"
+
+[hooks]
+after-split-window = "select-layout tiled"
+
+[env]
+EDITOR = "nvim"
 ```
 
 The file is read when the server starts; `lif source-file ~/.config/lif/config.toml`

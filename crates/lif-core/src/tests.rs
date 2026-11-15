@@ -41,6 +41,12 @@ struct TestHost {
     files: HashMap<String, Vec<u8>>,
     /// Data given to `set_clipboard`.
     clipboard: Vec<Vec<u8>>,
+    /// Shell commands and timers (id, milliseconds) the model started.
+    jobs: Vec<JobSpec>,
+    timers: Vec<(u64, u64)>,
+    fail_jobs: bool,
+    /// Panes whose history was cleared.
+    cleared: Vec<PaneId>,
 }
 
 impl Host for TestHost {
@@ -52,6 +58,20 @@ impl Host for TestHost {
         self.events.push(ProcEvent::Spawn { pane: spec.pane, respawn: spec.respawn });
         self.resized.insert(spec.pane, spec.size);
         Ok(())
+    }
+    fn start_job(&mut self, job: &JobSpec) -> Result<(), String> {
+        if self.fail_jobs {
+            return Err(format!("{}: fork failed", job.command));
+        }
+        self.jobs.push(job.clone());
+        Ok(())
+    }
+    fn start_timer(&mut self, id: u64, delay_ms: u64) -> Result<(), String> {
+        self.timers.push((id, delay_ms));
+        Ok(())
+    }
+    fn clear_history(&mut self, pane: PaneId) {
+        self.cleared.push(pane);
     }
     fn kill_pane(&mut self, pane: PaneId) {
         self.killed.push(pane);
@@ -79,7 +99,7 @@ impl Host for TestHost {
             current_path: self.paths.get(&pane).map(|s| s.as_str()).unwrap_or(""),
             history_size: 0,
             history_bytes: 0,
-            in_mode: false,
+            in_mode: self.in_mode.contains(&pane),
         }
     }
     fn capture_pane(&self, pane: PaneId, range: CaptureRange) -> String {
@@ -1413,7 +1433,7 @@ fn list_commands_format() {
     );
     assert_eq!(
         t.ok("lscm -F '#{command_list_usage}' new-session"),
-        "[-AdDEPX] [-c value] [-F value] [-n value] [-s value] [-x value] [-y value] [argument ...]\n"
+        "[-AdDEPX] [-c value] [-e value] [-F value] [-n value] [-s value] [-x value] [-y value] [argument ...]\n"
     );
     assert_eq!(t.ok("lscm -F '#{command_list_usage}' kill-server"), "\n");
     let all = t.ok("lscm -F '#{command_list_name}'");
@@ -1514,4 +1534,410 @@ fn set_titles_string() {
     t.ok("set -g set-titles on");
     t.h.titles.insert(PaneId(0), "vim x".into());
     assert_eq!(t.m.titles_string(SessionId(0), &t.h, NOW).as_deref(), Some("a:0:zsh - \"vim x\""));
+}
+
+// ----- commands that wait, hooks, environment (tmux 3.8 checked) ---------
+
+impl T {
+    /// Runs `s`, which must park.
+    fn park(&mut self, s: &str) {
+        let list = parse_string(s).unwrap();
+        let o = self.m.execute_list(&list, &self.ctx, &mut self.h).unwrap_or_else(|e| panic!("{s}: {e}"));
+        assert!(o.pending && o.stdout.is_empty(), "{s} did not park: {o:?}");
+    }
+
+    /// The newest job ends with `status` and `output`.
+    fn job(&mut self, status: i32, output: &str) {
+        let id = self.h.jobs.last().expect("a job").id;
+        self.m.job_done(id, JobStatus::Exited(status), output.as_bytes(), NOW, &mut self.h);
+        check_model(&self.m);
+    }
+
+    fn finished(&mut self) -> Finished {
+        let mut f = self.m.take_finished();
+        assert_eq!(f.len(), 1, "{f:?}");
+        f.remove(0)
+    }
+}
+
+#[test]
+fn run_shell_parks_the_list_and_carries_on() {
+    let mut t = T::with_session();
+    t.park("run-shell 'echo #{session_name}' ; display -p after");
+    assert_eq!(t.h.jobs.len(), 1);
+    assert_eq!(t.h.jobs[0].command, "echo a", "the command is a format");
+    assert_eq!((t.h.jobs[0].session, t.h.jobs[0].pane, t.h.jobs[0].stderr), (Some(SessionId(0)), Some(PaneId(0)), false));
+    assert_eq!(t.m.parked(), 1);
+    assert!(!t.m.has_finished());
+    t.job(0, "a\n");
+    assert_eq!(t.finished(), Finished { client: None, waited: true, stdout: "a\nafter\n".into(), status: 0, error: None });
+    assert_eq!(t.m.parked(), 0);
+    // tmux 3.8: a failing command prints this, the list goes on, and the
+    // client exits with the command's status.
+    t.park("run -E 'exit 3' ; display -p after");
+    assert!(t.h.jobs[1].stderr);
+    t.job(3, "partial");
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.status), ("partial\n'exit 3' returned 3\nafter\n", 3));
+    t.park("run 'kill -9 $$'");
+    let id = t.h.jobs.last().unwrap().id;
+    t.m.job_done(id, JobStatus::Signaled(9), b"", NOW, &mut t.h);
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.status), ("'kill -9 $$' terminated by signal 9\n", 137));
+    // An error after the wait ends the list; what ran before is kept.
+    t.park("run 'echo x' ; kill-pane -t %99 ; display -p never");
+    t.job(0, "x\n");
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.error.map(|e| e.0).as_deref()), ("x\n", Some("can't find pane: %99")));
+    // Nothing to run is not an error; a job that cannot start is.
+    assert_eq!(t.ok("run-shell"), "");
+    t.h.fail_jobs = true;
+    assert_eq!(t.err("run-shell 'true'"), "true: fork failed");
+    assert_eq!(t.m.parked(), 0);
+    assert_eq!(t.err("run-shell -t %9 true"), "can't find pane: %9");
+}
+
+#[test]
+fn run_shell_background_delay_and_commands() {
+    let mut t = T::with_session();
+    // -b: the list does not wait.
+    assert_eq!(t.ok("run-shell -b 'echo bg' ; display -p now"), "now\n");
+    assert_eq!(t.m.parked(), 1);
+    t.job(0, "bg\n");
+    assert_eq!(t.finished(), Finished { client: None, waited: false, stdout: "bg\n".into(), status: 0, error: None });
+    // -C runs commands, in place.
+    assert_eq!(t.ok("run-shell -C 'display -p one' ; display -p two"), "one\ntwo\n");
+    assert_eq!(t.err("run-shell -C 'nosuch'"), "unknown command: nosuch");
+    // -d waits first (seconds, with a fraction).
+    t.park("run-shell -d 0.25 'echo late'");
+    assert_eq!(t.h.timers.len(), 1);
+    assert_eq!(t.h.timers[0].1, 250);
+    let jobs = t.h.jobs.len();
+    t.m.job_done(t.h.timers[0].0, JobStatus::Exited(0), b"", NOW, &mut t.h);
+    assert_eq!(t.h.jobs.len(), jobs + 1, "the command starts when the delay is over");
+    assert!(!t.m.has_finished());
+    t.job(0, "late\n");
+    assert_eq!(t.finished().stdout, "late\n");
+    t.park("run-shell -d 1 -C 'display -p later' ; display -p last");
+    t.m.job_done(t.h.timers[1].0, JobStatus::Exited(0), b"", NOW, &mut t.h);
+    assert_eq!(t.finished().stdout, "later\nlast\n");
+    t.park("run-shell -d 2");
+    assert_eq!(t.h.timers[2].1, 2000);
+    assert_eq!(t.err("run-shell -d x"), "invalid delay time: x");
+    assert_eq!(t.err("run-shell -d -1"), "invalid delay time: -1");
+    assert_eq!(t.err("run-shell -d 1e300"), "invalid delay time: 1e300");
+}
+
+#[test]
+fn if_shell_runs_a_branch_in_place() {
+    let mut t = T::with_session();
+    assert_eq!(t.ok("if-shell -F '#{session_name}' 'display -p yes' 'display -p no' ; display -p end"), "yes\nend\n");
+    assert_eq!(t.ok("if -F '0' 'display -p yes' 'display -p no'"), "no\n");
+    assert_eq!(t.ok("if -F '' 'display -p yes'"), "");
+    assert_eq!(t.ok("if -F 1 { display -p a ; display -p b }"), "a\nb\n");
+    assert!(t.h.jobs.is_empty(), "-F runs nothing");
+    t.park("if-shell 'test -n #{session_name}' 'display -p yes' 'display -p no' ; display -p end");
+    assert_eq!(t.h.jobs[0].command, "test -n a");
+    t.job(0, "ignored output");
+    assert_eq!(t.finished().stdout, "yes\nend\n");
+    t.park("if-shell false 'display -p yes' 'display -p no'");
+    t.job(1, "");
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.status), ("no\n", 0), "the condition's status is not the client's");
+    t.park("if-shell false 'display -p yes'");
+    t.job(1, "");
+    assert_eq!(t.finished().stdout, "");
+    // Only the branch taken is parsed (tmux 3.8).
+    t.park("if-shell true 'nosuchcmd' 'alsonot'");
+    t.job(0, "");
+    assert_eq!(t.finished().error.map(|e| e.0).as_deref(), Some("unknown command: nosuchcmd"));
+    // A branch can wait itself.
+    t.park("if-shell true 'run-shell \"echo inner\"' ; display -p end");
+    t.job(0, "");
+    assert!(!t.m.has_finished());
+    t.job(0, "inner\n");
+    assert_eq!(t.finished().stdout, "inner\nend\n");
+    assert_eq!(t.ok("if-shell -b true 'display -p yes' ; display -p first"), "first\n");
+    t.job(0, "");
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.waited), ("yes\n", false));
+    assert_eq!(t.err("if-shell true"), "command if-shell: too few arguments (need at least 2)");
+}
+
+#[test]
+fn wait_for_channels_and_locks() {
+    let mut t = T::with_session();
+    let (a, b) = (t.attach_client(1, 80, 24), t.attach_client(2, 80, 24));
+    t.ctx = CmdContext::client(a, NOW);
+    t.park("wait-for ch ; display -p woke-a");
+    t.ctx = CmdContext::client(b, NOW);
+    t.park("wait-for ch ; display -p woke-b");
+    t.ctx = CmdContext::none(NOW);
+    assert_eq!(t.ok("wait-for -S other"), "", "another channel wakes nobody");
+    assert!(!t.m.has_finished());
+    assert_eq!(t.ok("wait-for -S ch ; display -p signalled"), "signalled\n");
+    let f = t.m.take_finished();
+    assert_eq!(f.iter().map(|f| (f.client, f.stdout.as_str())).collect::<Vec<_>>(), [(Some(a), "woke-a\n"), (Some(b), "woke-b\n")]);
+    // Signalled ahead of the waiter (tmux 3.8 keeps that).
+    assert_eq!(t.ok("wait-for other ; display -p at-once"), "at-once\n");
+    t.park("wait-for other");
+    // Locks: one holder, the others queue in order.
+    assert_eq!(t.err("wait-for -U lk"), "channel lk not locked");
+    assert_eq!(t.ok("wait-for -L lk"), "");
+    t.ctx = CmdContext::client(a, NOW);
+    t.park("wait-for -L lk ; display -p a-has-it");
+    t.ctx = CmdContext::client(b, NOW);
+    t.park("wait-for -L lk ; display -p b-has-it");
+    t.ctx = CmdContext::none(NOW);
+    t.ok("wait-for -U lk");
+    assert_eq!(t.finished().stdout, "a-has-it\n");
+    t.ok("wait-for -U lk");
+    assert_eq!(t.finished().stdout, "b-has-it\n");
+    t.ok("wait-for -U lk");
+    assert_eq!(t.err("wait-for -U lk"), "channel lk not locked");
+    // A client that goes away stops waiting.
+    t.ctx = CmdContext::client(a, NOW);
+    t.park("wait-for gone");
+    let parked = t.m.parked();
+    t.m.client_disconnect(a, &mut t.h);
+    assert_eq!(t.m.parked(), parked - 1);
+    t.ctx = CmdContext::none(NOW);
+    assert_eq!(t.err("wait-for"), "command wait-for: too few arguments (need at least 1)");
+}
+
+#[test]
+fn waiting_inside_source_file_does_not_hold_it_up() {
+    let mut t = T::with_session();
+    let file = ConfigFile {
+        commands: vec![("run-shell 'echo slow' ; set -g @after-run 1".into(), "f:1:1".into()), ("set -g @next 1".into(), "f:2:1".into())],
+        diagnostics: Vec::new(),
+    };
+    t.h.configs.insert("/f".into(), file);
+    assert_eq!(t.ok("source-file /f ; display -p '#{@next}#{@after-run}'"), "1\n", "the file's other lines ran, the list goes on");
+    t.job(0, "slow\n");
+    assert_eq!(t.ok("display -p '#{@after-run}'"), "1\n", "the rest of the line ran when the command was done");
+    let f = t.finished();
+    assert!(!f.waited);
+}
+
+#[test]
+fn parked_lists_are_bounded() {
+    let mut t = T::with_session();
+    for _ in 0..1024 {
+        t.park("wait-for never");
+    }
+    assert_eq!(t.err("wait-for never"), "too many waiting commands (1024)");
+    assert_eq!(t.err("run-shell true"), "too many waiting commands (1024)");
+    assert!(t.h.jobs.is_empty(), "nothing is started that could not be waited for");
+    t.ok("wait-for -S never");
+    assert_eq!(t.m.take_finished().len(), 1024);
+    assert_eq!(t.m.parked(), 0);
+}
+
+#[test]
+fn format_shell_commands_show_their_last_output() {
+    let mut t = T::with_session();
+    let at = |secs: i64| WallClock::new(NOW.unix_secs + secs, NOW.utc_offset_secs);
+    let show = |t: &mut T, secs: i64| t.m.expand_format("[#(uptime #{session_name})]", Some(SessionId(0)), None, None, None, at(secs), &t.h);
+    let uses = t.m.format_job_uses();
+    assert_eq!(show(&mut t, 0), "[]", "nothing until it has run once");
+    assert_ne!(t.m.format_job_uses(), uses);
+    assert!(t.h.jobs.is_empty(), "expanding starts nothing itself");
+    t.m.start_format_jobs(at(0), &mut t.h);
+    assert_eq!(t.h.jobs.len(), 1);
+    assert_eq!((t.h.jobs[0].command.as_str(), t.h.jobs[0].session), ("uptime a", Some(SessionId(0))));
+    assert_eq!(show(&mut t, 1), "[]");
+    t.m.start_format_jobs(at(1), &mut t.h);
+    assert_eq!(t.h.jobs.len(), 1, "not again while it runs");
+    t.job(0, "first line\nload 1.5\n\n");
+    assert!(!t.m.has_finished(), "a format's command is nobody's command");
+    assert_eq!(show(&mut t, 2), "[load 1.5]", "the last line that is not empty");
+    t.m.start_format_jobs(at(2), &mut t.h);
+    assert_eq!(t.h.jobs.len(), 1, "not before status-interval (15 s) has passed");
+    assert_eq!(show(&mut t, 15), "[load 1.5]");
+    t.m.start_format_jobs(at(15), &mut t.h);
+    assert_eq!(t.h.jobs.len(), 2);
+    t.job(0, "load 2.0\n");
+    assert_eq!(show(&mut t, 16), "[load 2.0]");
+    // More commands than are remembered: the one used longest ago goes.
+    for i in 0..64 {
+        t.m.expand_format(&format!("#(echo {i})"), None, None, None, None, at(20), &t.h);
+    }
+    assert_eq!(show(&mut t, 21), "[]", "forgotten, so empty again");
+}
+
+#[test]
+fn hooks_run_after_commands_and_events() {
+    let mut t = T::with_session();
+    assert_eq!(t.err("set-hook -g bogus-hook 'display x'"), "invalid option: bogus-hook");
+    assert_eq!(t.err("set-hook -g after-new-window"), "empty value");
+    assert_eq!(t.err("show-hooks -g nosuch"), "invalid option: nosuch");
+    assert_eq!(t.ok("show-hooks"), "");
+    let all = t.ok("show-hooks -g");
+    assert_eq!(all.lines().count(), 62, "tmux 3.8 has 62 session hooks");
+    assert!(all.starts_with("after-bind-key\nafter-capture-pane\n") && all.ends_with("window-linked\nwindow-unlinked\n"));
+    assert_eq!(t.ok("show-hooks -gw").lines().count(), 27);
+    // tmux 3.8 prints the command as it parsed it; the hook's output joins
+    // the command's.
+    t.ok("set-hook -g after-new-window 'display -p \"hooked #{hook} #{hook_session_name} #{hook_window} #{hook_pane} #{pane_id}\"'");
+    assert_eq!(t.ok("show-hooks -g after-new-window"), "after-new-window[0] display-message -p \"hooked #{hook} #{hook_session_name} #{hook_window} #{hook_pane} #{pane_id}\"\n");
+    assert_eq!(t.ok("new-window -d"), "hooked after-new-window a @1 %1 %1\n", "about the new pane, which is its current pane");
+    t.ok("set-hook -ga after-new-window 'display -p second'");
+    assert_eq!(t.ok("new-window -d ; display -p cmd"), "cmd\nhooked after-new-window a @2 %2 %2\nsecond\n", "hooks run when the list is done");
+    t.ok("set-hook -gu 'after-new-window[0]'");
+    assert_eq!(t.ok("show-hooks -g after-new-window"), "after-new-window[1] display-message -p second\n");
+    // A session's own setting replaces the global one.
+    t.ok("set-hook after-new-window 'display -p mine'");
+    assert_eq!(t.ok("show-hooks"), "after-new-window[0] display-message -p mine\n");
+    assert_eq!(t.ok("new-window -d"), "mine\n");
+    t.ok("set-hook -u after-new-window ; set-hook -gu after-new-window");
+    assert_eq!(t.ok("new-window -d"), "");
+    // Commands of a hook fire no hooks.
+    t.ok("set-hook -g after-new-window 'new-window -d'");
+    let before = t.ok("list-windows").lines().count();
+    t.ok("new-window -d");
+    assert_eq!(t.ok("list-windows").lines().count(), before + 2);
+    t.ok("set-hook -gu after-new-window");
+    // Events.
+    t.ok("set-hook -g session-renamed 'display -p \"renamed to #{hook_session_name}\"'");
+    assert_eq!(t.ok("rename-session b"), "renamed to b\n");
+    t.ok("set-hook -g session-closed 'set -gF @closed \"#{hook_session_name}\"'");
+    t.ok("new -d -s doomed ; kill-session -t doomed");
+    assert_eq!(t.ok("display -p '#{@closed}'"), "doomed\n");
+    t.ok("set-hook -g window-renamed 'set -gF @w \"#{hook_window_name}\"' ; rename-window -t b:0 ed");
+    assert_eq!(t.ok("display -p '#{@w}'"), "ed\n");
+    // Outside commands: the server runs them.
+    t.ok("set-hook -g pane-exited 'set -gF @exited \"#{hook_pane}\"' ; split-window -d -t b:0");
+    let p = t.m.window(WindowId(0)).unwrap().panes()[1];
+    t.m.pane_exited(p, Some(0), &mut t.h);
+    assert!(t.m.has_hooks());
+    t.m.run_hooks(NOW, &mut t.h);
+    assert!(!t.m.has_hooks());
+    assert_eq!(t.ok("display -p '#{@exited}'"), format!("{p}\n"));
+    // On a pane, for window hooks; -R runs one now.
+    t.ok("set-hook -p -t b:0.0 pane-exited 'display -p pane-own'");
+    assert_eq!(t.ok("show-hooks -p -t b:0.0"), "pane-exited[0] display-message -p pane-own\n");
+    assert_eq!(t.ok("show-hooks -w -t b:0"), "");
+    assert_eq!(t.ok("set-hook -R -t b:0.0 pane-exited"), "pane-own\n");
+    // A list that waits takes along what its hooks printed so far.
+    t.ok("set-hook -g after-rename-window 'display -p renamed-hook'");
+    t.park("rename-window -t b:0 w1 ; run-shell 'echo job' ; display -p end");
+    t.job(0, "job\n");
+    assert_eq!(t.finished().stdout, "renamed-hook\njob\nend\n");
+    // A hook that waits finishes on its own, reporting once.
+    t.ok("set-hook -g after-rename-window 'run-shell \"echo a\" ; run-shell \"echo b\"'");
+    assert_eq!(t.ok("rename-window -t b:0 w2"), "");
+    t.job(0, "a\n");
+    let f = t.finished();
+    assert_eq!((f.stdout.as_str(), f.waited), ("a\n", false), "what it has so far, for whoever can show it");
+    t.job(0, "b\n");
+    assert_eq!(t.finished().stdout, "b\n");
+    // A hook that fails is logged, not an error of the command.
+    t.ok("set-hook -g after-rename-window 'kill-pane -t %99'");
+    assert_eq!(t.ok("rename-window -t b:0 again"), "");
+    assert!(t.m.messages().any(|m| m == "can't find pane: %99"));
+}
+
+#[test]
+fn environment_commands() {
+    let mut t = T::with_session();
+    assert_eq!(t.err("setenv '' x"), "empty variable name");
+    assert_eq!(t.err("setenv A=B x"), "variable name contains =");
+    assert_eq!(t.err("setenv NOVAL"), "no value specified");
+    assert_eq!(t.err("setenv -u X y"), "can't specify a value with -u");
+    assert_eq!(t.err("setenv -r X y"), "can't specify a value with -r");
+    assert_eq!(t.err("showenv NOPE"), "unknown variable: NOPE");
+    t.ok("setenv FOO bar ; setenv -g GFOO 'g \"x\" $y' ; setenv -F FF '#{session_name}' ; setenv -h HID 1 ; setenv -r GONE");
+    assert_eq!(t.ok("showenv"), "FF=a\nFOO=bar\n-GONE\n");
+    assert_eq!(t.ok("showenv -h"), "HID=1\n");
+    assert_eq!(t.ok("showenv -g"), "GFOO=g \"x\" $y\n");
+    assert_eq!(t.ok("showenv -gs"), "GFOO=\"g \\\"x\\\" \\$y\"; export GFOO;\n");
+    assert_eq!(t.ok("showenv -s GONE"), "unset GONE;\n");
+    assert_eq!(t.ok("showenv FOO"), "FOO=bar\n");
+    // New panes and shell commands get them: global, session, then -e.
+    t.ok("new-window -d -e FOO=flag -e EXTRA=1 -e ignored");
+    let env = &t.h.spawned.last().unwrap().env;
+    let want: Vec<(String, Option<String>)> = [("GFOO", Some("g \"x\" $y")), ("FF", Some("a")), ("FOO", Some("bar")), ("GONE", None), ("FOO", Some("flag")), ("EXTRA", Some("1"))]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+        .collect();
+    assert_eq!(*env, want, "hidden ones stay out; later entries win");
+    t.ok("split-window -d -e S=1");
+    assert_eq!(t.h.spawned.last().unwrap().env.last(), Some(&("S".to_string(), Some("1".to_string()))));
+    t.park("run-shell true");
+    assert_eq!(t.h.jobs[0].env.len(), 4);
+    t.ok("setenv -u FOO ; setenv -gu GFOO");
+    assert_eq!(t.ok("showenv"), "FF=a\n-GONE\n");
+    assert_eq!(t.ok("showenv -g"), "");
+    // Another session has its own.
+    t.ok("new -d -s other");
+    assert_eq!(t.ok("showenv -t other"), "");
+}
+
+#[test]
+fn join_pane_moves_a_pane_between_windows() {
+    // Sizes and order as tmux 3.8 gives them for the same commands.
+    let mut t = T::with_session();
+    t.ok("new-window -d ; split-window -d -t a:0");
+    assert_eq!(t.err("join-pane -s a:1.0 -t a:1.0"), "source and target panes must be different");
+    t.ok("join-pane -h -s a:0.1 -t a:1.0");
+    assert_eq!(
+        t.ok("list-panes -a -F '#{window_index}.#{pane_index} #{pane_id} #{pane_width}x#{pane_height} #{pane_active}'"),
+        "0.0 %0 80x24 1\n1.0 %1 40x24 0\n1.1 %2 39x24 1\n"
+    );
+    assert_eq!(t.ok("display -p '#{window_index}'"), "1\n", "the target's window becomes current");
+    // The last pane of a window: the window goes.
+    t.ok("join-pane -d -s a:0.0 -t a:1.0");
+    assert_eq!(
+        t.ok("list-panes -a -F '#{window_index}.#{pane_index} #{pane_id} #{pane_width}x#{pane_height} #{pane_active}'"),
+        "1.0 %1 40x12 0\n1.1 %0 40x11 0\n1.2 %2 39x24 1\n"
+    );
+    assert!(t.h.killed.is_empty(), "nothing was killed");
+    // Inside one window, before the target.
+    t.ok("join-pane -b -s a:1.2 -t a:1.0");
+    assert_eq!(t.ok("list-panes -t a:1 -F '#{pane_id}'"), "%2\n%1\n%0\n");
+    // A pane that does not fit leaves everything as it was.
+    t.ok("new -d -s tiny -x 80 -y 2");
+    let before = t.ok("list-panes -a -F '#{pane_id} #{window_id} #{pane_width}x#{pane_height}'");
+    assert_eq!(t.err("join-pane -s a:1.0 -t tiny:0.0"), t.err("split-window -t tiny:0.0"), "what split-window says there");
+    assert_eq!(t.ok("list-panes -a -F '#{pane_id} #{window_id} #{pane_width}x#{pane_height}'"), before);
+    // The last window of a session: the session goes.
+    t.ok("new -d -s one");
+    t.ok("join-pane -s one:0.0 -t a:1.0");
+    assert_eq!(t.err("has-session -t one"), "can't find session: one");
+}
+
+#[test]
+fn synchronize_panes_and_clear_history() {
+    let mut t = T::with_session();
+    t.ok("split-window -d ; split-window -d");
+    t.ok("send-keys -t a:0.0 -l solo");
+    assert_eq!(t.h.sent.len(), 1);
+    assert_eq!(t.ok("display -p '#{pane_synchronized}'"), "0\n");
+    t.ok("set -w synchronize-panes on");
+    assert_eq!(t.ok("display -p '#{pane_synchronized}'"), "1\n");
+    t.h.sent.clear();
+    t.h.in_mode.push(PaneId(2));
+    t.ok("send-keys -t a:0.0 -l all Enter");
+    let got: Vec<(u32, &str)> = t.h.sent.iter().map(|(p, s)| (p.0, s.as_str())).collect();
+    assert_eq!(got, [(0, "text:all"), (1, "text:all"), (0, "text:Enter"), (1, "text:Enter")], "not the pane in a mode");
+    // One pane can stay out (set -p).
+    t.h.in_mode.clear();
+    t.h.sent.clear();
+    t.ok("set -p -t %1 synchronize-panes off ; send-keys -t a:0.0 -l x");
+    assert_eq!(t.h.sent.iter().map(|(p, _)| p.0).collect::<Vec<_>>(), [0, 2]);
+    t.ok("clear-history -t %1");
+    assert_eq!(t.h.cleared, [PaneId(1)]);
+    assert_eq!(t.err("clear-history -t nosuch"), "can't find pane: nosuch");
+}
+
+#[test]
+fn new_window_from_inside_a_pane_takes_a_free_index() {
+    // A client that is not attached but runs in a pane (LIF_PANE): its
+    // current window is the pane's, which is no reason to reuse its index.
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 24);
+    t.ctx = CmdContext { client: Some(c), pane: Some(PaneId(0)), now: NOW };
+    assert_eq!(t.ok("new-window -d -P"), "a:1.0\n");
+    assert_eq!(t.err("new-window -d -t a:0"), "create window failed: index 0 in use");
 }

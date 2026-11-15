@@ -7,8 +7,8 @@
 //! substitution), `m:` (glob match) and `e|op|:` (integer arithmetic).
 //!
 //! `#[style]` directives are copied through unchanged for the status line
-//! renderer. `#(shell command)` expands to nothing: lif never runs commands
-//! from formats.
+//! renderer. `#(shell command)` expands to what [`Vars::shell`] gives for
+//! the command (itself expanded first): the last line of its previous run.
 
 use crate::time::{Tm, WallClock, ctime, strftime};
 
@@ -18,6 +18,13 @@ pub trait Vars {
     fn var(&self, name: &str) -> Option<String>;
     /// The current wall-clock time, for `t:`.
     fn now(&self) -> WallClock;
+    /// `#(command)`: the last line `command` printed when it last ran
+    /// (it is run again in the background), or `None` where formats do
+    /// not run commands.
+    fn shell(&self, command: &str) -> Option<String> {
+        let _ = command;
+        None
+    }
 }
 
 /// How deeply `#{...}` (and `E:`/`T:` option expansions) may nest; deeper
@@ -239,6 +246,12 @@ fn expand_into(fmt: &str, cx: &mut Cx, out: &mut String, depth: u32) {
                         _ => {}
                     }
                     j += 1;
+                }
+                if j < b.len() && cx.step() {
+                    let command = sub(&fmt[i + 2..j], cx, depth + 1);
+                    if let Some(v) = cx.vars.shell(&command) {
+                        cx.push(out, &v);
+                    }
                 }
                 i = (j + 1).min(b.len());
             }

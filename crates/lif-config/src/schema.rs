@@ -100,6 +100,7 @@ pub(crate) static TOP: &[Opt] = &[
     srv("set-clipboard", Choice(&["off", "external", "on"])),
     o("set-titles", "set-titles", Bool),
     o("set-titles-string", "set-titles-string", Str),
+    o("synchronize-panes", "synchronize-panes", Bool),
     o("tiled-layout-max-columns", "tiled-layout-max-columns", Int),
     srv("tmux-compat", Bool),
     o("visual-bell", "visual-bell", Choice(&["off", "on", "both"])),
@@ -146,7 +147,7 @@ pub(crate) static THEME: &[Opt] = &[
 /// Key tables a `[keys.NAME]` section may name.
 pub(crate) const TABLES: &[&str] = &["prefix", "root", "copy-mode", "copy-mode-vi"];
 
-const SECTIONS: &[&str] = &["keys", "status", "theme"];
+const SECTIONS: &[&str] = &["keys", "status", "theme", "hooks", "env"];
 
 /// Named keys, for suggestions on misspelled key names.
 const KEY_NAMES: &[&str] = &[
@@ -352,6 +353,10 @@ impl Tr<'_> {
                 }
                 ("theme", DeValue::Table(t)) => self.section(t, THEME, "theme"),
                 ("theme", other) => self.err(at, format!("`theme` must be a table of styles ([theme]), found {}", describe(other))),
+                ("hooks", DeValue::Table(t)) => self.hooks(t),
+                ("hooks", other) => self.err(at, format!("`hooks` must be a table of hooks ([hooks]), found {}", describe(other))),
+                ("env", DeValue::Table(t)) => self.env(t),
+                ("env", other) => self.err(at, format!("`env` must be a table of environment variables ([env]), found {}", describe(other))),
                 _ => match TOP.iter().find(|o| o.key == name) {
                     Some(opt) => self.option(opt, name, k, v),
                     None => {
@@ -517,6 +522,94 @@ impl Tr<'_> {
                 self.err(k.span().start, msg);
             } else {
                 self.err(k.span().start, bad_key_message(name));
+            }
+        }
+    }
+
+    /// `[hooks]`: `name = "command"`, a list of commands that each run,
+    /// or `false` for none. They are the global hooks (`set-hook -g`).
+    fn hooks(&mut self, t: &DeTable<'_>) {
+        for (k, v) in entries(t) {
+            if self.is_damaged(k.span().start..v.span().end) {
+                continue;
+            }
+            let name = k.get_ref().as_ref();
+            let at = v.span().start;
+            if !lif_core::hook_names().any(|h| h == name) {
+                let hint = did_you_mean(name, lif_core::hook_names(), ("`", "`"));
+                self.err(k.span().start, format!("unknown hook `{name}`{hint}"));
+                continue;
+            }
+            let what = format!("hook `{name}` in [hooks]");
+            let list: Vec<String> = match v.get_ref() {
+                DeValue::Boolean(false) => {
+                    self.push(3, at, format!("set-hook -gu {name}"), &what);
+                    continue;
+                }
+                DeValue::String(s) => match validate_command(s) {
+                    Ok(()) => vec![s.to_string()],
+                    Err(m) => {
+                        self.err(at, format!("{what}: {m}"));
+                        continue;
+                    }
+                },
+                DeValue::Array(a) if !a.is_empty() => {
+                    let mut list = Vec::with_capacity(a.len());
+                    let mut bad = false;
+                    for item in a.iter() {
+                        match item.get_ref() {
+                            DeValue::String(s) => match validate_command(s) {
+                                Ok(()) => list.push(s.to_string()),
+                                Err(m) => {
+                                    self.err(item.span().start, format!("{what}: {m}"));
+                                    bad = true;
+                                }
+                            },
+                            other => {
+                                self.err(item.span().start, format!("{what}: expected a command string, found {}", describe(other)));
+                                bad = true;
+                            }
+                        }
+                    }
+                    if bad {
+                        continue;
+                    }
+                    list
+                }
+                other => {
+                    self.err(at, format!("{what}: expected a command string, a list of them, or false for none, found {}", describe(other)));
+                    continue;
+                }
+            };
+            // The first replaces what was set (a reload starts over), the
+            // others are added to it.
+            for (i, cmd) in list.iter().enumerate() {
+                let flags = if i == 0 { "-g" } else { "-ga" };
+                self.push(3, at, format!("set-hook {flags} {name} {}", escape_arg(cmd)), &what);
+            }
+        }
+    }
+
+    /// `[env]`: `NAME = "value"` for new panes and shell commands, or
+    /// `false` to remove a variable from their environment
+    /// (`set-environment -g`, `-gr`).
+    fn env(&mut self, t: &DeTable<'_>) {
+        for (k, v) in entries(t) {
+            if self.is_damaged(k.span().start..v.span().end) {
+                continue;
+            }
+            let name = k.get_ref().as_ref();
+            let at = v.span().start;
+            if name.is_empty() || name.contains('=') {
+                self.err(k.span().start, format!("`{name}` is not a variable name (it is empty or contains `=`)"));
+                continue;
+            }
+            let what = format!("variable `{name}` in [env]");
+            // `--`: a name or value may start with a dash.
+            match v.get_ref() {
+                DeValue::String(s) => self.push(3, at, format!("set-environment -g -- {} {}", escape_arg(name), escape_arg(s)), &what),
+                DeValue::Boolean(false) => self.push(3, at, format!("set-environment -gr -- {}", escape_arg(name)), &what),
+                other => self.err(at, format!("{what}: expected a string, or false to remove the variable, found {}", describe(other))),
             }
         }
     }

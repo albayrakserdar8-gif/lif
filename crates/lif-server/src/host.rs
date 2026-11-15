@@ -40,6 +40,8 @@ pub(crate) const CLIENT_TOKEN: usize = 2 << 32;
 pub(crate) const TTY_TOKEN: usize = 4 << 32;
 /// The stdin of a `copy-pipe` command (`crate::pipe`).
 pub(crate) const PIPE_TOKEN: usize = 8 << 32;
+/// The output of a shell command (`crate::job`).
+pub(crate) const JOB_TOKEN: usize = 16 << 32;
 
 /// `TERM` inside panes. xterm-256color has a terminfo entry on every
 /// system (unlike a `lif` entry would), and libghostty-vt implements the
@@ -94,6 +96,11 @@ pub(crate) struct Rt {
     /// `copy-pipe` commands still being fed, by id (`PIPE_TOKEN | id`).
     pub(crate) pipes: HashMap<u32, crate::pipe::PipeJob>,
     pub(crate) next_pipe: u32,
+    /// Shell commands running for the model, by token (`JOB_TOKEN | n`).
+    pub(crate) jobs: HashMap<u32, crate::job::Job>,
+    pub(crate) next_job: u32,
+    /// `run-shell -d` delays: when, and the model's id.
+    pub(crate) job_timers: Vec<(std::time::Instant, u64)>,
     /// The RLIMIT_NOFILE soft limit (0: unknown).
     pub(crate) fd_limit: usize,
 }
@@ -142,6 +149,9 @@ impl Rt {
             cmd_stdin: None,
             pipes: HashMap::new(),
             next_pipe: 0,
+            jobs: HashMap::new(),
+            next_job: 0,
+            job_timers: Vec::new(),
             fd_limit: 0,
         }
     }
@@ -456,6 +466,15 @@ impl Rt {
             }
             env.push((k.into(), v.into()));
         }
+        // set-environment and -e, over what the client passed on.
+        for (k, v) in &spec.env {
+            env.retain(|(x, _)| x != k.as_str());
+            // (spawn_pane removes the ones without a value from what
+            // the server itself has.)
+            if let Some(v) = v {
+                env.push((k.into(), v.into()));
+            }
+        }
         let mut set = |k: &str, v: String| {
             env.retain(|(x, _)| x != k);
             env.push((k.into(), v.into()));
@@ -641,6 +660,7 @@ impl Host for Rt {
         };
         let mut env_remove: Vec<OsString> = ENV_REMOVE.iter().map(OsString::from).collect();
         env_remove.extend(self.server_env_zellij.iter().cloned());
+        env_remove.extend(spec.env.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| OsString::from(k)));
         let opts = SpawnOptions {
             argv,
             cwd: (!spec.cwd.is_empty()).then(|| PathBuf::from(&spec.cwd)),
@@ -700,6 +720,71 @@ impl Host for Rt {
         self.panes.insert(spec.pane, p);
         // The child may have exited before it was watched.
         self.views_stale = true;
+        Ok(())
+    }
+
+    fn start_job(&mut self, spec: &lif_core::JobSpec) -> Result<(), String> {
+        if self.jobs.len() >= crate::job::MAX_JOBS {
+            return Err(format!("{} shell commands are still running; not running {}", self.jobs.len(), spec.command));
+        }
+        if self.fd_limit > 0 {
+            let open = crate::sys::open_fd_count();
+            if open + crate::FD_RESERVE >= self.fd_limit {
+                return Err(format!("cannot run {}: {open} of {} file descriptors in use", spec.command, self.fd_limit));
+            }
+        }
+        let mut env: Vec<(String, Option<String>)> = Vec::new();
+        // What the server took from the client that made the session.
+        if let Some(vars) = spec.session.and_then(|s| self.session_env.get(&s)) {
+            env.extend(vars.iter().filter(|(k, _)| !k.is_empty() && !k.contains('=')).map(|(k, v)| (k.clone(), Some(v.clone()))));
+        }
+        env.extend(spec.env.iter().cloned());
+        // Where `lif` run by the command finds this server and its target.
+        let session = spec.session.map(|s| s.0.to_string()).unwrap_or_default();
+        let here = format!("{},{},{session}", self.socket, self.server_pid);
+        let pane = spec.pane.map(|p| p.to_string());
+        env.push(("LIF".into(), Some(here.clone())));
+        env.push(("LIF_PANE".into(), pane.clone()));
+        env.push(("TMUX".into(), spec.tmux_compat.then_some(here)));
+        env.push(("TMUX_PANE".into(), pane.filter(|_| spec.tmux_compat)));
+        let mut job = crate::job::spawn(spec, &env).map_err(|e| format!("{}: {e}", spec.command))?;
+        self.reaper.watch(job.pid);
+        // Its group goes with the server if the server panics, like a
+        // pane's (child_reaped takes it off that list).
+        crate::panic::pane_started(job.pid);
+        log!("job {} pid {}: {}", job.id, job.pid, spec.command);
+        self.next_job = self.next_job.wrapping_add(1);
+        while self.jobs.contains_key(&self.next_job) {
+            self.next_job = self.next_job.wrapping_add(1);
+        }
+        let token = self.next_job;
+        if let Some(rx) = job.rx.as_mut()
+            && let Err(e) = self.registry.register(rx, Token(JOB_TOKEN | token as usize), Interest::READABLE)
+        {
+            crate::sys::kill_group(job.pid, libc::SIGKILL);
+            return Err(format!("{}: {e}", spec.command));
+        }
+        self.jobs.insert(token, job);
+        Ok(())
+    }
+
+    fn clear_history(&mut self, pane: PaneId) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if p.mode.is_some() {
+            p.leave_mode();
+            self.mode_changed.push(pane);
+        }
+        // What a program asks for with CSI 3 J: the scrollback goes, the
+        // screen stays.
+        p.engine.feed(b"\x1b[3J");
+        self.views_stale = true;
+    }
+
+    fn start_timer(&mut self, id: u64, delay_ms: u64) -> Result<(), String> {
+        if self.job_timers.len() >= crate::job::MAX_TIMERS {
+            return Err(format!("too many delays pending ({})", self.job_timers.len()));
+        }
+        self.job_timers.push((std::time::Instant::now() + std::time::Duration::from_millis(delay_ms), id));
         Ok(())
     }
 

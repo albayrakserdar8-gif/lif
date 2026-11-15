@@ -20,6 +20,7 @@ mod client;
 mod frame;
 mod host;
 mod input;
+mod job;
 pub mod mode;
 mod pane;
 mod panic;

@@ -71,6 +71,11 @@ impl Args {
         self.flags.iter().rev().find(|(c, _)| *c == f).and_then(|(_, v)| v.as_deref())
     }
 
+    /// Every value of flag `f`, in the order given (`-e A=1 -e B=2`).
+    pub fn all(&self, f: char) -> impl Iterator<Item = &str> {
+        self.flags.iter().filter(move |(c, _)| *c == f).filter_map(|(_, v)| v.as_deref())
+    }
+
     /// Positional arguments.
     pub fn values(&self) -> &[Arg] {
         &self.values

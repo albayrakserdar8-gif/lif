@@ -152,7 +152,13 @@ and modifiers such as
 .Pa docs/tmux-migration.md ) .
 A name that is not a variable is looked up as an option.
 .Li #(command)
-expands to nothing.
+expands to the last line
+.Ar command
+printed when it last ran; it is run again, with
+.Pa /bin/sh ,
+when it is expanded
+.Ic status-interval
+seconds or more after that.
 .Sh COMMANDS
 Commands, their aliases and their flags as
 .Nm
@@ -201,6 +207,13 @@ Move a pane into a new window of its own.
 Copy the text of a pane into a buffer, or print it with -p. -S and -E choose
 lines (negative numbers are history, - is the start or end), -J joins
 wrapped lines, -e keeps colors and attributes, -N keeps trailing spaces.
+.It Xo
+.Ic clear-history Pq Ic clearhist
+.Op Fl H
+.Op Fl t Ar target-pane
+.Xc
+Remove the pane's scrollback; the screen stays.
+A pane in copy mode leaves it. -H changes nothing.
 .It Xo
 .Ic command-prompt
 .Op Fl 1FkNP
@@ -274,6 +287,40 @@ duration.
 .Op Fl t Ar target-session
 .Xc
 Exit 0 if the session exists, 1 otherwise.
+.It Xo
+.Ic if-shell Pq Ic if
+.Op Fl bF
+.Op Fl t Ar target-pane
+.Ar shell-command command
+.Op Ar command
+.Xc
+Run the first
+.Ar command
+if
+.Ar shell-command
+(a format, run with
+.Pa /bin/sh )
+exits with 0, else the second, if given.
+The commands after if-shell wait for it unless -b is given.
+With -F nothing is run:
+.Ar shell-command
+is a format, true unless it expands to nothing or 0.
+.It Xo
+.Ic join-pane Pq Ic joinp
+.Op Fl bdhv
+.Op Fl l Ar size
+.Op Fl p Ar percentage
+.Op Fl s Ar src-pane
+.Op Fl t Ar dst-pane
+.Xc
+Move
+.Ar src-pane
+next to
+.Ar dst-pane
+by splitting that, as split-window splits for a new pane: -h side by side,
+-v (default) top and bottom, -b before, -l size in cells or N%, -d without
+selecting it.
+A window left without panes is closed.
 .It Xo
 .Ic kill-pane Pq Ic killp
 .Op Fl a
@@ -387,6 +434,7 @@ Move a window to another index; -r renumbers the windows of a session.
 .Ic new-session Pq Ic new
 .Op Fl ADdPX
 .Op Fl c Ar start-directory
+.Op Fl e Ar environment
 .Op Fl F Ar format
 .Op Fl n Ar window-name
 .Op Fl s Ar session-name
@@ -397,11 +445,15 @@ Move a window to another index; -r renumbers the windows of a session.
 Create a session and attach to it unless -d is given. -A attaches if the
 session named with -s exists; then -D and -X act as attach-session's -d and
 -x. -x and -y set the size of a detached session.
+-e
+.Ar VARIABLE=value
+sets a variable for the session's first pane (it may be repeated).
 -E is not supported (there is no update-environment option).
 .It Xo
 .Ic new-window Pq Ic neww
 .Op Fl abdkPS
 .Op Fl c Ar start-directory
+.Op Fl e Ar environment
 .Op Fl F Ar format
 .Op Fl n Ar window-name
 .Op Fl t Ar target-window
@@ -470,6 +522,7 @@ percentage, or toggle zoom with -Z.
 .Ic respawn-pane Pq Ic respawnp
 .Op Fl k
 .Op Fl c Ar start-directory
+.Op Fl e Ar environment
 .Op Fl t Ar target-pane
 .Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
 .Xc
@@ -481,6 +534,34 @@ one first). The scrollback is kept.
 .Op Fl t Ar target-window
 .Xc
 Rotate the panes of a window (-D: the other way).
+.It Xo
+.Ic run-shell Pq Ic run
+.Op Fl bCE
+.Op Fl c Ar start-directory
+.Op Fl d Ar delay
+.Op Fl t Ar target-pane
+.Op Ar shell-command
+.Xc
+Run
+.Ar shell-command
+(a format) with
+.Pa /bin/sh
+and print its output; a command that fails also prints
+.Dq 'command' returned N
+and its status becomes the exit status of
+.Nm .
+The commands after run-shell wait for it unless -b is given.
+-E includes standard error, -d waits
+.Ar delay
+seconds first (a fraction is allowed), -c sets the directory, and with -C
+.Ar shell-command
+is a list of
+.Nm
+commands.
+The command finds this server through
+.Ev LIF
+and its target pane in
+.Ev LIF_PANE .
 .It Xo
 .Ic select-layout Pq Ic selectl
 .Op Fl Enop
@@ -534,6 +615,35 @@ Send the prefix key (-2: prefix2) to a pane.
 .Xc
 Set a buffer's contents; -a appends, -n renames.
 .It Xo
+.Ic set-environment Pq Ic setenv
+.Op Fl Fghru
+.Op Fl t Ar target-session
+.Ar variable Op Ar value
+.Xc
+Set a variable for the panes and shell commands started from now on in a
+session, or in every session with -g. -r removes the variable from their
+environment instead, -u forgets the entry, -h hides it (it is listed with
+show-environment -h and not passed on), -F expands formats in the value.
+.It Xo
+.Ic set-hook
+.Op Fl agpRuw
+.Op Fl t Ar target-pane
+.Ar hook Op Ar command
+.Xc
+Set the commands run when
+.Ar hook
+happens: for a session, with -g for all, and for the pane and window hooks
+for a window or (-p) a pane. -a adds a command to the ones set, -u removes
+them, -R runs the hook now.
+.Ar hook
+may be
+.Ar name Ns Li \&[ Ns Ar index Ns Li \&]
+to set or unset one command.
+Hook names are those of
+.Xr tmux 1 ;
+the ones that run are listed in
+.Pa docs/tmux-migration.md .
+.It Xo
 .Ic set-option Pq Ic set
 .Op Fl aFgopqsuw
 .Op Fl t Ar target-pane
@@ -565,6 +675,27 @@ writes it to standard output.
 .Op Fl b Ar buffer-name
 .Xc
 Print a buffer.
+.It Xo
+.Ic show-environment Pq Ic showenv
+.Op Fl ghs
+.Op Fl t Ar target-session
+.Op Ar variable
+.Xc
+List the variables set with set-environment for a session (-g: for all), as
+.Li NAME=value ,
+or
+.Li -NAME
+for one that is removed. -s prints shell commands that set them, -h the
+hidden ones.
+.It Xo
+.Ic show-hooks
+.Op Fl gpw
+.Op Fl t Ar target-pane
+.Op Ar hook
+.Xc
+List the hooks set for a session, or with -w a window and -p a pane.
+With -g every hook name is listed, the global ones with their commands (-gw:
+the pane and window hooks).
 .It Xo
 .Ic show-messages Pq Ic showmsgs
 .Op Fl JT
@@ -605,6 +736,7 @@ shell continues it with
 .Ic split-window Pq Ic splitw
 .Op Fl bdhPvZ
 .Op Fl c Ar start-directory
+.Op Fl e Ar environment
 .Op Fl F Ar format
 .Op Fl l Ar size
 .Op Fl p Ar percentage
@@ -613,7 +745,9 @@ shell continues it with
 .Xc
 Split a pane: -h side by side, -v (default) top and bottom; -l size in cells
 or N%, -p percentage, -b before, -d without selecting it, -Z zoomed, -c
-working directory, -P print the new pane (format with -F).
+working directory, -e
+.Ar VARIABLE=value
+a variable for the new pane, -P print the new pane (format with -F).
 .It Xo
 .Ic start-server Pq Ic start
 .Xc
@@ -650,6 +784,15 @@ stays zoomed on that pane.
 .Ar key
 .Xc
 Remove a binding (-a: all in the table, -n: root table).
+.It Xo
+.Ic wait-for Pq Ic wait
+.Op Fl LSU
+.Ar channel
+.Xc
+Wait until another client runs wait-for -S with the same
+.Ar channel .
+-L locks the channel, waiting while another client holds the lock; -U
+unlocks it.
 .El
 .Pp
 The other
@@ -659,15 +802,12 @@ commands are recognized and fail with
 .Ic choose-buffer ,
 .Ic choose-client ,
 .Ic choose-tree ,
-.Ic clear-history ,
 .Ic clear-prompt-history ,
 .Ic clock-mode ,
 .Ic customize-mode ,
 .Ic display-menu ,
 .Ic display-popup ,
 .Ic find-window ,
-.Ic if-shell ,
-.Ic join-pane ,
 .Ic link-window ,
 .Ic lock-client ,
 .Ic lock-server ,
@@ -677,16 +817,10 @@ commands are recognized and fail with
 .Ic pipe-pane ,
 .Ic resize-window ,
 .Ic respawn-window ,
-.Ic run-shell ,
 .Ic server-access ,
-.Ic set-environment ,
-.Ic set-hook ,
-.Ic show-environment ,
-.Ic show-hooks ,
 .Ic show-prompt-history ,
 .Ic switch-mode ,
-.Ic unlink-window ,
-.Ic wait-for .
+.Ic unlink-window .
 .Sh KEY BINDINGS
 The default prefix table.
 Keys marked repeatable can be pressed again without the prefix within
@@ -990,6 +1124,16 @@ at most 1000000; one format expands to at most 256 KiB;
 reads regular files of at most 1 MiB;
 .Ic { }
 blocks nest at most 100 deep.
+At most 64 shell commands
+.Po
+.Ic run-shell ,
+.Ic if-shell ,
+.Li #()
+.Pc
+run at once and 1 MiB of the output of each is kept; they are hung up when
+the server exits.
+At most 1024 command lists wait at a time (for a shell command or
+.Ic wait-for ) .
 Command output larger than one protocol frame is sent in parts.
 The server raises its open-file limit to the hard limit (at most 65536)
 and keeps 32 descriptors for clients when it creates panes; programs in
@@ -1036,15 +1180,21 @@ Scrollback is limited both by
 .Ic scrollback-bytes
 (memory, default 10 MiB, allocated in whole pages so small budgets round
 up); changing either applies to existing panes too.
-.Nm
-runs no shell commands except the command of
+Shell commands
+.Po
+.Ic run-shell ,
+.Ic if-shell ,
+.Li #() ,
 .Ic copy-pipe
 and the
 .Ic copy-command
-option, which get the copied text on standard input: there is no
-.Ic run-shell
-or
-.Ic if-shell ,
-and
-.Li #()
-expands to nothing.
+option
+.Pc
+run with
+.Pa /bin/sh ,
+not with
+.Ic default-shell .
+.Ic show-environment
+lists only what
+.Ic set-environment
+set, and some hooks can be set but never run.

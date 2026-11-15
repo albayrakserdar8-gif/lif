@@ -83,6 +83,45 @@ pub struct SpawnSpec {
     pub respawn: bool,
     /// The `tmux-compat` option: give the pane `TMUX` and `TMUX_PANE`.
     pub tmux_compat: bool,
+    /// Variables set (`Some`) or removed (`None`) on top of the pane's
+    /// environment, in order (`set-environment`, then `-e`).
+    pub env: Vec<(String, Option<String>)>,
+}
+
+/// A shell command the server runs for the model (`run-shell`,
+/// `if-shell`, `#()` in formats): `/bin/sh -c command`, standard input
+/// from `/dev/null`, standard output captured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobSpec {
+    /// The model's name for the job, handed back to
+    /// [`Model::job_done`](crate::Model::job_done).
+    pub id: u64,
+    /// The command string.
+    pub command: String,
+    /// Working directory. Empty, or not a directory: the user's home.
+    pub cwd: String,
+    /// The session the command belongs to, if any: the job gets its
+    /// environment (and `LIF` naming it).
+    pub session: Option<SessionId>,
+    /// The target pane, if any (`LIF_PANE`).
+    pub pane: Option<PaneId>,
+    /// Capture standard error with standard output (`run-shell -E`);
+    /// otherwise it is discarded.
+    pub stderr: bool,
+    /// Variables set (`Some`) or removed (`None`) on top of the job's
+    /// environment, in order (`set-environment`).
+    pub env: Vec<(String, Option<String>)>,
+    /// The `tmux-compat` option: also set `TMUX` (and `TMUX_PANE`).
+    pub tmux_compat: bool,
+}
+
+/// How a job ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStatus {
+    /// It exited with this status.
+    Exited(i32),
+    /// It was killed by this signal.
+    Signaled(i32),
 }
 
 /// Input for the program in a pane.
@@ -298,6 +337,28 @@ pub trait Host {
     fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
         let _ = client;
         Err("suspend-client: not supported".into())
+    }
+
+    /// Start a shell command. When it has exited and its output is read to
+    /// the end, the server calls [`Model::job_done`](crate::Model::job_done)
+    /// with `job.id`, the status and the output (the server bounds how much
+    /// it keeps), from the event loop, never from inside this call. On
+    /// error nothing was started and `job_done` is not called.
+    fn start_job(&mut self, job: &JobSpec) -> Result<(), String> {
+        Err(format!("{}: shell commands are not supported here", job.command))
+    }
+
+    /// Call [`Model::job_done`](crate::Model::job_done) with `id` (status
+    /// 0, no output) in `delay_ms` milliseconds (`run-shell -d`).
+    fn start_timer(&mut self, id: u64, delay_ms: u64) -> Result<(), String> {
+        let _ = (id, delay_ms);
+        Err("timers are not supported here".into())
+    }
+
+    /// `clear-history`: drop the pane's scrollback (and leave any mode it
+    /// is in, which shows that history).
+    fn clear_history(&mut self, pane: PaneId) {
+        let _ = pane;
     }
 
     /// Deliver input to the program in a pane. An error means the input

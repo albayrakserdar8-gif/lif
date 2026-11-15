@@ -16,7 +16,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::ServerOptions;
 use crate::client::{CLIENT_READ_BUDGET, ClientRt, TermOut, Tty};
-use crate::host::{CLIENT_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
+use crate::host::{CLIENT_TOKEN, JOB_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
 use crate::sys::{self, SignalPipe};
 
 const LISTENER: Token = Token(0);
@@ -247,6 +247,7 @@ impl Server {
             LISTENER => self.accept(),
             REAPER => self.reap(now),
             SIGNALS => self.handle_signals(),
+            Token(t) if t & JOB_TOKEN != 0 => self.read_job((t & 0xffff_ffff) as u32),
             Token(t) if t & PIPE_TOKEN != 0 => self.rt.pipe_writable((t & 0xffff_ffff) as u32),
             Token(t) if t & TTY_TOKEN != 0 => {
                 let id = ClientId((t & 0xffff_ffff) as u32);
@@ -301,6 +302,13 @@ impl Server {
             self.read_tty(c, now);
         }
         self.scratch_clients = clients;
+        if self.rt.jobs.values().any(|j| j.read_more) {
+            let more: Vec<u32> = self.rt.jobs.iter().filter(|(_, j)| j.read_more).map(|(t, _)| *t).collect();
+            for t in more {
+                self.read_job(t);
+            }
+        }
+        self.job_timers(now);
         self.rt.kill_overdue(now);
         self.timers(now);
         self.step_searches();
@@ -367,6 +375,10 @@ impl Server {
             }
         }
         min(self.rt.dying.iter().map(|d| d.1).min());
+        if self.rt.jobs.values().any(|j| j.read_more) {
+            return Some(now);
+        }
+        min(self.rt.job_timers.iter().map(|t| t.0).min());
         d
     }
 
@@ -583,7 +595,10 @@ impl Server {
     fn reap(&mut self, now: Instant) {
         for (pid, status) in self.rt.reaper.reap() {
             self.rt.child_reaped(pid);
-            let Some(id) = self.rt.pids.remove(&pid) else { continue };
+            let Some(id) = self.rt.pids.remove(&pid) else {
+                self.job_exited(pid, status);
+                continue;
+            };
             log!("pane {id} pid {pid} exited: {status:?}");
             // Output the program wrote just before exiting is still in the
             // PTY. Bounded: a background process that ignores SIGHUP may
@@ -613,6 +628,93 @@ impl Server {
             p.read_more = false;
         }
         self.rt.views_stale = true;
+    }
+
+    // ----- shell commands ------------------------------------------------
+
+    fn read_job(&mut self, token: u32) {
+        let Some(j) = self.rt.jobs.get_mut(&token) else { return };
+        if j.read(&mut self.read_buf)
+            && let Some(mut rx) = j.rx.take()
+        {
+            let _ = self.rt.registry.deregister(&mut rx);
+        }
+        self.job_check(token);
+    }
+
+    fn job_exited(&mut self, pid: u32, status: std::process::ExitStatus) {
+        let Some((&token, j)) = self.rt.jobs.iter_mut().find(|(_, j)| j.pid == pid && j.status.is_none()) else { return };
+        j.status = Some(crate::job::status_of(status));
+        self.job_check(token);
+    }
+
+    /// Hands a job that is over to the model.
+    fn job_check(&mut self, token: u32) {
+        if !self.rt.jobs.get(&token).is_some_and(|j| j.done()) {
+            return;
+        }
+        let Some(j) = self.rt.jobs.remove(&token) else { return };
+        let status = j.status.unwrap_or(lif_core::JobStatus::Exited(1));
+        log!("job {} pid {} done: {status:?}, {} bytes", j.id, j.pid, j.out.len());
+        self.job_done(j.id, status, &j.out);
+    }
+
+    /// Reports a job or timer to the model; the commands that waited for
+    /// it run now.
+    fn job_done(&mut self, id: u64, status: lif_core::JobStatus, out: &[u8]) {
+        self.refresh_pane_facts();
+        self.model.job_done(id, status, out, sys::wall_clock(), &mut self.rt);
+        // They may have been anything, set-option included.
+        self.rt.views_stale = true;
+        self.apply_options();
+        self.after_model();
+    }
+
+    fn job_timers(&mut self, now: Instant) {
+        if !self.rt.job_timers.iter().any(|t| t.0 <= now) {
+            return;
+        }
+        let mut due: Vec<(Instant, u64)> = Vec::new();
+        self.rt.job_timers.retain(|t| {
+            if t.0 <= now {
+                due.push(*t);
+            }
+            t.0 > now
+        });
+        due.sort();
+        for (_, id) in due {
+            self.job_done(id, lif_core::JobStatus::Exited(0), &[]);
+        }
+    }
+
+    /// The outcome of commands that had to wait: the answer a client's
+    /// command still owes, a message for an attached client, or a line in
+    /// the message log when nobody is there to see it.
+    fn deliver(&mut self, f: lif_core::Finished) {
+        let client = f.client.filter(|id| self.rt.clients.get(id).is_some_and(|c| !c.dead));
+        let Some(id) = client else {
+            if let Some(e) = f.error {
+                self.model.log_message(e.to_string());
+            }
+            return;
+        };
+        let attached = self.rt.clients.get(&id).is_some_and(|c| c.att.is_some());
+        if attached {
+            match f.error {
+                Some(e) => {
+                    let d = self.display_time();
+                    lif_core::Host::show_message(&mut self.rt, id, &e.to_string(), d);
+                }
+                None => self.show_output(id, &f.stdout),
+            }
+        } else if f.waited {
+            let Some(c) = self.rt.clients.get_mut(&id) else { return };
+            match f.error {
+                Some(e) => c.send_command_done(1, f.stdout.into_bytes(), format!("{e}\n").into_bytes()),
+                None => c.send_command_done(f.status, f.stdout.into_bytes(), Vec::new()),
+            }
+            self.rt.flush_client(id);
+        }
     }
 
     // ----- clients -------------------------------------------------------
@@ -904,7 +1006,10 @@ impl Server {
                     log!("client {id}: output of an attaching command dropped");
                 }
             }
-            Ok(out) => c.send_command_done(0, out.stdout.into_bytes(), Vec::new()),
+            // The answer comes when the commands have finished waiting
+            // (`Server::deliver`).
+            Ok(out) if out.pending => {}
+            Ok(out) => c.send_command_done(out.status, out.stdout.into_bytes(), Vec::new()),
             Err(e) if attached_now => {
                 let text = e.to_string();
                 lif_core::Host::show_message(&mut self.rt, id, &text, 750);
@@ -993,6 +1098,22 @@ impl Server {
     /// environments of sessions that are gone, bring views up to date.
     pub(crate) fn after_model(&mut self) {
         self.rt.respawn_stash = None;
+        if self.model.has_finished() {
+            for f in self.model.take_finished() {
+                self.deliver(f);
+            }
+        }
+        if self.model.has_hooks() {
+            // Hooks of events (a pane exited, a client resized); their
+            // commands may have been anything.
+            self.model.run_hooks(sys::wall_clock(), &mut self.rt);
+            self.rt.views_stale = true;
+            self.apply_options();
+            for f in self.model.take_finished() {
+                self.deliver(f);
+            }
+        }
+        self.model.start_format_jobs(sys::wall_clock(), &mut self.rt);
         if !self.rt.mode_actions.is_empty() {
             for (c, p, a) in std::mem::take(&mut self.rt.mode_actions) {
                 self.mode_action(c, p, a);
@@ -1117,6 +1238,11 @@ impl Server {
         let panes: Vec<PaneId> = self.rt.panes.keys().copied().collect();
         for p in panes {
             lif_core::Host::kill_pane(&mut self.rt, p);
+        }
+        // Shell commands still running go the way of the panes.
+        let jobs: Vec<u32> = self.rt.jobs.values().filter(|j| j.status.is_none()).map(|j| j.pid).collect();
+        for pid in jobs {
+            self.rt.hang_up(pid);
         }
         self.await_hung_up();
         self.rt.respawn_stash = None;

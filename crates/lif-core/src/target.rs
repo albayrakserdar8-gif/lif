@@ -84,10 +84,20 @@ impl Model {
         Some(Found { s: win.session, w: Some(w), p: Some(p), idx: Some(win.index) })
     }
 
-    /// Resolve `target` (`None` or empty: the current state).
+    /// Resolve `target` (`None` or empty: the current state). What it
+    /// found is remembered as the target of the command being run, for
+    /// its `after-` hook.
     pub(crate) fn find_target(&self, ctx: &CmdContext, target: Option<&str>, kind: Kind, flags: Flags) -> Result<Found, CmdError> {
+        let f = self.resolve_target(ctx, target, kind, flags)?;
+        self.last_found.set(Some(f));
+        Ok(f)
+    }
+
+    fn resolve_target(&self, ctx: &CmdContext, target: Option<&str>, kind: Kind, flags: Flags) -> Result<Found, CmdError> {
         let Some(target) = target.filter(|t| !t.is_empty()) else {
-            return self.current_state(ctx, flags.prefer_unattached);
+            // No target names no index: `new-window` run from a pane's
+            // shell takes the next free one, not its own window's.
+            return self.current_state(ctx, flags.prefer_unattached).map(|f| Found { idx: None, ..f });
         };
         let (mut session, mut window, mut pane) = (None, None, None);
         let (mut window_only, mut pane_only) = (false, false);

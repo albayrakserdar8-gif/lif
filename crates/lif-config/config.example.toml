@@ -125,6 +125,10 @@ automatic-rename-format = "#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane
 # a non-zero exit status).
 remain-on-exit = "off"
 
+# Type into every pane of a window at once (tmux's synchronize-panes; most
+# people turn it on for one window: "set -w synchronize-panes on").
+synchronize-panes = false
+
 # Bells and activity: which windows' bells reach you ("none", "any",
 # "current", "other"), whether a bell is also shown as a message ("off",
 # "on", "both"), and which windows are watched for bells and output.
@@ -259,3 +263,21 @@ Up = { command = "select-pane -U", repeat = true }
 
 # [keys.copy-mode] and [keys.copy-mode-vi] bind keys in copy mode (emacs and
 # vi mode-keys) the same way.
+
+# ------------------------------------------------- hooks and environment ----
+
+# [hooks] runs commands when something happens (tmux's set-hook -g). A value
+# is a command string, a list of them (each runs), or false for none. The
+# names are tmux's: after-new-window, after-split-window, session-created,
+# client-attached, pane-exited and so on ("lif show-hooks -g" and
+# "lif show-hooks -gw" list them all).
+[hooks]
+# after-split-window = "select-layout tiled"
+# session-created = "run-shell 'date >> ~/.lif-sessions'"
+
+# [env] sets environment variables for new panes and for the commands of
+# run-shell, if-shell and #() (tmux's set-environment -g); false removes a
+# variable from their environment.
+[env]
+# EDITOR = "nvim"
+# SSH_ASKPASS = false

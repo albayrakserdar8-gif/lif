@@ -3,8 +3,9 @@
 //! Only the common core is translated: `set` / `set-option` / `setw` with
 //! `-g` (or `-s`) for options lif has, `bind` / `bind-key` with `-n`, `-r`,
 //! `-T` and `-N`, `unbind` / `unbind-key` with `-n` and `-T`, and comments
-//! directly above a translated line. Everything else is reported, never
-//! guessed.
+//! directly above a translated line, `set-hook -g` (with `-a` and `-u`)
+//! and `set-environment -g` (with `-r`). Everything else is reported,
+//! never guessed.
 
 use crate::schema::{Kind, TABLES, location};
 use lif_core::{Arg, Command, KeyCode, escape_arg, parse_list, parse_string};
@@ -66,6 +67,8 @@ struct Out {
     status: Section,
     theme: Section,
     keys: [Section; 4],
+    hooks: Section,
+    env: Section,
     prefix: Option<KeyCode>,
 }
 
@@ -240,6 +243,64 @@ impl Out {
                 self.keys[ti].set(key.to_string(), value, comments.take().unwrap_or_default());
                 Ok(())
             }
+            "set-hook" => {
+                for f in ['R', 't', 'p', 'w'] {
+                    if a.has(f) {
+                        return Err(format!("set-hook -{f} has no config.toml equivalent"));
+                    }
+                }
+                if !a.has('g') {
+                    return Err("only global hooks (set-hook -g) can be translated".to_string());
+                }
+                let name = a.value(0).unwrap_or("");
+                if name.contains('[') {
+                    return Err("hook indexes (name[N]) have no config.toml equivalent: list the commands in order".to_string());
+                }
+                if !lif_core::hook_names().any(|h| h == name) {
+                    return Err(format!("lif has no hook {name}"));
+                }
+                if a.has('u') {
+                    self.hooks.set(name.to_string(), "false".to_string(), comments.take().unwrap_or_default());
+                    return Ok(());
+                }
+                let rest = &a.values()[1..];
+                if rest.is_empty() {
+                    return Err("set-hook without a command".to_string());
+                }
+                let text = toml_str(&command_text(rest)?);
+                // -a adds to what the file has so far: a list.
+                let value = match self.hooks.get(name).filter(|v| a.has('a') && *v != "false") {
+                    Some(old) => match old.strip_prefix('[').and_then(|o| o.strip_suffix(']')) {
+                        Some(items) => format!("[{items}, {text}]"),
+                        None => format!("[{old}, {text}]"),
+                    },
+                    None => text,
+                };
+                self.hooks.set(name.to_string(), value, comments.take().unwrap_or_default());
+                Ok(())
+            }
+            "set-environment" => {
+                for f in ['F', 'h', 't', 'u'] {
+                    if a.has(f) {
+                        return Err(format!("set-environment -{f} has no config.toml equivalent"));
+                    }
+                }
+                if !a.has('g') {
+                    return Err("only the global environment (set-environment -g) can be translated".to_string());
+                }
+                let name = a.value(0).unwrap_or("");
+                let value = match (a.has('r'), a.value(1)) {
+                    (true, _) => "false".to_string(),
+                    (false, Some(v)) => toml_str(v),
+                    (false, None) => return Err(format!("no value given for {name}")),
+                };
+                self.env.set(name.to_string(), value, comments.take().unwrap_or_default());
+                Ok(())
+            }
+            "run-shell" | "if-shell" => Err(format!(
+                "{} at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])",
+                cmd.name()
+            )),
             other => Err(format!("{other} has no config.toml equivalent")),
         }
     }
@@ -308,6 +369,8 @@ impl Out {
             let header = if *t == "prefix" { "[keys]".to_string() } else { format!("[keys.{t}]") };
             section(&mut s, &header, sec);
         }
+        section(&mut s, "[hooks]", &self.hooks);
+        section(&mut s, "[env]", &self.env);
         s
     }
 }

@@ -681,6 +681,7 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g automatic-rename on",
         "set-option -g automatic-rename-format \"#{?pane_in_mode,[lif],#{pane_current_command}}#{?pane_dead,[dead],}\"",
         "set-option -g remain-on-exit off",
+        "set-option -g synchronize-panes off",
         "set-option -g bell-action any",
         "set-option -g visual-bell off",
         "set-option -g monitor-bell on",
@@ -1083,8 +1084,8 @@ v = "send -X begin-selection"
             ),
             (41, "key table mytable is not supported (config.toml has prefix, root, copy-mode, copy-mode-vi)"),
             (42, "unbind-key -a has no config.toml equivalent"),
-            (43, "unsupported command: if-shell"),
-            (44, "unsupported command: run-shell"),
+            (43, "if-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])"),
+            (44, "run-shell at start-up has no config.toml equivalent (lif runs it in key bindings and [hooks])"),
             (47, "no value given for automatic-rename"),
             (48, "only global options (set -g) can be translated"),
         ]
@@ -1236,4 +1237,90 @@ fn garbage_never_panics() {
         let back = Config::parse(&m.toml);
         assert!(!back.diagnostics.iter().any(|d| d.message.starts_with("invalid TOML")), "{s:?}\n{}\n{}", m.toml, back.report());
     }
+}
+
+// ----------------------------------------------------- hooks and env --
+
+#[test]
+fn hooks_and_env_sections_give_the_exact_commands() {
+    let c = Config::parse(
+        r##"
+[hooks]
+after-split-window = "select-layout tiled"
+session-created = ["run-shell 'echo #{hook_session_name}'", "display-message hi"]
+pane-exited = false
+
+[env]
+EDITOR = "nvim -u NONE"
+SSH_ASKPASS = false
+"-odd" = "-v"
+"##,
+    );
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
+    assert_eq!(
+        c.command_strings(),
+        [
+            "set-hook -g after-split-window \"select-layout tiled\"",
+            "set-hook -g session-created \"run-shell 'echo #{hook_session_name}'\"",
+            "set-hook -ga session-created \"display-message hi\"",
+            "set-hook -gu pane-exited",
+            "set-environment -g -- EDITOR \"nvim -u NONE\"",
+            "set-environment -gr -- SSH_ASKPASS",
+            "set-environment -g -- -odd -v",
+        ]
+    );
+    // They mean what they say.
+    let mut m = Model::new("h");
+    assert!(c.apply(&mut m, &mut TestHost::default()).is_empty());
+    let ctx = CmdContext::none(WallClock::new(0, 0));
+    let mut show = |cmd: &str| m.execute_list(&parse_string(cmd).unwrap(), &ctx, &mut TestHost::default()).unwrap().stdout;
+    assert_eq!(show("show-hooks -g session-created"), "session-created[0] run-shell \"echo #{hook_session_name}\"\nsession-created[1] display-message hi\n");
+    assert_eq!(show("show-environment -g"), "-odd=-v\nEDITOR=nvim -u NONE\n-SSH_ASKPASS\n");
+    // Applying the file again (a reload) does not pile hooks up.
+    assert!(c.apply(&mut m, &mut TestHost::default()).is_empty());
+    let mut show = |cmd: &str| m.execute_list(&parse_string(cmd).unwrap(), &ctx, &mut TestHost::default()).unwrap().stdout;
+    assert_eq!(show("show-hooks -g session-created").lines().count(), 2);
+}
+
+#[test]
+fn hooks_and_env_mistakes_are_diagnosed() {
+    assert_eq!(diag("[hooks]\nafter-new-windw = \"display hi\""), "2:1: error: unknown hook `after-new-windw`, did you mean `after-new-window`?");
+    assert_eq!(diag("[hooks]\npane-exited = \"frobnicate\""), "2:15: error: hook `pane-exited` in [hooks]: unknown command `frobnicate`");
+    assert_eq!(
+        diag("[hooks]\npane-exited = 3"),
+        "2:15: error: hook `pane-exited` in [hooks]: expected a command string, a list of them, or false for none, found integer 3"
+    );
+    assert_eq!(diag("[hooks]\npane-exited = [\"display a\", 4]"), "2:29: error: hook `pane-exited` in [hooks]: expected a command string, found integer 4");
+    assert_eq!(diag("hooks = 1"), "1:1: error: `hooks` must be a table of hooks ([hooks]), found integer 1");
+    assert_eq!(diag("[env]\nA = 1"), "2:5: error: variable `A` in [env]: expected a string, or false to remove the variable, found integer 1");
+    assert_eq!(diag("[env]\n\"A=B\" = \"x\""), "2:1: error: `A=B` is not a variable name (it is empty or contains `=`)");
+    assert_eq!(diag("env = \"x\""), "1:1: error: `env` must be a table of environment variables ([env]), found string \"x\"");
+    assert_eq!(diag("[hook]\nx = 1"), "1:2: error: unknown section [hook], did you mean [hooks]?");
+}
+
+#[test]
+fn tmux_conf_hooks_and_environment_are_translated() {
+    let m = migrate_tmux_conf(
+        "# keep it tidy\nset-hook -g after-split-window 'select-layout tiled'\n\
+         set-hook -g session-created 'display one'\nset-hook -ga session-created 'display two'\n\
+         set-hook -gu pane-exited\nset-hook after-new-window 'display x'\nset-hook -g no-such-hook 'display x'\n\
+         setenv -g EDITOR vim\nset-environment -gr DISPLAY\nsetenv LOCAL 1\nsetenv -gu GONE\n",
+    );
+    assert_eq!(
+        m.toml,
+        "# lif config.toml, translated from .tmux.conf.\n\n[hooks]\n# keep it tidy\nafter-split-window = \"select-layout tiled\"\n\
+         session-created = [\"display one\", \"display two\"]\npane-exited = false\n\n[env]\nEDITOR = \"vim\"\nDISPLAY = false\n"
+    );
+    let un: Vec<(usize, &str)> = m.untranslated.iter().map(|u| (u.line, u.reason.as_str())).collect();
+    assert_eq!(
+        un,
+        [
+            (6, "only global hooks (set-hook -g) can be translated"),
+            (7, "lif has no hook no-such-hook"),
+            (10, "only the global environment (set-environment -g) can be translated"),
+            (11, "set-environment -u has no config.toml equivalent"),
+        ]
+    );
+    let c = Config::parse(&m.toml);
+    assert!(c.diagnostics.is_empty(), "{}", c.report());
 }
