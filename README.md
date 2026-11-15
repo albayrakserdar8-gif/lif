@@ -11,40 +11,46 @@ what is missing is below and in [docs/tmux-migration.md](docs/tmux-migration.md)
 
 ## Benchmarks
 
-<!-- BEGIN BENCHMARKS: generated from bench/results/comparison.md; replace this whole block when the numbers are re-measured -->
+<!-- BEGIN BENCHMARKS: generated from bench/results/2026-11-15-0330-final-summary.md; replace this whole block when the numbers are re-measured -->
 
-lif (after the performance tour) against tmux 3.8, zellij 0.46.0 and a bare
-shell on the same PTY ("none"). One run on one machine (Mac18,5, Apple M6, 12
-cores, 16 GiB, macOS 27.2; 2026-11-15) with other work running (load average
-2.3-4.3), client PTY 200x50, every tool with its default settings. Medians;
-spreads, sample counts, the raw data and the methodology are in
-[bench/results/comparison.md](bench/results/comparison.md) and
-[bench/README.md](bench/README.md).
+lif 0.1.0 against tmux 3.8, zellij 0.46.0 and a bare shell on the same PTY
+("none"). One run on one machine (Mac18,5, Apple M6, 12 cores, 16 GiB,
+macOS 27.2; 2026-11-15) with other work running (load average about 4.5),
+client PTY 200x50, every tool with its default settings. Medians; spreads and
+sample counts are in
+[bench/results/2026-11-15-0330-final-summary.md](bench/results/2026-11-15-0330-final-summary.md),
+the methodology in [bench/README.md](bench/README.md), and the history of how
+the numbers moved in [bench/results/comparison.md](bench/results/comparison.md).
+Absolute latencies vary several-fold between runs on this machine for every
+tool at once; compare tools within a run.
 
 | | none | tmux 3.8 | zellij 0.46.0 | lif |
 |---|---|---|---|---|
-| `cat` 100 MB ASCII (MB/s) | 225.2 | 52.4 | 79.2 | 205.8 |
-| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 284.7 | 21.3 | 81.6 | 151.8 |
-| `cat` one 20 MB line (MB/s) | 155.1 | 51.8 | 17.6 | 151.1 |
-| server memory, idle, 1 pane (MiB, footprint / RSS) | - | 3.7 / 5.2 | 26.5 / 43.1 | 3.3 / 5.1 |
-| server memory, idle, 50 visible panes (MiB) | - | 4.2 / 5.7 | 38.2 / 55.2 | 9.5 / 11.4 |
-| server memory after a 100 MB `cat` (MiB), lines kept | - | 6.1 / 7.6, 1,818 | 44.8 / 61.4, 9,997 | 5.6 / 13.7, 3,784 |
-| server over 30 s idle: CPU ms, idle wakeups | - | 2.3, 1 | 40.6, 155 | 0.4, 0 |
-| create session + kill server (ms) | - | 11.0 | 53.2 | 6.1 |
-| new session until a typed command runs (ms) | 31.6 | 51.4 | 85.5 | 41.9 |
-| key echo, idle pane, p50 / p95 (us) | 22 / 37 | 146 / 214 | 536 / 763 | 126 / 185 |
-| key echo while another pane runs `yes`, p50 / p95 (us) | - | 263 / 332 | 949 / 1,063 | 38 / 45 |
-| bare ESC to the program, default settings, p50 (us) | 54 | 11,696 | 61,673 | 6,323 |
-| bare ESC with `escape-time 0` / kitty keyboard protocol, p50 (us) | - | 1,444 / - | - | 157 / 162 |
-| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 3.06, system libraries only |
+| `cat` 100 MB ASCII (MB/s) | 209.2 | 49.8 | 76.4 | 210.9 |
+| `cat` 100 MB SGR-colored UTF-8 (MB/s) | 213.1 | 19.0 | 75.7 | 142.7 |
+| `cat` one 20 MB line (MB/s) | 196.6 | 53.5 | 14.4 | 204.1 |
+| server memory, idle, 1 pane (MiB, footprint / RSS) | - | 3.8 / 5.2 | 25.1 / 41.7 | 3.4 / 5.2 |
+| server memory, idle, 50 visible panes (MiB) | - | 4.2 / 5.7 | 37.7 / 54.7 | 9.6 / 11.6 |
+| server memory, 100k colored lines of history (MiB) | - | 257.0 / 258.4 | 232.2 / 248.7 | 43.3 / 235.6 |
+| server memory after a 100 MB `cat` (MiB), lines kept | - | 6.4 / 7.9, 1,818 | 44.5 / 61.0, 9,997 | 5.6 / 13.8, 3,784 |
+| server over 30 s idle: CPU ms, interrupt wakeups | - | 0.7, 3 | 10.2, 363 | 0.1, 1 |
+| create session + kill server (ms) | - | 13.0 | 61.9 | 6.9 |
+| attach, draw, detach (ms, includes a 20 ms wait) | - | 28.6 | 69.6 | 25.2 |
+| new session until a typed command runs (ms) | 11.5 | 24.1 | 108.7 | 33.3 |
+| key echo, idle pane, p50 / p95 (us) | 2 / 4 | 21 / 26 | 97 / 138 | 17 / 23 |
+| key echo while another pane runs `yes`, p50 / p95 (us) | - | 273 / 365 | 1,114 / 1,392 | 40 / 51 |
+| bare ESC to the program, default settings, p50 (us) | 8 | 10,075 | 56,614 | 5,046 |
+| bare ESC with `escape-time 0` / kitty keyboard protocol, p50 (us) | - | 1,283 / - | - | 24 / 24 |
+| binary size (MB) | - | 1.19 + 4 Homebrew dylibs | 73.07 | 3.14, system libraries only |
 
-Where lif still loses: each extra visible pane costs about 128 KiB (tmux:
-about 10 KiB), so 50 idle panes take 9.5 MiB against tmux's 4.2 MiB (a pane no
-client shows costs about 46 KiB). After large output its RSS stays higher than
-tmux's (13.7 MiB against 7.6 after the 100 MB `cat`) although its footprint is
-lower: compressed history leaves its old pages resident until macOS reclaims
-them. The binary is 2.6 times tmux's, and a new session takes 10 ms longer
-than a bare shell to run its first command.
+Where lif still loses: each extra visible pane costs about 130 KiB (tmux:
+about 9 KiB), so 50 idle panes take 9.6 MiB against tmux's 4.2 MiB. After
+large output its RSS stays higher than tmux's (13.8 MiB against 7.9 after the
+100 MB `cat`, and nearly as high as tmux's with 100k lines of history)
+although its footprint is lower: compressed history leaves its old pages
+resident until macOS reclaims them. A new session took 9 ms longer than
+tmux's to run its first typed command in this run (in an earlier run lif was
+10 ms faster; see comparison.md). The binary is 2.6 times tmux's.
 
 <!-- END BENCHMARKS -->
 
