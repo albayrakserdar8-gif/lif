@@ -42,7 +42,8 @@ fn server_uses_the_terminal_directly() {
     // SAFETY: as above.
     unsafe { libc::kill(pid, libc::SIGCONT) };
     t.write(b"\x02d");
-    assert_eq!(t.wait_exit(), 0);
+    let code = t.wait_exit();
+    assert_eq!(code, 0, "client exit status; screen:\n{}", t.screen());
     let m = t.modes();
     assert!(!m.alt_screen && !m.bracketed_paste && !m.mouse_tracking, "terminal not restored: {m:?}");
     assert!(t.screen().contains("[detached"), "{}", t.screen());

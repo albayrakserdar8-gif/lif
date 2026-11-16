@@ -52,6 +52,10 @@
 - Fixed: a command run right after `kill-server` could meet the exiting
   server and fail with `server closed the connection`; the client now
   asks again (issues/0004).
+- Fixed: a client could exit with `lif: Broken pipe` (status 1) on a clean
+  detach when the server ended the attachment while the client was still
+  writing to it, e.g. `C-b d` (which the server reads from the terminal
+  itself) typed right after the client was continued (issues/0007).
 - Linux: the tests now run there (Ubuntu 26.04 arm64 in a Lima VM) and
   pass, with one set aside (issues/0006: the echo of a key next to a
   flooding pane takes about 4 ms on Linux). Found and fixed on the way:

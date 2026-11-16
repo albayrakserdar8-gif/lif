@@ -220,6 +220,9 @@ struct Relay {
     got_suspended: bool,
     /// The SIGCONT that continued our own stop is still in the pipe.
     skip_cont: bool,
+    /// Writing to the socket failed with EPIPE / ECONNRESET: the server
+    /// closed it, usually right after an `Exit` we have not read yet.
+    sock_shut: bool,
 }
 
 /// Job control (see `Relay::stop`).
@@ -260,6 +263,7 @@ impl Relay {
             suspend: Suspend::Running,
             got_suspended: false,
             skip_cont: false,
+            sock_shut: false,
         }
     }
 
@@ -611,13 +615,22 @@ impl Relay {
     }
 
     fn flush_sock(&mut self, sock: RawFd) -> io::Result<()> {
-        while self.sock_pending() > 0 {
+        while self.sock_pending() > 0 && !self.sock_shut {
             match sys::write(sock, &self.sock_out[self.sock_pos..]) {
                 Ok(n) => self.sock_pos += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // The server may end the attachment on its own (a key it
+                // read from the terminal directly, kill-server) while we
+                // still write, e.g. the `Resume` after SIGCONT. What it sent
+                // before closing is still readable: keep reading for its
+                // `Exit`; a close without one still ends in server_closed.
+                Err(e) if matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => self.sock_shut = true,
                 Err(e) => return Err(e),
             }
+        }
+        if self.sock_shut {
+            self.sock_pos = self.sock_out.len();
         }
         if self.sock_pos == self.sock_out.len() {
             self.sock_out.clear();

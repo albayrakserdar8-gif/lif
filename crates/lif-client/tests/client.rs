@@ -521,6 +521,78 @@ fn sigwinch_sends_resize() {
     let _ = std::fs::remove_file(path);
 }
 
+/// How many bytes a write to the slave takes before the terminal pushes
+/// back (nobody reading the master). Leaves the PTY empty.
+fn pty_capacity(pty: &Pty) -> usize {
+    let s = pty.slave.as_raw_fd();
+    // SAFETY: plain fcntl calls on a valid fd.
+    let fl = unsafe { libc::fcntl(s, libc::F_GETFL) };
+    set_nonblocking(s);
+    let chunk = [b'k'; 1024];
+    let mut n = 0;
+    loop {
+        // SAFETY: chunk is valid for chunk.len() bytes.
+        let w = unsafe { libc::write(s, chunk.as_ptr().cast(), chunk.len()) };
+        if w <= 0 {
+            break;
+        }
+        n += w as usize;
+    }
+    // SAFETY: as above.
+    unsafe { libc::fcntl(s, libc::F_SETFL, fl) };
+    read_master(pty.master.as_raw_fd(), |g| g.len() >= n);
+    n
+}
+
+/// The server may end the attachment on its own while the client still has
+/// something to say (in lif: the server read `C-b d` from the terminal
+/// itself while the client was busy with a SIGCONT and its `Resume`).
+/// Writing to the closed socket fails with EPIPE; the `Exit` sent before
+/// the close must still be read and end the loop cleanly. To make the order
+/// certain the terminal is kept full: a client blocked on its terminal does
+/// not read the socket, so the `Exit` stays unread while it writes.
+#[test]
+fn server_closing_while_the_client_writes_still_exits_cleanly() {
+    let _g = exclusive();
+    let pty = Pty::new(80, 24);
+    let s = pty.slave.as_raw_fd();
+    let before = modes(s);
+    // More than the terminal holds, little enough to sit in the socket.
+    let screen = vec![b'x'; pty_capacity(&pty) + 4096];
+    let (path, l) = listen();
+    let (closed_tx, closed_rx) = mpsc::channel::<()>();
+    let screen2 = screen.clone();
+    let srv = serve(l, move |mut s| {
+        s.attach();
+        s.send(&ServerMsg::Output(screen2));
+        s.send(&ServerMsg::Exit { reason: ExitReason::Detached, message: "[detached]".into() });
+        drop(s);
+        closed_tx.send(()).unwrap();
+    });
+    let cl = client(path.clone(), pty.fds(), Size::new(80, 24));
+    closed_rx.recv_timeout(TIMEOUT).expect("server never closed");
+    // The client writes a Resize to the closed socket. Giving it time to do
+    // so before the terminal drains can only make this test pass without
+    // testing anything, never fail it.
+    pty.set_size(132, 43, 1056, 688);
+    kill_self(libc::SIGWINCH);
+    thread::sleep(Duration::from_millis(200));
+    let m = pty.master.as_raw_fd();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut got = Vec::new();
+    while !cl.is_finished() {
+        got.extend(drain_master(m));
+        wait_fd(m, libc::POLLIN, deadline);
+    }
+    got.extend(drain_master(m));
+    join(srv, "server");
+    let exit = join(cl, "client").expect("the Exit before the close was not read");
+    assert_eq!(exit, ExitInfo { cause: ExitCause::Server, reason: ExitReason::Detached, message: "[detached]".into(), signal: None });
+    assert!(got == [&screen[..], b"[detached]\r\n"].concat(), "terminal got {} bytes", got.len());
+    assert_eq!(modes(s), before);
+    let _ = std::fs::remove_file(path);
+}
+
 /// What a real server sends on attach: everything lif may turn on.
 fn enter_bytes() -> Vec<u8> {
     let caps = OuterCaps {
