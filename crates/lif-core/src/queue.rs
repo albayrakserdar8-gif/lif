@@ -96,6 +96,8 @@ pub(crate) struct Run {
     waited: bool,
     /// The list is a hook's: what it does fires no hooks.
     muted: bool,
+    /// A job to report done when the list ends (see [`Model::execute_list_then`]).
+    release: Option<u64>,
 }
 
 /// A command list to run (from the start, or from where it was parked).
@@ -107,6 +109,7 @@ struct Work {
     status: i32,
     waited: bool,
     muted: bool,
+    release: Option<u64>,
 }
 
 /// How far [`Model::drive`] got.
@@ -159,6 +162,9 @@ pub(crate) struct Queue {
     finished: Vec<Finished>,
     next_id: u64,
     channels: BTreeMap<String, Channel>,
+    /// Jobs released by lists that were dropped (`forget_waiter`); the
+    /// lists waiting for them go on at the next `drain_ready`.
+    orphan_releases: Vec<(u64, WallClock)>,
 }
 
 /// One `#()` command.
@@ -237,7 +243,19 @@ impl Model {
     /// [`CmdOutput::pending`] and the outcome comes later through
     /// [`Model::take_finished`].
     pub fn execute_list(&mut self, list: &CommandList, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        let work = Work { rest: list.0.iter().cloned().collect(), ctx: *ctx, out: String::new(), status: 0, waited: true, muted: false };
+        self.execute_work(list, ctx, None, host)
+    }
+
+    /// [`Model::execute_list`], and when the list has ended (at once, or
+    /// after its waits; failed or not), the list waiting for job `release`
+    /// carries on: a `command-prompt`'s answer runs before the commands
+    /// that wait for the prompt, its own waits included.
+    pub fn execute_list_then(&mut self, list: &CommandList, ctx: &CmdContext, release: u64, host: &mut dyn Host) -> R {
+        self.execute_work(list, ctx, Some(release), host)
+    }
+
+    fn execute_work(&mut self, list: &CommandList, ctx: &CmdContext, release: Option<u64>, host: &mut dyn Host) -> R {
+        let work = Work { rest: list.0.iter().cloned().collect(), ctx: *ctx, out: String::new(), status: 0, waited: true, muted: false, release };
         let o = self.drive(work, host);
         match o.error {
             Some(e) => Err(e),
@@ -247,7 +265,7 @@ impl Model {
 
     /// Runs the list until it ends, fails or has to wait.
     fn drive(&mut self, work: Work, host: &mut dyn Host) -> Outcome {
-        let Work { mut rest, ctx, mut out, mut status, waited, muted } = work;
+        let Work { mut rest, ctx, mut out, mut status, waited, muted, release } = work;
         let nested = self.q.depth > 0;
         let waited = waited && !nested;
         self.clock = ctx.now.unix_secs;
@@ -259,7 +277,9 @@ impl Model {
         let (mut pending, mut parked) = (false, false);
         while let Some(c) = rest.pop_front() {
             self.last_found.set(None);
-            match self.execute(&c, &ctx, host) {
+            let r = self.execute(&c, &ctx, host);
+            self.flush_group_sync(host);
+            match r {
                 Ok(o) => {
                     out.push_str(&o.stdout);
                     if o.status != 0 {
@@ -279,7 +299,7 @@ impl Model {
             }
             let Some(b) = self.q.block.take() else { continue };
             if b.background {
-                self.q.parked.push(Run { ctx, rest: VecDeque::new(), out: String::new(), status: 0, key: b.key, then: b.then, waited: false, muted });
+                self.q.parked.push(Run { ctx, rest: VecDeque::new(), out: String::new(), status: 0, key: b.key, then: b.then, waited: false, muted, release: None });
                 continue;
             }
             if !nested {
@@ -292,7 +312,7 @@ impl Model {
             // A waited list keeps its output for whoever waits; an inner
             // list gives its caller what it has and finishes on its own.
             let kept = if waited { std::mem::take(&mut out) } else { String::new() };
-            self.q.parked.push(Run { ctx, rest, out: kept, status, key: b.key, then: b.then, waited, muted });
+            self.q.parked.push(Run { ctx, rest, out: kept, status, key: b.key, then: b.then, waited, muted, release });
             pending = waited;
             parked = true;
             break;
@@ -301,6 +321,9 @@ impl Model {
         self.hooks.muted = was_muted;
         if !nested && !parked {
             self.run_pending_hooks(ctx.now, Some(&mut out), host);
+        }
+        if !parked && let Some(job) = release {
+            self.job_done(job, JobStatus::Exited(0), b"", ctx.now, host);
         }
         self.drain_ready(host);
         Outcome { out, status, error, pending, parked }
@@ -313,9 +336,13 @@ impl Model {
             return;
         }
         self.q.draining = true;
+        for (job, now) in std::mem::take(&mut self.q.orphan_releases) {
+            // (Only queues the list: this drain runs it.)
+            self.job_done(job, JobStatus::Exited(0), b"", now, host);
+        }
         while let Some(run) = self.q.ready.pop_front() {
             let (client, was_waited) = (run.ctx.client, run.waited);
-            let work = Work { rest: run.rest, ctx: run.ctx, out: run.out, status: run.status, waited: run.waited, muted: run.muted };
+            let work = Work { rest: run.rest, ctx: run.ctx, out: run.out, status: run.status, waited: run.waited, muted: run.muted, release: run.release };
             let o = self.drive(work, host);
             // Parked again: nothing to report yet, unless nobody waits
             // and it printed something on the way.
@@ -330,7 +357,7 @@ impl Model {
     /// Runs one command list of a hook: its output and the error that
     /// ended it. If it has to wait, the rest finishes on its own.
     pub(crate) fn run_hook_list(&mut self, list: &CommandList, ctx: &CmdContext, host: &mut dyn Host) -> (String, Option<CmdError>) {
-        let work = Work { rest: list.0.iter().cloned().collect(), ctx: *ctx, out: String::new(), status: 0, waited: false, muted: true };
+        let work = Work { rest: list.0.iter().cloned().collect(), ctx: *ctx, out: String::new(), status: 0, waited: false, muted: true, release: None };
         let o = self.drive(work, host);
         (o.out, o.error)
     }
@@ -425,6 +452,9 @@ impl Model {
         }
         if error.is_some() {
             self.q.finished.push(Finished { client: run.ctx.client, waited: run.waited, stdout: run.out, status: run.status, error });
+            if let Some(job) = run.release {
+                self.job_done(job, JobStatus::Exited(0), b"", now, host);
+            }
             return;
         }
         self.q.ready.push_back(run);
@@ -434,7 +464,16 @@ impl Model {
     /// A client is gone: its `wait-for` commands stop waiting (tmux
     /// removes them too). Lists waiting for a job finish without it.
     pub(crate) fn forget_waiter(&mut self, client: ClientId) {
-        self.q.parked.retain(|r| r.ctx.client != Some(client) || matches!(r.key, WaitKey::Job(_)));
+        let mut released = Vec::new();
+        self.q.parked.retain(|r| {
+            let keep = r.ctx.client != Some(client) || matches!(r.key, WaitKey::Job(_));
+            if !keep && let Some(job) = r.release {
+                released.push((job, r.ctx.now));
+            }
+            keep
+        });
+        // What waited for those lists to end does not wait for ever.
+        self.q.orphan_releases.extend(released);
     }
 
     /// The target of `run-shell` and `if-shell`: the pane `-t` names, or

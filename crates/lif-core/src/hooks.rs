@@ -139,6 +139,11 @@ impl HookSet {
         self.0.get(name).filter(|m| !m.is_empty())
     }
 
+    /// `name[i]` and the command of every hook set here, in name order.
+    fn lines(&self) -> Vec<(String, String)> {
+        self.0.iter().flat_map(|(name, m)| m.iter().map(move |(i, list)| (format!("{name}[{i}]"), list.print(false)))).collect()
+    }
+
     fn is_empty(&self) -> bool {
         self.0.values().all(|m| m.is_empty())
     }
@@ -196,6 +201,51 @@ pub(crate) struct Hooks {
     pub(crate) current: Option<HookVars>,
 }
 
+/// Most events kept for control-mode clients between two drains (the
+/// server drains after every batch of commands and event).
+pub(crate) const MAX_CONTROL_EVENTS: usize = 4096;
+
+/// Something that happened, for control-mode clients' notifications: the
+/// name of the hook it would run (`window-linked`, `session-renamed`...)
+/// and what it happened to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlEvent {
+    /// The hook name of what happened.
+    pub name: &'static str,
+    /// The client it is about (`client-session-changed`), if any.
+    pub client: Option<ClientId>,
+    /// The session it happened in, if known.
+    pub session: Option<SessionId>,
+    /// The window it happened to, if any.
+    pub window: Option<WindowId>,
+    /// The pane it happened to, if any.
+    pub pane: Option<PaneId>,
+}
+
+impl Model {
+    /// Keep events for control-mode clients (only while there is one).
+    pub fn set_control_events(&mut self, on: bool) {
+        match (on, self.control_events.is_some()) {
+            (true, false) => self.control_events = Some(Vec::new()),
+            (false, true) => self.control_events = None,
+            _ => {}
+        }
+    }
+
+    /// The events since the last call.
+    pub fn take_control_events(&mut self) -> Vec<ControlEvent> {
+        self.control_events.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+}
+
+impl Hooks {
+    /// Every global hook that is set (the window ones with `window`):
+    /// `name[i]` and its command, for `customize-mode`.
+    pub(crate) fn global_lines(&self, window: bool) -> Vec<(String, String)> {
+        if window { self.window.lines() } else { self.session.lines() }
+    }
+}
+
 /// `name` or `name[index]`.
 fn split_index(raw: &str) -> Result<(&str, Option<u32>), CmdError> {
     let Some((name, rest)) = raw.split_once('[') else { return Ok((raw, None)) };
@@ -222,11 +272,21 @@ impl Model {
     /// `name` happened to this client / session / window / pane: queue its
     /// hook, if one is set, with the commands as they are now.
     pub(crate) fn notify(&mut self, name: &'static str, client: Option<ClientId>, s: Option<SessionId>, w: Option<WindowId>, p: Option<PaneId>) {
+        // Control-mode clients hear about it too (hooks or not).
+        if self.control_events.is_some() {
+            let w2 = w.or_else(|| p.and_then(|p| self.panes.get(&p)).map(|p| p.window));
+            let s2 = s.or_else(|| w2.and_then(|w| self.windows.get(&w)).map(|w| w.session()));
+            if let Some(q) = self.control_events.as_mut()
+                && q.len() < MAX_CONTROL_EVENTS
+            {
+                q.push(ControlEvent { name, client, session: s2, window: w2, pane: p });
+            }
+        }
         if !self.hooks.any || self.hooks.muted || self.hooks.pending.len() >= MAX_PENDING_HOOKS {
             return;
         }
         let w = w.or_else(|| p.and_then(|p| self.panes.get(&p)).map(|p| p.window));
-        let s = s.or_else(|| w.and_then(|w| self.windows.get(&w)).map(|w| w.session));
+        let s = s.or_else(|| w.and_then(|w| self.windows.get(&w)).map(|w| w.session()));
         let set = if WINDOW_HOOKS.contains(&name) {
             p.and_then(|p| self.panes.get(&p))
                 .and_then(|p| p.hooks.get(name))

@@ -272,7 +272,8 @@ fn handshake_sends_environment_and_reads_welcome() {
     assert_eq!(h.pid, std::process::id());
     assert_eq!(h.term, std::env::var("TERM").unwrap_or_default());
     assert_eq!(h.cwd, std::env::current_dir().unwrap().to_string_lossy());
-    assert!(h.env.iter().all(|(k, _)| ENV_ALLOW_LIST.contains(&k.as_str())));
+    // The whole environment, bounded; the server keeps what it uses.
+    assert!(h.env.len() <= HELLO_ENV_MAX && h.env.iter().all(|(k, v)| k.len() + v.len() <= 4096));
     for k in ENV_ALLOW_LIST {
         assert_eq!(h.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()), std::env::var(k).ok(), "{k}");
     }

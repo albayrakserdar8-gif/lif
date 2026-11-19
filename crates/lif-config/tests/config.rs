@@ -265,6 +265,7 @@ fn prefix_alone_does_the_whole_job() {
             cwd: "/".into(),
             pid: 1,
             terminal: true,
+            control: false,
         },
     );
     let mut h = TestHost::default();
@@ -594,7 +595,7 @@ fn bad_command_strings_point_at_the_value() {
         "2:7: error: key `|` in [keys]: unknown command `splt-window`, did you mean `split-window`?"
     );
     assert_eq!(diag("[keys]\nx =   \"kill-pane -Q\""), "2:7: error: key `x` in [keys]: command kill-pane: unknown flag -Q");
-    assert_eq!(diag("[keys]\nx = \"customize-mode\""), "2:5: error: key `x` in [keys]: unsupported command: customize-mode");
+    assert_eq!(diag("[keys]\nx = \"switch-mode\""), "2:5: error: key `x` in [keys]: unsupported command: switch-mode");
     assert_eq!(diag("[keys]\nx = \"split-window ; { \""), "2:5: error: key `x` in [keys]: syntax error: missing }");
     assert_eq!(diag("[keys]\nx = \"  # only a comment\""), "2:5: error: key `x` in [keys]: empty command");
     assert_eq!(
@@ -712,6 +713,12 @@ fn example_parses_cleanly_to_the_expected_commands() {
         "set-option -g set-titles-string \"#S:#I:#W - \\\"#T\\\"\"",
         "set-option -g allow-passthrough off",
         "set-option -s tmux-compat off",
+        "set-option -g pane-scrollbars off",
+        "set-option -g pane-scrollbars-position right",
+        "set-option -g pane-scrollbars-style bg=brightblack,fg=white,width=1,pad=0",
+        "set-option -g lock-after-time 0",
+        "set-option -g lock-command \"lock -np\"",
+        "set-option -g update-environment \"DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY\"",
         "set-option -g status on",
         "set-option -g status-position bottom",
         "set-option -g status-justify left",
@@ -1388,7 +1395,7 @@ fn startup_commands() {
         ("[startup]\nrun = true\n", "2:7: error: run in [startup]: expected a command string or a list of them, found boolean true"),
         ("[startup]\nran = \"x\"\n", "2:1: error: unknown key `ran` in [startup], did you mean `run`? (it has one key: run)"),
         ("startup = 3\n", "1:1: error: `startup` must be a table ([startup] with run = [...]), found integer 3"),
-        ("[startup]\nrun = [\"customize-mode\"]\n", "2:8: error: run in [startup]: unsupported command: customize-mode"),
+        ("[startup]\nrun = [\"switch-mode\"]\n", "2:8: error: run in [startup]: unsupported command: switch-mode"),
     ] {
         let c = Config::parse(text);
         assert_eq!(c.diagnostics.iter().map(|d| d.to_string()).collect::<Vec<_>>(), [want], "{text}");

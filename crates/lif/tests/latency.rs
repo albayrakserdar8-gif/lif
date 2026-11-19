@@ -52,7 +52,6 @@ fn server_uses_the_terminal_directly() {
 /// Frame pacing coalesces output nobody typed for; it must never hold back
 /// an echo, also not while another pane floods the same client.
 #[test]
-#[cfg_attr(target_os = "linux", ignore = "issues/0006: on Linux the echo comes back from the PTY milliseconds late next to a flood")]
 fn echo_is_not_paced_next_to_a_flood() {
     let env = Env::new();
     env.ok(&["new-session", "-d", "-s", "echo", "-x", "120", "-y", "40"]);

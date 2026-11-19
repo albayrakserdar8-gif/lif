@@ -10,6 +10,8 @@ const NOW: WallClock = WallClock::new(1_794_682_220, 3 * 3600);
 
 #[derive(Default)]
 struct TestHost {
+    /// What `client_env` gives every client.
+    client_env: Vec<(String, String)>,
     spawned: Vec<SpawnSpec>,
     killed: Vec<PaneId>,
     resized: HashMap<PaneId, Size>,
@@ -66,6 +68,9 @@ struct TestHost {
 }
 
 impl Host for TestHost {
+    fn client_env(&self, _client: ClientId) -> Vec<(String, String)> {
+        self.client_env.clone()
+    }
     fn spawn_pane(&mut self, spec: &SpawnSpec) -> Result<(), String> {
         if self.fail_spawn {
             return Err("fork failed: Resource temporarily unavailable".into());
@@ -109,10 +114,14 @@ impl Host for TestHost {
     fn close_overlay(&mut self, _client: ClientId) {
         self.overlays_closed += 1;
     }
-    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, _cwd: &str) -> Result<(), String> {
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, _cwd: &str, input: bool, output: bool) -> Result<(), String> {
         self.pipe_calls.push((pane, command.map(str::to_string)));
         match command {
-            Some(c) => self.pipes.insert(pane, c.to_string()),
+            Some(c) => self.pipes.insert(pane, format!("{}{c}", match (input, output) {
+                (true, true) => "-IO ",
+                (true, false) => "-I ",
+                _ => "",
+            })),
             None => self.pipes.remove(&pane),
         };
         Ok(())
@@ -271,7 +280,7 @@ impl T {
         let c = ClientId(id);
         self.m.client_connect(
             c,
-            ClientInfo { name: format!("/dev/ttys00{id}"), term: "xterm-256color".into(), size: Size::new(cols, rows), cwd: "/home/u".into(), pid: 99, terminal: true },
+            ClientInfo { name: format!("/dev/ttys00{id}"), term: "xterm-256color".into(), size: Size::new(cols, rows), cwd: "/home/u".into(), pid: 99, terminal: true, control: false },
         );
         c
     }
@@ -288,14 +297,18 @@ fn check_model(m: &Model) {
         }
         for (idx, wid) in &s.windows {
             let w = m.window(*wid).expect("window exists");
-            assert_eq!(w.session, s.id);
-            assert_eq!(w.index, *idx);
+            assert!(w.links.contains(&(s.id, *idx)), "window {wid} at {}:{idx} without that link", s.id);
             w.layout.check().unwrap();
             let mut lp = w.layout.panes();
             lp.sort();
-            let mut wp = w.panes.clone();
+            // The floating ones are not in the layout; they are in the window.
+            let mut wp: Vec<PaneId> = w.panes.iter().copied().filter(|p| !w.is_floating(*p)).collect();
             wp.sort();
             assert_eq!(lp, wp, "layout panes != window panes");
+            for (p, r) in w.floating() {
+                assert!(w.panes.contains(p), "floating pane {p} not in its window");
+                assert!(r.x + r.cols <= w.size.cols && r.y + r.rows <= w.size.rows, "floating pane {p} outside its window");
+            }
             assert!(w.panes.contains(&w.active));
             for p in &w.panes {
                 assert_eq!(m.pane(*p).expect("pane exists").window, w.id);
@@ -305,8 +318,9 @@ fn check_model(m: &Model) {
             }
         }
     }
-    let nwin: usize = m.sessions().map(|s| s.windows.len()).sum();
-    assert_eq!(nwin, m.windows.len(), "orphan windows");
+    // Every session map entry is one link and every link one entry.
+    let nlinks: usize = m.sessions().map(|s| s.windows.len()).sum();
+    assert_eq!(nlinks, m.windows.values().map(|w| w.links.len()).sum::<usize>(), "links and session maps disagree");
     let npanes: usize = m.windows.values().map(|w| w.panes.len()).sum();
     assert_eq!(npanes, m.panes.len(), "orphan panes");
     for c in m.clients() {
@@ -314,7 +328,7 @@ fn check_model(m: &Model) {
             assert!(m.session(s).is_some(), "client attached to a dead session");
             let view = m.client_view(c.id).expect("an attached client has a view");
             let w = m.window(view.window).expect("viewed window exists");
-            assert_eq!(w.session, s, "client views a window of another session");
+            assert!(w.index_in(s).is_some(), "client views a window of another session");
             for (p, _) in &view.panes {
                 assert_eq!(m.pane(*p).expect("viewed pane exists").window, w.id);
             }
@@ -323,14 +337,17 @@ fn check_model(m: &Model) {
             assert!(m.session(s).is_some(), "client's last session is dead");
         }
     }
-    // Every window and pane is reachable from exactly one place, every index
-    // is in range and every id came from its counter.
+    // Every window is linked somewhere, every link is in its session's
+    // map, every index is in range and every id came from its counter.
     for (wid, w) in &m.windows {
         assert_eq!(*wid, w.id);
         assert!(w.id.0 < m.next_window && w.id.0 != u32::MAX, "window id {} not from the counter", w.id);
-        assert!(w.index <= crate::model::MAX_WINDOW_INDEX, "window index {} too big", w.index);
-        let s = m.session(w.session).expect("window's session exists");
-        assert_eq!(s.windows.get(&w.index), Some(wid), "window {wid} not linked at its index");
+        assert!(!w.links.is_empty(), "window {wid} linked nowhere");
+        for (sid, idx) in &w.links {
+            assert!(*idx <= crate::model::MAX_WINDOW_INDEX, "window index {idx} too big");
+            let s = m.session(*sid).expect("window's session exists");
+            assert_eq!(s.windows.get(idx), Some(wid), "window {wid} not linked at its index");
+        }
     }
     let mut owner: HashMap<PaneId, WindowId> = HashMap::new();
     for w in m.windows.values() {
@@ -943,7 +960,7 @@ fn keys_bindings_and_prompts() {
     t.ok("confirm-before -p 'kill-pane #P? (y/n)' kill-pane");
     assert_eq!(
         t.h.prompts[1].1,
-        Prompt::Confirm { prompt: "kill-pane 1? (y/n) ".into(), command: "kill-pane".into(), default_yes: false }
+        Prompt::Confirm { prompt: "kill-pane 1? (y/n) ".into(), command: "kill-pane".into(), default_yes: false, job: Some(2) }
     );
     t.ok("command-prompt");
     assert!(matches!(&t.h.prompts[2].1, Prompt::Command { prompts, template, .. } if prompts[0] == ":" && template == "%1"));
@@ -1456,14 +1473,45 @@ fn flags_that_change_behavior_work_or_fail() {
     t.ctx = CmdContext::client(c2, NOW);
     t.ok("new -A -D -s a");
     assert_eq!(t.h.hangups.len(), 3);
-    // -E would skip update-environment, which lif does not have.
-    assert_eq!(t.err("new -d -E -s e"), "new-session -E is not supported: lif has no update-environment option");
+    // update-environment: copied from the client, a missing one marked as
+    // removed; -E skips it (new-session, attach-session, switch-client).
+    t.h.client_env = vec![("DISPLAY".into(), ":1".into()), ("SSH_AUTH_SOCK".into(), "/tmp/a".into()), ("HOME".into(), "/h".into())];
+    t.ok("set -g update-environment 'DISPLAY SSH_AUTH_SOCK'");
+    t.ok("set -ga update-environment GONE");
+    // Shown as tmux shows an array option.
+    assert_eq!(t.ok("show -gv update-environment"), "DISPLAY\nSSH_AUTH_SOCK\nGONE\n");
+    assert_eq!(t.ok("show -g update-environment"), "update-environment[0] DISPLAY\nupdate-environment[1] SSH_AUTH_SOCK\nupdate-environment[2] GONE\n");
+    t.ok("new -d -s u");
+    assert_eq!(t.ok("show-environment -t u"), "DISPLAY=:1\n-GONE\nSSH_AUTH_SOCK=/tmp/a\n");
+    t.ok("new -d -E -s e");
+    assert_eq!(t.ok("show-environment -t e"), "");
+    t.h.client_env[0].1 = ":2".into();
+    t.ok("switch-client -E -t e");
+    assert_eq!(t.ok("show-environment -t e"), "");
+    t.ok("switch-client -t u");
+    assert_eq!(t.ok("show-environment -t u"), "DISPLAY=:2\n-GONE\nSSH_AUTH_SOCK=/tmp/a\n");
+    t.ok("set -g update-environment ''");
     // display-panes -N: numbers that ignore keys; -b is not a tmux 3.8 flag.
     t.ok("display-panes -N");
     assert_eq!(t.h.messages.last().unwrap(), &(c2, "display-panes select-pane -t '%%' (no keys)".to_string()));
     assert_eq!(t.err("display-panes -b"), "command display-panes: unknown flag -b");
-    // command-prompt -i (incremental) only exists for copy-mode searches.
-    assert!(t.err("command-prompt -i").contains("not supported"));
+    // command-prompt: -i, -e and -l reach the prompt (-l: no splitting at
+    // commas); -i means nothing with -1; -b: nothing waits for it.
+    t.ok("command-prompt -i -e -l -p 'a,b' -I '1,2' 'x %%'");
+    match &t.h.prompts.last().unwrap().1 {
+        Prompt::Command { prompts, inputs, incremental: true, backspace_cancels: true, job: Some(_), .. } => {
+            assert_eq!((prompts.as_slice(), inputs.as_slice()), (["a,b ".to_string()].as_slice(), ["1,2".to_string()].as_slice()));
+        }
+        other => panic!("{other:?}"),
+    }
+    t.ok("command-prompt -1 -i -b -C x");
+    assert!(matches!(&t.h.prompts.last().unwrap().1, Prompt::Command { incremental: false, job: None, .. }));
+    // Without -b the commands after it wait until the prompt closes.
+    t.ok("command-prompt -p x 'display a' ; display after");
+    let Prompt::Command { job: Some(job), .. } = t.h.prompts.last().unwrap().1.clone() else { panic!("no job") };
+    assert_ne!(t.h.messages.last().unwrap().1, "after");
+    t.m.job_done(job, JobStatus::Exited(0), b"", NOW, &mut t.h);
+    assert_eq!(t.h.messages.last().unwrap().1, "after");
 }
 
 #[test]
@@ -1494,7 +1542,7 @@ fn list_commands_format() {
     );
     assert_eq!(
         t.ok("lscm -F '#{command_list_usage}' new-session"),
-        "[-AdDEPX] [-c value] [-e value] [-F value] [-n value] [-s value] [-x value] [-y value] [argument ...]\n"
+        "[-AdDEPX] [-c value] [-e value] [-F value] [-n value] [-s value] [-t value] [-x value] [-y value] [argument ...]\n"
     );
     assert_eq!(t.ok("lscm -F '#{command_list_usage}' kill-server"), "\n");
     let all = t.ok("lscm -F '#{command_list_name}'");
@@ -2192,7 +2240,16 @@ fn choose_buffer_client_and_find_window() {
     assert_eq!(lines(&mut s).len(), 9, "no window is named vim");
     let mut s = t.chooser("find-window -i -C CAPTURED");
     assert_eq!(lines(&mut s).len(), 9, "every pane's text matches");
-    assert_eq!(t.err("find-window -r x"), "find-window -r is not supported: lif matches with shell patterns");
+    // -r: a regular expression, anywhere in the name; -i ignores case; one
+    // that does not compile finds nothing, so the whole tree shows.
+    let mut s = t.chooser("find-window -r -N 'ec.n'");
+    assert_eq!(lines(&mut s)[1], " (1) └─→ - 1: second: \"box.local\"");
+    let mut s = t.chooser("find-window -r -i -N '^SEC'");
+    assert_eq!(lines(&mut s).len(), 3);
+    let mut s = t.chooser("find-window -r -N '^SEC'");
+    assert_eq!(lines(&mut s).len(), 9, "case matters without -i");
+    let mut s = t.chooser("find-window -r -N '('");
+    assert_eq!(lines(&mut s).len(), 9);
     // -Z zooms the pane for the mode, and only then is there a zoom to undo.
     t.ok("choose-tree -Z -t a:0.0");
     let (_, pane, spec) = t.h.choosers.pop().unwrap();
@@ -2279,7 +2336,13 @@ fn pipe_pane_input_off_clock_and_prompt_history() {
     assert_eq!(t.h.pipe_calls, [(PaneId(0), None), (PaneId(0), Some("cat > third".into()))]);
     t.ok("pipe-pane");
     assert!(t.h.pipes.is_empty());
-    assert!(t.err("pipe-pane -I x").starts_with("pipe-pane -I is not supported"));
+    t.ok("pipe-pane -I 'echo ls'");
+    assert_eq!(t.h.pipes[&PaneId(0)], "-I echo ls");
+    t.ok("pipe-pane -I -O cat");
+    assert_eq!(t.h.pipes[&PaneId(0)], "-IO cat");
+    t.ok("pipe-pane -O cat");
+    assert_eq!(t.h.pipes[&PaneId(0)], "cat");
+    t.ok("pipe-pane");
     // select-pane -d and -e.
     assert_eq!(t.ok("display -p '#{pane_input_off}'"), "0\n");
     t.ok("split-window -d ; select-pane -d -t %1");
@@ -2347,7 +2410,10 @@ fn display_popup_places_and_waits() {
     assert_eq!((p.border, p.title.as_str(), p.close, p.any_key), (BorderLines::Rounded, " a ", PopupClose::OnExit, false));
     assert_eq!((p.cwd.as_str(), p.style.as_str(), p.border_style.as_str()), ("/tmp", "bg=blue", "fg=red"));
     assert_eq!(p.command, SpawnCommand::Shell { shell: "/bin/zsh".into(), command: "make test".into() });
-    assert_eq!(p.env, [("FROM".to_string(), Some("global".to_string())), ("A".to_string(), Some("1".to_string()))]);
+    // (Less the update-environment variables the test client lacks, which
+    // the session marks as removed.)
+    let set: Vec<_> = p.env.iter().filter(|(_, v)| v.is_some()).cloned().collect();
+    assert_eq!(set, [("FROM".to_string(), Some("global".to_string())), ("A".to_string(), Some("1".to_string()))]);
     assert_eq!((p.session, p.pane), (SessionId(0), PaneId(0)));
     // The list waits for the popup; its program's status is the client's.
     assert!(!t.m.has_finished());
@@ -2671,4 +2737,166 @@ fn full_size_splits_before_and_join_pane_f() {
     assert_eq!(t.ok(f), "0 0,0 40x12 0\n1 0,13 40x5 0\n2 41,0 39x24 1\n3 0,19 40x5 0\n");
     t.ok("join-pane -f -b -d -s a:2.0 -t a:0.0");
     assert_eq!(t.ok(f), "0 0,0 80x12 0\n1 0,13 40x5 0\n2 0,19 40x2 0\n3 41,13 39x11 1\n4 0,22 40x2 0\n");
+}
+
+/// customize-mode: tmux's headings, a line per setting, Enter edits it on
+/// the status line and d puts the default back, without leaving the mode.
+#[test]
+fn customize_mode_lists_and_edits_settings() {
+    let mut t = T::with_session();
+    let c = t.attach_client(1, 80, 24);
+    t.ctx = CmdContext::client(c, NOW);
+    t.ok("attach -t a");
+    t.ok("set -g @x 1 ; set -t a status-left L ; set-hook -g after-new-window 'display hi' ; setenv -g EV 1 ; bind -T prefix y display yes");
+    let mut s = t.chooser("customize-mode");
+    let l = lines(&mut s);
+    assert_eq!(&l[..3], [">(0) + Server Options", " (1) + Session Options", " (2) + Window & Pane Options"]);
+    assert!(l.iter().any(|x| x.ends_with("+ Key Table - prefix")), "{l:?}");
+    s.key(&key("Down"));
+    s.key(&key("Right"));
+    // Down to the line holding `needle` (selected), and its text.
+    let to = |s: &mut ChooseState, needle: &str| -> String {
+        for _ in 0..300 {
+            if let Some(l) = lines(s).into_iter().find(|x| x.starts_with('>') && x.contains(needle)) {
+                return l;
+            }
+            s.key(&key("Down"));
+        }
+        panic!("no line with {needle}");
+    };
+    assert!(to(&mut s, "base-index").ends_with("├─→   base-index: 0"));
+    assert_eq!(s.key(&key("Enter")), ChooseOutcome::Run(vec!["command-prompt -I 0 -p (base-index) { set-option -g base-index \"%%%\" }".into()]));
+    assert_eq!(s.key(&key("d")), ChooseOutcome::Run(vec!["set-option -gu base-index".into()]));
+    assert!(to(&mut s, "status-left:").ends_with("├─→   status-left: (session a) L"));
+    assert_eq!(s.key(&key("u")), ChooseOutcome::Run(vec!["set-option -u -t \"\\$0\" status-left".into()]));
+    // Hooks, environment, keys.
+    s.key(&key("M-+"));
+    to(&mut s, "after-new-window[0]: display-message hi");
+    to(&mut s, "EV: 1");
+    to(&mut s, "y: display-message yes");
+}
+
+/// link-window and unlink-window, against what tmux 3.8 printed for the
+/// same commands.
+#[test]
+fn linked_windows() {
+    let mut t = T::with_session();
+    t.ok("rename-window -t a:0 one ; new-window -d -t a:1 -n two ; new -d -s b -n bee ; link-window -s a:1 -t b:5");
+    let all = "list-windows -a -F '#{session_name}:#{window_index} #{window_name} #{window_linked} #{window_linked_sessions} #{window_linked_sessions_list}'";
+    assert_eq!(t.ok(all), "a:0 one 0 1 a\na:1 two 1 2 a,b\nb:0 bee 0 1 b\nb:5 two 1 2 a,b\n");
+    assert_eq!(t.err("link-window -s a:1 -t b:5"), "same index: 5");
+    assert_eq!(t.err("link-window -s a:0 -t b:5"), "index in use: 5");
+    t.ok("link-window -d -s a:0 -t a:7");
+    assert_eq!(t.ok("list-windows -t a -F '#I #W #{window_linked}'"), "0 one 1\n1 two 1\n7 one 1\n");
+    assert_eq!(t.err("unlink-window -t b:0"), "window only linked to one session");
+    t.ok("unlink-window -t a:7");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "a:0 one\na:1 two\nb:0 bee\nb:5 two\n");
+    // A pane of a linked window is the same pane in both sessions.
+    let pa = t.ok("display -p -t a:1 '#{pane_id}'");
+    assert_eq!(t.ok("display -p -t b:5 '#{pane_id} #{window_index} #{session_name}'"), format!("{} 5 b\n", pa.trim()));
+    // kill-window kills it everywhere; unlink-window -k kills a window
+    // linked once.
+    t.ok("kill-window -t b:5");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "a:0 one\nb:0 bee\n");
+    t.ok("link-window -s a:0 -t b:3 ; kill-session -t a");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W #{window_linked}'"), "b:0 bee 0\nb:3 one 0\n");
+    t.ok("unlink-window -k -t b:3");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "b:0 bee\n");
+}
+
+/// Session groups, against what tmux 3.8 printed for the same commands.
+#[test]
+fn session_groups() {
+    let mut t = T::with_session();
+    let f = "ls -F '#{session_name} g=#{session_grouped} n=#{session_group} sz=#{session_group_size} l=#{session_group_list} cur=#{window_index}'";
+    t.ok("rename-window -t a:0 one ; new-window -d -n two ; new -d -s c -t a");
+    assert_eq!(t.ok(f), "a g=1 n=a sz=2 l=a,c cur=0\nc g=1 n=a sz=2 l=a,c cur=0\n");
+    t.ok("new-window -d -t c:5 -n five");
+    let all = "list-windows -a -F '#{session_name}:#I #W #{window_linked}'";
+    assert_eq!(t.ok(all), "a:0 one 1\na:1 two 1\na:5 five 1\nc:0 one 1\nc:1 two 1\nc:5 five 1\n");
+    t.ok("select-window -t c:1");
+    assert_eq!(t.ok(f), "a g=1 n=a sz=2 l=a,c cur=0\nc g=1 n=a sz=2 l=a,c cur=1\n");
+    t.ok("kill-window -t a:0");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "a:1 two\na:5 five\nc:1 two\nc:5 five\n");
+    assert_eq!(t.err("new -d -s x -t a -n nm"), "command or window name given with target");
+    assert_eq!(t.err("new -d -s y -t a 'sleep 1'"), "command or window name given with target");
+    t.ok("rename-session -t a aa");
+    assert_eq!(t.ok(f), "aa g=1 n=a sz=2 l=aa,c cur=5\nc g=1 n=a sz=2 l=aa,c cur=1\n");
+    t.ok("kill-session -t aa");
+    assert_eq!(t.ok(f), "c g=1 n=a sz=1 l=c cur=1\n");
+    // A window moved in one member moves in all; unlinking one that is only
+    // in the group needs -k.
+    t.ok("new -d -s d -t c ; move-window -s c:5 -t c:7");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "c:1 two\nc:7 five\nd:1 two\nd:7 five\n");
+    assert_eq!(t.err("unlink-window -t d:7"), "window only linked to one session");
+    t.ok("unlink-window -k -t d:7");
+    assert_eq!(t.ok("list-windows -a -F '#{session_name}:#I #W'"), "c:1 two\nd:1 two\n");
+}
+
+/// Floating panes: geometry as tmux 3.8 printed it for the same commands.
+#[test]
+fn floating_panes() {
+    let mut t = T::with_session();
+    t.ok("resize-window -t a -x 100 -y 40");
+    let lp = "list-panes -F '#{pane_index} #{pane_id} #{pane_left},#{pane_top} #{pane_width}x#{pane_height} f=#{pane_floating_flag} a=#{pane_active}'";
+    t.ok("new-pane -d ; new-pane -d ; new-pane -d -x 30 -y 10 -X 5 -Y 6");
+    assert_eq!(t.ok(lp), "0 %0 0,0 100x40 f=0 a=1\n1 %1 4,2 50x10 f=1 a=0\n2 %2 8,4 50x10 f=1 a=0\n3 %3 6,7 28x8 f=1 a=0\n");
+    t.ok("new-pane -d -x 50% -y 50% -X 10% -Y 20%");
+    assert!(t.ok(lp).ends_with("4 %4 11,9 48x18 f=1 a=0\n"));
+    let p3 = |t: &mut T| t.ok(lp).lines().find(|l| l.contains("%3")).unwrap().to_string();
+    t.ok("move-pane -t %3 -P centre");
+    assert_eq!(p3(&mut t), "3 %3 36,16 28x8 f=1 a=0");
+    t.ok("move-pane -t %3 -P bottom-right");
+    assert_eq!(p3(&mut t), "3 %3 71,31 28x8 f=1 a=0");
+    t.ok("move-pane -t %3 -L 4");
+    assert_eq!(p3(&mut t), "3 %3 67,31 28x8 f=1 a=0");
+    t.ok("move-pane -t %3 -U 2");
+    assert_eq!(p3(&mut t), "3 %3 67,29 28x8 f=1 a=0");
+    t.ok("move-pane -t %3 -X 0 -Y 0");
+    assert_eq!(p3(&mut t), "3 %3 1,1 28x8 f=1 a=0");
+    t.ok("resize-pane -t %3 -x 20 -y 5");
+    assert_eq!(p3(&mut t), "3 %3 1,1 18x3 f=1 a=0");
+    t.ok("resize-pane -t %3 -R 3");
+    assert_eq!(p3(&mut t), "3 %3 1,1 21x3 f=1 a=0");
+    assert_eq!(t.err("move-pane -t %0 -X 3"), "pane is not floating");
+    assert_eq!(t.err("move-pane -t %3 -P nowhere"), "invalid position: nowhere");
+    // Front to back: -z 0 is the front.
+    t.ok("move-pane -t %1 -z 0");
+    let w = t.m.window(WindowId(0)).unwrap();
+    assert_eq!(w.floating().last().map(|f| f.0), Some(PaneId(1)));
+    // Selecting one, killing one, and the commands that know only tiled
+    // panes, with floating ones around.
+    t.ok("select-pane -t %2 ; kill-pane -t %4");
+    // Splitting a floating pane makes another below it (tmux).
+    t.ok("split-window -d -t %2");
+    assert!(t.ok(lp).contains(" %5 8,16 50x10 f=1 a=0"), "{}", t.ok(lp));
+    t.ok("select-pane -t %0 ; split-window -d ; select-layout tiled ; rotate-window ; resize-pane -Z ; resize-pane -Z");
+    t.ok("swap-pane -s %1 -t %0");
+    assert!(t.ok(lp).contains(" %0 ") && t.m.window(WindowId(0)).unwrap().is_floating(PaneId(0)));
+    t.ok("swap-pane -s %1 -t %0");
+    t.ok("break-pane -d -s %2");
+    t.ok("join-pane -d -s :1 -t %0");
+    assert!(t.ok(lp).contains("f=0"));
+    // The last tiled pane closes the window with its floating panes.
+    t.ok("new -d -s solo ; new-pane -d -t solo");
+    t.ok("kill-pane -t solo:0.0");
+    assert!(t.err("has-session -t solo").contains("can't find session"));
+}
+
+/// Scrollbars take their columns from the pane, as tmux 3.8 shows it
+/// (80 columns: 79 with one, 77 with width=2,pad=1; modal: over the pane).
+#[test]
+fn scrollbars_take_columns() {
+    let mut t = T::with_session();
+    t.ok("resize-window -t a -x 80 -y 24");
+    let w = |t: &mut T| t.ok("display -p '#{pane_width}'");
+    assert_eq!(w(&mut t), "80\n");
+    t.ok("set -g pane-scrollbars on");
+    assert_eq!(w(&mut t), "79\n");
+    t.ok("set -g pane-scrollbars-style 'bg=red,fg=blue,width=2,pad=1'");
+    assert_eq!(w(&mut t), "77\n");
+    t.ok("set -g pane-scrollbars modal");
+    assert_eq!(w(&mut t), "80\n");
+    t.ok("set -g pane-scrollbars off");
+    assert_eq!(w(&mut t), "80\n");
 }

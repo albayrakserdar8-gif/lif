@@ -1,7 +1,7 @@
 # Moving from tmux to lif
 
 This guide is for someone who uses tmux today. Everything in it was checked
-against lif 0.4.0's command table and by running the commands; the tmux side is
+against lif 0.5.0's command table and by running the commands; the tmux side is
 tmux 3.8 (`tmux list-commands`, `tmux list-keys` with an empty configuration).
 
 In short: the commands, flags, targets, formats and default keys you use every
@@ -12,26 +12,25 @@ tmux, with the differences listed under [Scripting](#scripting).
 
 ## Commands
 
-82 of tmux 3.8's 92 commands exist in lif (32 with the same flags, 50 with some
-difference, usually missing flags); 10 do not. Command names, aliases and unambiguous prefixes
+90 of tmux 3.8's 92 commands exist in lif (38 with the same flags, 52 with some
+difference, usually missing flags); 2 do not. Command names, aliases and unambiguous prefixes
 resolve as in tmux (`lif splitw`, `lif new`, `lif a`). An unimplemented
 command fails with exit status 1:
 
 ```
-$ lif customize-mode
-unsupported command: customize-mode
+$ lif switch-mode
+unsupported command: switch-mode
 ```
 
 A flag lif does not know fails the same way (`command split-window: unknown flag -f`).
 A few tmux flags that lif cannot honor fail with an explicit `not supported`
-error instead (`new-session -E`, `command-prompt -i`, `find-window -r`,
-`pipe-pane -I`). The flags that are
+error instead (`new-session -E`). The flags that are
 accepted without changing anything are listed in
 [Flags accepted without effect](#flags-accepted-without-effect).
 
 | tmux command | lif | Differences |
 |---|---|---|
-| `attach-session` (`attach`) | supported with differences | no `-E`, `-f`, `-r` |
+| `attach-session` (`attach`) | supported with differences | no `-f`, `-r` |
 | `bind-key` (`bind`) | supported with differences | mouse keys are bound in the root table; in the copy-mode tables they are accepted and never used (see [Mouse](#mouse)) |
 | `break-pane` (`breakp`) | supported with differences | no `-W`, `-x`, `-y`, `-X`, `-Y` (floating panes) |
 | `capture-pane` (`capturep`) | supported with differences | has `-b -e -E -J -N -p -q -S -t`; no `-a`, `-C`, `-F`, `-H`, `-I`, `-L`, `-M`, `-P`, `-R`, `-T` |
@@ -41,17 +40,17 @@ accepted without changing anything are listed in
 | `clear-history` (`clearhist`) | supported | `-H` changes nothing (see below) |
 | `clear-prompt-history` (`clearphist`) | supported | lif keeps one history, the command prompt's |
 | `clock-mode` | supported | |
-| `command-prompt` | supported with differences | no `-b`, `-C`, `-e`, `-l`; `-i` fails with `not supported` (incremental prompts exist only for copy-mode searches); `-P`, `-T` change nothing (see below) |
-| `confirm-before` (`confirm`) | supported with differences | `-b` changes nothing (see below) |
+| `command-prompt` | supported with differences | all of tmux's flags; `-C`, `-P`, `-T` change nothing (see below); without `-b` the commands after it wait for the prompt, as in tmux |
+| `confirm-before` (`confirm`) | supported | without `-b` the commands after it wait for the answer, as in tmux |
 | `copy-mode` | supported with differences | no `-k`, `-s`, `-S` |
-| `customize-mode` | not supported | |
+| `customize-mode` | supported with differences | tmux's headings, keys and editing (Enter, `d`, `u`); the preview shows the scope and value of an option but not tmux's description of it; `-F` and `-f` change nothing |
 | `delete-buffer` (`deleteb`) | supported | |
 | `detach-client` (`detach`) | supported with differences | no `-E` |
 | `display-menu` (`menu`) | supported with differences | has `-b -c -C -H -M -O -s -S -t -T -x -y`; positions `M` and `W` are the centre unless a mouse key opened the menu; `#[...]` styles in names and titles are dropped; see [Popups and menus](#popups-and-menus) |
 | `display-message` (`display`) | supported with differences | has `-c -d -F -l -p -t`; no `-a`, `-C`, `-I`, `-j`, `-N`, `-v` |
 | `display-panes` (`displayp`) | supported with differences | no `-k`, `-s`, `-Z` |
 | `display-popup` (`popup`) | supported with differences | has `-B -b -C -c -d -e -E -h -k -s -S -t -T -w -x -y`; no `-N`; see [Popups and menus](#popups-and-menus) |
-| `find-window` (`findw`) | supported with differences | has `-C -i -N -T -t -Z`; `-r` fails with `not supported` (matching is by shell pattern, as tmux's default) |
+| `find-window` (`findw`) | supported | `-r` takes the regular expressions of copy-mode search (see [copy-mode.md](copy-mode.md)) |
 | `has-session` (`has`) | supported | |
 | `if-shell` (`if`) | supported | the shell command runs with `/bin/sh` |
 | `join-pane` (`joinp`) | supported with differences | `-p` percentage is also accepted |
@@ -61,7 +60,7 @@ accepted without changing anything are listed in
 | `kill-window` (`killw`) | supported with differences | no `-f` |
 | `last-pane` (`lastp`) | supported with differences | no `-d`, `-e` |
 | `last-window` (`last`) | supported | |
-| `link-window` (`linkw`) | not supported | |
+| `link-window` (`linkw`) | supported | the window is the same in both places, as in tmux; see [Linked windows and session groups](#linked-windows-and-session-groups) |
 | `list-buffers` (`lsb`) | supported with differences | no `-O` (sort order) |
 | `list-clients` (`lsc`) | supported with differences | no `-O` |
 | `list-commands` (`lscm`) | supported with differences | prints names and aliases only, no usage strings; with `-F`, `#{command_list_usage}` is built from the flag table (`[-deHMqu] [-t value]`), without tmux's argument names |
@@ -70,21 +69,21 @@ accepted without changing anything are listed in
 | `list-sessions` (`ls`) | supported with differences | no `-O`, `-r` |
 | `list-windows` (`lsw`) | supported with differences | no `-O`, `-r` |
 | `load-buffer` (`loadb`) | supported with differences | has `-b`, `-w` and `-` (standard input, at most 16 MiB); `-t` changes nothing |
-| `lock-client` (`lockc`) | not supported | |
-| `lock-server` (`lock`) | not supported | |
-| `lock-session` (`locks`) | not supported | |
-| `move-pane` (`movep`) | not supported | |
+| `lock-client` (`lockc`) | supported | `lock-command` runs with `/bin/sh` on the client's terminal |
+| `lock-server` (`lock`) | supported | |
+| `lock-session` (`locks`) | supported | |
+| `move-pane` (`movep`) | supported with differences | as `join-pane`, or with `-D -L -P -R -U -X -Y -z` it moves a floating pane; no `-M` (see [Floating panes](#floating-panes)) |
 | `move-window` (`movew`) | supported | |
-| `new-pane` (`newp`) | not supported | |
-| `new-session` (`new`) | supported with differences | no `-f`, `-t` (no session groups); `-E` fails with `not supported` (lif has no `update-environment`) |
+| `new-pane` (`newp`) | supported with differences | has `-b -c -d -e -F -L -P -t -T -x -X -y -Y` and the command; `-A -C -D -I -K -M -O -W` fail with `not supported`; `-B -m -R -s -S -k -l -p -f -h -v -Z` change nothing without `-L` (see [Floating panes](#floating-panes)) |
+| `new-session` (`new`) | supported with differences | no `-f` |
 | `new-window` (`neww`) | supported with differences | no `-E` |
 | `next-layout` (`nextl`) | supported | |
 | `next-window` (`next`) | supported | |
 | `paste-buffer` (`pasteb`) | supported with differences | no `-S` |
-| `pipe-pane` (`pipep`) | supported with differences | has `-O -o -t`; `-I` fails with `not supported`; the command runs with `/bin/sh`; at most 1 MiB waits for a command that reads slowly, the rest is not piped |
+| `pipe-pane` (`pipep`) | supported with differences | all of tmux's flags; the command runs with `/bin/sh`; at most 1 MiB waits for a command that reads slowly, the rest is not piped; with `-I` the command's output is read only while the pane's input queue (1 MiB) has room |
 | `previous-layout` (`prevl`) | supported | |
 | `previous-window` (`prev`) | supported | |
-| `refresh-client` (`refresh`) | supported with differences | only `-S` and `-t`; no control-mode or pan flags |
+| `refresh-client` (`refresh`) | supported with differences | `-C` (a control client's size), `-S`, `-t`; no `-A`, `-B`, `-f` (control-mode subscriptions and flags) or pan flags |
 | `rename-session` (`rename`) | supported | |
 | `rename-window` (`renamew`) | supported | |
 | `resize-pane` (`resizep`) | supported with differences | no `-T` |
@@ -118,10 +117,10 @@ accepted without changing anything are listed in
 | `suspend-client` (`suspendc`) | supported | |
 | `swap-pane` (`swapp`) | supported | |
 | `swap-window` (`swapw`) | supported | |
-| `switch-client` (`switchc`) | supported with differences | no `-E`, `-O`, `-r` |
+| `switch-client` (`switchc`) | supported with differences | no `-O`, `-r` |
 | `switch-mode` | not supported | |
 | `unbind-key` (`unbind`) | supported | |
-| `unlink-window` (`unlinkw`) | not supported | |
+| `unlink-window` (`unlinkw`) | supported | |
 | `wait-for` (`wait`) | supported with differences | has `-L -S -U`; no `-E`, `-l`, `-v`, `-F`, `-w` |
 
 The commands `check-config`, `print-config` and `migrate-tmux-conf`
@@ -133,8 +132,8 @@ So is `install-tmux-shim [dir]` (see [claude-code.md](claude-code.md)).
 These parse and change nothing, because what they switch is how lif always
 behaves (or something lif does not have):
 
-- `confirm-before -b`: lif never makes the command that opened a prompt wait
-  for the answer (tmux waits unless `-b` is given).
+- `command-prompt -C`: tmux keeps updating panes while the prompt is up
+  only with it; lif always does.
 - `command-prompt -P`: tmux opens the prompt inside the pane; lif always uses
   the status line.
 - `command-prompt -T`: the prompt type chooses Tab completions in tmux; lif's
@@ -154,7 +153,7 @@ commands or flags lif lacks). The mouse keys of the root table are listed
 under [Mouse](#mouse). Long tmux
 commands are cut at 70 characters.
 
-| Key | tmux 3.8 | lif 0.4.0 | |
+| Key | tmux 3.8 | lif 0.5.0 | |
 |---|---|---|---|
 | `Tab` | `new-pane -E -X 0 -Y 0 -x "75%" -y "30%" \; move-pane -P bottom-cent...` |  | missing in lif |
 | `Space` | `next-layout` | `next-layout` | same |
@@ -189,7 +188,7 @@ commands are cut at 70 characters.
 | `>` | `display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -x P -y...` | `display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -x P -y P...` | different |
 | `?` | `list-keys -N` | `list-keys` | different |
 | `@` | `if-shell -F "#{pane_floating_flag}" { join-pane } { break-pane -W }` |  | missing in lif |
-| `C` | `customize-mode -Z` |  | missing in lif |
+| `C` | `customize-mode -Z` | `customize-mode -Z` | same |
 | `D` | `choose-client -Z` | `choose-client -Z` | same |
 | `E` | `select-layout -E` | `select-layout -E` | same |
 | `L` | `switch-client -l` | `switch-client -l` | same |
@@ -260,7 +259,7 @@ The copy-mode tables are compared in [copy-mode.md](copy-mode.md#differences-fro
 
 ## Options
 
-lif has 88 options: 85 with tmux's names, scopes and (except for colors that
+lif has 94 options: 91 with tmux's names, scopes and (except for colors that
 tmux 3.8 expresses with theme colors, `pane-border-format`, `focus-events`,
 and `escape-time` and `history-limit`) tmux 3.8's defaults, plus three of its
 own, `scrollback-bytes`, `mouse-drag-end` and `tmux-compat`. `set-option`, `set-window-option`, `show-options`
@@ -296,6 +295,8 @@ silences it).
 | `exit-empty` | server | on/off | `on` | `exit-empty` |
 | `focus-events` | server | on/off | `on` | `focus-events` |
 | `history-limit` | session | number (lines) | `4000` (tmux: `2000`) | `history-limit` |
+| `lock-after-time` | session | number (seconds; 0: never) | `0` | `lock-after-time` |
+| `lock-command` | session | string | `lock -np` | `lock-command` |
 | `main-pane-height` | window | cells or N% | `24` | `main-pane-height` |
 | `main-pane-width` | window | cells or N% | `80` | `main-pane-width` |
 | `menu-border-lines` | window | one of: single, rounded, double, heavy, simple, padded, none | `single` | `menu-border-lines` |
@@ -317,6 +318,9 @@ silences it).
 | `pane-border-format` | window | string | `#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"` (tmux adds mouse buttons) | `pane-border-format` |
 | `pane-border-status` | window | one of: off, top, bottom | `off` | `pane-border-status` |
 | `pane-border-style` | window | string | `default` | `[theme] border` |
+| `pane-scrollbars` | window | one of: off, modal, on | `off` | `pane-scrollbars` |
+| `pane-scrollbars-position` | window | one of: right, left | `right` | `pane-scrollbars-position` |
+| `pane-scrollbars-style` | window | string (a style plus `width=N`, `pad=N`) | `bg=brightblack,fg=white,width=1,pad=0` (tmux: theme colors) | `pane-scrollbars-style` |
 | `popup-border-lines` | window | one of: single, rounded, double, heavy, simple, padded, none | `single` | `popup-border-lines` |
 | `popup-border-style` | window | string | `default` | `[theme] popup-border` |
 | `popup-style` | window | string | `default` | `[theme] popup` |
@@ -344,6 +348,7 @@ silences it).
 | `synchronize-panes` | window | on/off | `off` | `synchronize-panes` |
 | `tiled-layout-max-columns` | window | number | `0` | `tiled-layout-max-columns` |
 | `tmux-compat` (lif only) | server | on/off | `off` | `tmux-compat` |
+| `update-environment` | session | list of names (`set -a` adds one; shown as `update-environment[0] DISPLAY`...) | tmux's: `DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY` | `update-environment` (a TOML array) |
 | `visual-activity` | session | one of: off, on, both | `off` | `visual-activity` |
 | `visual-bell` | session | one of: off, on, both | `off` | `visual-bell` |
 | `visual-silence` | session | one of: off, on, both | `off` | `visual-silence` |
@@ -363,9 +368,9 @@ silences it).
 
 Some tmux options people often set and lif does not have: `default-terminal`,
 `terminal-overrides`, `terminal-features`,
-`extended-keys`, `update-environment`,
+`extended-keys`,
 `status-keys`, `allow-rename`, `message-command-style`,
-`pane-border-lines`, `pane-border-indicators`, `lock-*`. The behavior
+`pane-border-lines`, `pane-border-indicators`. The behavior
 several of these exist to turn on (true color, extended keys, OSC 52) is on
 or automatic in lif.
 
@@ -400,13 +405,77 @@ are not written to it raw. `all` is the same as `on`. `pane-border-status`
 takes one row from the window, as in tmux, and draws each pane's
 `pane-border-format` on its border, two cells in from each end.
 
+## Floating panes
+
+`new-pane` makes a floating pane: drawn over the tiled panes in a box,
+in the window's pane list after them (`#{pane_floating_flag}` is 1), and
+not part of the layout. As in tmux, `-x`/`-y` give its size and
+`-X`/`-Y` its position, border included (cells or `N%` of the window);
+without them it is half the window wide and a quarter high, cascaded from
+the top left. `move-pane` moves one (`-P` with tmux's positions, `-X`,
+`-Y`, `-D`/`-U`/`-L`/`-R` by lines or columns, `-z` its depth, 0 in
+front), `resize-pane -x`/`-y` and `-L`/`-R`/`-U`/`-D` resize one,
+`split-window` of one makes another below it, `swap-pane` trades places
+with a tiled pane of the same window. A click selects the pane on top.
+Not in lif: modal panes (`-O -K -C -D`), floating panes over a zoomed
+pane (`-A`; they are hidden while a pane is zoomed), dragging them
+(`-M`), the `move` key table and the floating pane keys of the default
+bindings. Differences: the last tiled pane of a window closes the window
+with its floating panes (tmux keeps the window); `rotate-window` turns
+the tiled panes only; a floating pane cannot be zoomed or swapped with a
+pane of another window.
+
+`pane-scrollbars` (`on`, or `modal`: only in copy mode),
+`pane-scrollbars-position` and `pane-scrollbars-style` (`width=N`,
+`pad=N`) work as in tmux: `on` takes the columns from the pane, `modal`
+draws over it. The slider shows where the screen (or copy mode's view) is
+in the history. Not in lif: `pane-scrollbars-timeout` and the mouse on
+the scrollbar.
+
+## Control mode
+
+`lif -C` (and `-CC`, wrapped in tmux's DCS for terminals such as iTerm2)
+speaks tmux's control-mode protocol: each line on standard input is a
+command list, answered with `%begin` ... `%end` (`%error` on failure;
+commands that wait, such as `run-shell`, are answered when they finish,
+in order); the panes of the client's session send `%output %N data`
+(bytes below space and `\` in octal); and `%session-changed`,
+`%sessions-changed`, `%session-renamed`, `%session-window-changed`,
+`%window-add`, `%window-close`, `%unlinked-window-add`,
+`%unlinked-window-close`, `%window-renamed`, `%window-pane-changed` and
+`%layout-change` tell what changed, after the answer of the command that
+changed it. An empty line or the end of input detaches (`%exit`). The
+client's size counts for its windows only after `refresh-client -C WxH`,
+and it has no status line. Differences: no `refresh-client -A`, `-B`,
+`-f` (subscriptions, `pause-after`, `no-output`), no
+`%extended-output`, `%pane-mode-changed`, `%client-*` or
+`%subscription-changed`. A client that does not keep up gets
+`%pause %N` for a pane (at most 1 MiB waits for it) and `%continue %N`
+once it has caught up; tmux does that only with `pause-after` and
+otherwise buffers without a bound.
+
+## Linked windows and session groups
+
+As in tmux, a window can be in several sessions at once: `link-window`
+puts it at an index of another session (or a second index of the same
+one), `new-session -t target` makes a session that shares all of
+`target`'s windows (a session group). It is one window either way: its
+panes are shown wherever it is linked, `kill-window` removes it from every
+session and `unlink-window` from one (its last place only with `-k`).
+The members of a group share their window list (a window made, moved or
+killed in one is in all of them) and keep their own current window,
+options and clients. The window takes the size the clients of all the
+sessions it is in ask for (`window-size`). A group is named after the
+session it was made from and keeps that name; `#{session_group}`,
+`#{session_group_list}` and `#{window_linked_sessions_list}` list them.
+
 ## Format variables
 
 Formats are expanded wherever tmux expands them (`-F`, `display-message`,
 `new-window -n`, `split-window -c`, the status line, `command-prompt -I`).
 Supported syntax: `#{name}`, `#S #I #W #P #T #D #F #H #h ##`,
 `#{?cond,a,b}` (with several conditions), `#{==:a,b}` `!=` `<` `>` `<=`
-`>=` `||` `&&` `#{!:x}`, `#{m:glob,s}`, `#{e|op|:a,b}` (`+ - * / % ==`...),
+`>=` `||` `&&` `#{!:x}`, `#{m:glob,s}` (`m/i:` ignores case, `m/r:` takes a regular expression, `m/ri:` both), `#{e|op|:a,b}` (`+ - * / % ==`...),
 and the modifiers `=N`, `=-N`, `=/N/marker`, `pN`, `t:`, `b:`, `d:`,
 `l:`, `E:`, `T:`, `q:`, `n:`, `w:`, `s/from/to/:` (literal, not a regex).
 `#[style]` is passed to the status line. `#(command)` expands to the last
@@ -418,9 +487,9 @@ a variable is looked up as an option (`#{status-left}`, `#{@myopt}`).
 | Group | Variables |
 |---|---|
 | Server | `host`, `host_short`, `pid`, `socket_path`, `version` |
-| Session | `session_name`, `session_id`, `session_windows`, `session_attached`, `session_many_attached`, `session_created`, `session_activity` (same value as `session_created`), `session_path`, `session_alerts`, `session_format`; `session_grouped` is always 0 and `session_group` empty |
-| Window | `window_index`, `window_name`, `window_id`, `window_flags`, `window_raw_flags`, `window_active`, `window_last_flag`, `window_bell_flag`, `window_activity_flag`, `window_zoomed_flag`, `window_panes`, `window_width`, `window_height`, `window_layout`, `window_visible_layout`, `window_start_flag`, `window_end_flag`, `window_marked_flag`, `window_format`; `window_silence_flag`, `window_bigger`, `window_linked` are always 0 and `window_offset_x/y` 0 |
-| Pane | `pane_index`, `pane_id`, `pane_title` (the host name until a program sets a title), `pane_current_command`, `pane_current_path`, `pane_width`, `pane_height`, `pane_active`, `pane_last`, `pane_pid`, `pane_dead`, `pane_dead_status`, `pane_in_mode`, `pane_start_command`, `pane_start_path`, `pane_left`, `pane_top`, `pane_right`, `pane_bottom`, `pane_at_left`, `pane_at_top`, `pane_at_right`, `pane_at_bottom`, `pane_synchronized`, `pane_input_off`, `pane_pipe`, `pane_marked`, `pane_marked_set`, `pane_format`; `pane_mode` is `copy-mode` in any mode; `mouse_any_flag`, `alternate_on` |
+| Session | `session_name`, `session_id`, `session_windows`, `session_attached`, `session_many_attached`, `session_created`, `session_activity` (same value as `session_created`), `session_path`, `session_alerts`, `session_format`, `session_grouped`, `session_group`, `session_group_size`, `session_group_list`, `session_group_attached`, `session_group_many_attached` |
+| Window | `window_index`, `window_name`, `window_id`, `window_flags`, `window_raw_flags`, `window_active`, `window_last_flag`, `window_bell_flag`, `window_activity_flag`, `window_zoomed_flag`, `window_panes`, `window_width`, `window_height`, `window_layout`, `window_visible_layout`, `window_start_flag`, `window_end_flag`, `window_marked_flag`, `window_format`; `window_silence_flag`, `window_linked`, `window_linked_sessions`, `window_linked_sessions_list`; `window_bigger` is always 0 and `window_offset_x/y` 0 |
+| Pane | `pane_index`, `pane_id`, `pane_title` (the host name until a program sets a title), `pane_current_command`, `pane_current_path`, `pane_width`, `pane_height`, `pane_active`, `pane_last`, `pane_pid`, `pane_dead`, `pane_dead_status`, `pane_in_mode`, `pane_start_command`, `pane_start_path`, `pane_left`, `pane_top`, `pane_right`, `pane_bottom`, `pane_at_left`, `pane_at_top`, `pane_at_right`, `pane_at_bottom`, `pane_synchronized`, `pane_input_off`, `pane_pipe`, `pane_marked`, `pane_marked_set`, `pane_floating_flag`, `pane_format`; `pane_mode` is `copy-mode` in any mode; `mouse_any_flag`, `alternate_on` |
 | Mouse (in a mouse key's commands) | `mouse_x`, `mouse_y` (in the pane under the mouse), `mouse_word`, `mouse_line` |
 | History | `history_size` (lines), `history_bytes` (lif only: bytes used), `history_limit` |
 | Client | `client_name`, `client_tty` (same as the name, e.g. `client-58982`), `client_termname`, `client_width`, `client_height`, `client_pid`, `client_session`, `client_last_session`, `client_prefix`, `client_key_table`, `client_flags`, `client_cwd` |
@@ -497,10 +566,13 @@ What differs:
   client that creates the session. `set-environment` adds to that or, with
   `-r`, removes from it, for panes and shell commands started afterwards:
   the global set (`-g`), then the session's, then `-e` of `new-session`,
-  `new-window`, `split-window` or `respawn-pane`. `show-environment`
-  lists only what was set this way (tmux lists everything, with the
-  `update-environment` variables). Hidden variables (`-h`) are listed
-  with `show-environment -h` and not passed on.
+  `new-window`, `split-window` or `respawn-pane`. `update-environment`
+  copies the variables it names from the client into the session's set
+  when the client creates, attaches or switches to the session (unless
+  `-E`); one the client lacks is set to be removed (`-NAME`), as in tmux.
+  `show-environment` lists only what was set this way (tmux lists
+  everything). Hidden variables (`-h`) are listed with
+  `show-environment -h` and not passed on.
 - **`synchronize-panes`.** Typed keys, pastes and `send-keys` go to every
   pane of the window that has the option on and is not in a mode; panes
   hidden by a zoomed pane are left alone. Mouse events go to one pane.

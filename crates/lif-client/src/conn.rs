@@ -15,6 +15,9 @@ use crate::sys;
 /// enforces the same list).
 pub use lif_proto::ENV_ALLOW_LIST;
 
+/// Most environment variables a client sends in `Hello`.
+pub const HELLO_ENV_MAX: usize = 512;
+
 /// A server that accepts but never answers must not hang the client forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -85,7 +88,9 @@ impl Connection {
 }
 
 /// `Hello` describing this process: terminal size from stdout, `$TERM`,
-/// cwd, and the variables in [`ENV_ALLOW_LIST`].
+/// cwd, and its environment (at most [`HELLO_ENV_MAX`] variables, none
+/// longer than 4096 bytes). The server keeps only the variables of
+/// [`ENV_ALLOW_LIST`] and those its `update-environment` option names.
 pub fn hello_from_env() -> Hello {
     let (size, pixels) = match sys::winsize(1) {
         Ok(ws) => (Size::new(ws.ws_col, ws.ws_row), PixelSize { width: ws.ws_xpixel, height: ws.ws_ypixel }),
@@ -96,13 +101,17 @@ pub fn hello_from_env() -> Hello {
     Hello {
         protocol: PROTOCOL_VERSION,
         // On a terminal the server may take it over while attached.
-        caps: Caps(if is_tty { Caps::TTY.0 | Caps::SUSPEND.0 } else { 0 } | Caps::OUTPUT_STREAM.0),
+        caps: Caps(if is_tty { Caps::TTY.0 | Caps::SUSPEND.0 | Caps::LOCK.0 } else { 0 } | Caps::OUTPUT_STREAM.0),
         pid: std::process::id(),
         size,
         pixels,
         term: var("TERM").unwrap_or_default(),
         cwd: std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-        env: ENV_ALLOW_LIST.iter().filter_map(|k| Some((k.to_string(), var(k)?))).collect(),
+        env: std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, v)| !k.is_empty() && k.len() + v.len() <= 4096)
+            .take(HELLO_ENV_MAX)
+            .collect(),
         is_tty,
     }
 }

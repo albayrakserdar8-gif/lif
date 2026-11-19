@@ -590,7 +590,7 @@ class ZellijAdapter(Adapter):
 
 
 class LifAdapter(Adapter):
-    """lif (target/release/lif). Skipped while the release binary does not
+    """lif (target-bench/release/lif, which run.sh builds). Skipped while the release binary does not
     exist. lif 0.1.0 does not read a config file yet (lif-config is not linked
     into the binary), so options are set with set-option after the server
     starts; they only apply to panes created afterwards."""
@@ -601,7 +601,8 @@ class LifAdapter(Adapter):
 
     @classmethod
     def binary_name(cls):
-        return os.path.join(ROOT, "target", "release", "lif")
+        # The build run.sh makes (target-bench), never a stale target/release.
+        return os.path.join(TARGET, "release", "lif")
 
     @classmethod
     def available(cls):

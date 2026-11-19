@@ -30,6 +30,9 @@ pub struct ClientInfo {
     pub pid: u32,
     /// stdin and stdout are terminals; only such clients can attach.
     pub terminal: bool,
+    /// A control-mode client: attached without a terminal, so no status
+    /// line takes rows from the size it asks for.
+    pub control: bool,
 }
 
 /// A session.
@@ -49,6 +52,9 @@ pub struct Session {
     pub(crate) size: Size,
     pub(crate) hooks: crate::hooks::HookSet,
     pub(crate) environ: crate::environ::Environ,
+    /// The session group it is in (`new-session -t`), by name: the name
+    /// the first session of the group had.
+    pub(crate) group: Option<String>,
 }
 
 impl Session {
@@ -86,8 +92,14 @@ impl Session {
 #[derive(Clone, Debug)]
 pub struct Window {
     pub(crate) id: WindowId,
-    pub(crate) session: SessionId,
-    pub(crate) index: u32,
+    /// Where it is linked, as (session, index): tmux's winlinks. A window
+    /// can be in several sessions (`link-window`, session groups), even at
+    /// two indexes of one. The first link is the one `session()` and
+    /// `index()` name where no session is given.
+    pub(crate) links: Vec<(SessionId, u32)>,
+    /// The session it was made for: what `session()` says until it is
+    /// linked.
+    pub(crate) home: SessionId,
     pub(crate) name: String,
     pub(crate) layout: Layout,
     /// Panes in window order (pane index order).
@@ -103,6 +115,10 @@ pub struct Window {
     pub(crate) old_layout: Option<Layout>,
     pub(crate) size: Size,
     pub(crate) hooks: crate::hooks::HookSet,
+    /// Floating panes (`new-pane`), back to front, each with its rectangle
+    /// in the window, border included (the pane is one cell inside). They
+    /// are in `panes` too, after the tiled ones, but not in the layout.
+    pub(crate) floating: Vec<(PaneId, Rect)>,
 }
 
 impl Window {
@@ -110,13 +126,74 @@ impl Window {
     pub fn id(&self) -> WindowId {
         self.id
     }
-    /// The session the window belongs to.
+    /// The session of its first link (see [`Window::links`]).
     pub fn session(&self) -> SessionId {
-        self.session
+        self.links.first().map_or(self.home, |l| l.0)
     }
-    /// Its index in the session.
+    /// Its index there.
     pub fn index(&self) -> u32 {
-        self.index
+        self.links.first().map_or(0, |l| l.1)
+    }
+    /// The floating panes, back to front, with their rectangles (border
+    /// included).
+    pub fn floating(&self) -> &[(PaneId, Rect)] {
+        &self.floating
+    }
+    /// Whether `p` is one of its floating panes.
+    pub fn is_floating(&self, p: PaneId) -> bool {
+        self.floating.iter().any(|f| f.0 == p)
+    }
+    /// Take `p` out of the layout, or out of the floating panes.
+    pub(crate) fn take_out(&mut self, p: PaneId) {
+        if self.is_floating(p) {
+            self.floating.retain(|f| f.0 != p);
+        } else {
+            self.layout.remove(p);
+        }
+    }
+    /// The tiled panes (those in the layout).
+    pub(crate) fn tiled_count(&self) -> usize {
+        self.panes.len() - self.floating.len()
+    }
+    /// The tiled panes, in window order.
+    pub(crate) fn tiled_panes(&self) -> Vec<PaneId> {
+        self.panes.iter().copied().filter(|p| !self.is_floating(*p)).collect()
+    }
+    /// Every session and index it is linked at, oldest link first.
+    pub fn links(&self) -> &[(SessionId, u32)] {
+        &self.links
+    }
+    /// Its (first) index in `s`, if it is linked there.
+    pub fn index_in(&self, s: SessionId) -> Option<u32> {
+        self.links.iter().find(|l| l.0 == s).map(|l| l.1)
+    }
+    /// The sessions it is linked into, each once.
+    pub(crate) fn sessions(&self) -> Vec<SessionId> {
+        let mut v: Vec<SessionId> = Vec::with_capacity(self.links.len());
+        for (s, _) in &self.links {
+            if !v.contains(s) {
+                v.push(*s);
+            }
+        }
+        if v.is_empty() {
+            v.push(self.home);
+        }
+        v
+    }
+    pub(crate) fn link(&mut self, s: SessionId, idx: u32) {
+        if !self.links.contains(&(s, idx)) {
+            self.links.push((s, idx));
+        }
+    }
+    pub(crate) fn unlink(&mut self, s: SessionId, idx: u32) {
+        self.links.retain(|l| *l != (s, idx));
+    }
+    pub(crate) fn relink(&mut self, s: SessionId, old: u32, new: u32) {
+        for l in &mut self.links {
+            if *l == (s, old) {
+                l.1 = new;
+            }
+        }
     }
     /// The name.
     pub fn name(&self) -> &str {
@@ -318,6 +395,30 @@ pub struct ClientView {
     pub window_size: Size,
     /// Where each pane's `pane-border-format` line goes (`pane-border-status`).
     pub border_status: BorderStatus,
+    /// The floating panes shown (after the tiled ones in `panes`), back to
+    /// front, with the rectangle of their border, in client coordinates.
+    pub floating: Vec<(PaneId, Rect)>,
+    /// Pane scrollbars (`pane-scrollbars`): the pane, the scrollbar's
+    /// columns in client coordinates, its style (`bg` the track, `fg` the
+    /// slider) and whether it is drawn over the pane (`modal`, in copy
+    /// mode) rather than beside it.
+    pub scrollbars: Vec<(PaneId, Rect, lif_types::Style, bool)>,
+}
+
+/// A pane's scrollbar: its width, the padding between it and the pane,
+/// whether it is on the left, and its style.
+pub(crate) struct Scrollbar {
+    pub width: u16,
+    pub pad: u16,
+    pub left: bool,
+    pub style: lif_types::Style,
+    /// `modal`: over the pane's own columns, which keep their width.
+    pub over: bool,
+}
+
+/// A floating pane's area inside its border.
+pub(crate) fn floating_inner(r: Rect) -> Rect {
+    Rect::new(r.x + 1, r.y + 1, r.cols.saturating_sub(2).max(1), r.rows.saturating_sub(2).max(1))
 }
 
 /// `pane-border-status`: a line with each pane's `pane-border-format` on
@@ -367,6 +468,14 @@ pub struct Model {
     pub(crate) environ: crate::environ::Environ,
     /// What the command being run last resolved a target to.
     pub(crate) last_found: std::cell::Cell<Option<crate::target::Found>>,
+    /// While a target is resolved: the session a window linked into
+    /// several is seen from (the client's), tmux's best winlink.
+    pub(crate) target_pref: std::cell::Cell<Option<SessionId>>,
+    /// Grouped sessions whose window list changed: the rest of their group
+    /// is brought in line after the command (`Model::flush_group_sync`).
+    pub(crate) group_dirty: Vec<SessionId>,
+    /// Events for control-mode clients; `None` while there is none.
+    pub(crate) control_events: Option<Vec<crate::hooks::ControlEvent>>,
     /// The time the last command list ran at (Unix seconds): the model
     /// reads no clock, and paste buffers want a creation time.
     pub(crate) clock: i64,
@@ -428,6 +537,9 @@ impl Model {
             hooks: Default::default(),
             environ: Default::default(),
             last_found: Default::default(),
+            target_pref: Default::default(),
+            group_dirty: Vec::new(),
+            control_events: None,
             clock: 0,
             mouse: None,
             marked_pane: None,
@@ -648,20 +760,27 @@ impl Model {
         if policy == 2 {
             return None;
         }
-        // aggressive-resize: only clients showing the window count, and a
-        // session's clients all show its current window.
-        if let Some(w) = wid
-            && self.sessions.get(&sid).is_some_and(|s| s.current != w)
-            && self.wopt(wid, "aggressive-resize").as_flag()
-        {
+        // The sessions whose clients count: every session a window is linked
+        // into (with aggressive-resize, only those it is current in; a
+        // session's clients all show its current window).
+        let aggressive = wid.is_some() && self.wopt(wid, "aggressive-resize").as_flag();
+        let sessions: Vec<SessionId> = match wid.and_then(|w| self.windows.get(&w)) {
+            Some(w) => w.sessions(),
+            None => vec![sid],
+        };
+        let counts = |s: SessionId| sessions.contains(&s) && !(aggressive && self.sessions.get(&s).is_some_and(|x| Some(x.current) != wid));
+        if !sessions.iter().any(|s| counts(*s)) {
             return None;
         }
-        let sl = self.status_lines(sid) + (self.border_status(wid) != BorderStatus::Off) as u16;
+        let border = (self.border_status(wid) != BorderStatus::Off) as u16;
         let sizes: Vec<(u64, Size)> = self
             .clients
             .values()
-            .filter(|c| c.session == Some(sid) && !c.info.size.is_empty())
-            .map(|c| (c.activity, Size::new(c.info.size.cols.max(1), c.info.size.rows.saturating_sub(sl).max(1))))
+            .filter(|c| c.session.is_some_and(counts) && !c.info.size.is_empty())
+            .map(|c| {
+                let sl = if c.info.control { border } else { c.session.map_or(0, |s| self.status_lines(s)) + border };
+                (c.activity, Size::new(c.info.size.cols.max(1), c.info.size.rows.saturating_sub(sl).max(1)))
+            })
             .collect();
         if sizes.is_empty() {
             return None;
@@ -698,6 +817,7 @@ impl Model {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         w.size = size;
         w.layout.resize(size);
+        self.fit_floating(wid);
         self.sync_window(wid, host);
     }
 
@@ -713,7 +833,13 @@ impl Model {
                 }
             }
         }
-        for (p, r) in g.panes {
+        let floating: Vec<(PaneId, Rect)> = w.floating.iter().map(|f| (f.0, floating_inner(f.1))).collect();
+        for (p, r) in g.panes.into_iter().chain(floating) {
+            // A scrollbar takes its columns from the pane.
+            let r = match self.scrollbar(p, host.pane_info(p).in_mode) {
+                Some(sb) => Self::split_scrollbar(r, &sb).0,
+                None => r,
+            };
             if let Some(pane) = self.panes.get_mut(&p)
                 && pane.size != r.size()
             {
@@ -765,14 +891,14 @@ impl Model {
         let old = w.active;
         w.last_panes.insert(0, old);
         w.active = pid;
-        let sid = w.session;
+        let sid = w.session();
         if let Some(p) = self.panes.get_mut(&pid) {
             p.active_point = point;
         }
         self.update_window_name(wid, host);
         self.notify("window-pane-changed", None, Some(sid), Some(wid), Some(pid));
         host.redraw(Redraw::Window(wid));
-        host.redraw(Redraw::Status(sid));
+        self.redraw_status_of(wid, host);
         true
     }
 
@@ -783,7 +909,9 @@ impl Model {
     pub(crate) fn remove_pane(&mut self, pid: PaneId, kill: bool, host: &mut dyn Host) {
         let Some(pane) = self.panes.get(&pid) else { return };
         let wid = pane.window;
-        if self.windows[&wid].panes.len() == 1 {
+        let w = &self.windows[&wid];
+        // The last tiled pane takes the window (and its floating panes) with it.
+        if !w.is_floating(pid) && w.tiled_count() == 1 {
             self.remove_window(wid, if kill { None } else { Some(pid) }, host);
             return;
         }
@@ -792,8 +920,10 @@ impl Model {
         }
         self.panes.remove(&pid);
         let w = self.windows.get_mut(&wid).expect("window of pane");
-        w.layout.unzoom();
-        w.layout.remove(pid);
+        if !w.is_floating(pid) {
+            w.layout.unzoom();
+        }
+        w.take_out(pid);
         let pos = w.panes.iter().position(|p| *p == pid).expect("pane in window");
         w.last_panes.retain(|p| *p != pid);
         if w.active == pid {
@@ -813,7 +943,7 @@ impl Model {
         }
         self.sync_window(wid, host);
         self.update_window_name(wid, host);
-        host.redraw(Redraw::Status(self.windows[&wid].session));
+        self.redraw_status_of(wid, host);
     }
 
     /// Remove a window and all its panes (killing their processes except
@@ -834,19 +964,34 @@ impl Model {
             }
             self.panes.remove(p);
         }
-        let sid = w.session;
+        // Gone from every session it was linked into.
+        for (sid, idx) in w.links.iter().copied() {
+            self.drop_link(sid, idx, wid, renumber, host);
+        }
+    }
+
+    /// Session `sid` no longer has `wid` at `idx` (the window itself is
+    /// unlinked or gone already): pick another current window, renumber,
+    /// or destroy the session when it has none left.
+    pub(crate) fn drop_link(&mut self, sid: SessionId, idx: u32, wid: WindowId, renumber: bool, host: &mut dyn Host) {
         let Some(s) = self.sessions.get_mut(&sid) else { return };
-        s.windows.remove(&w.index);
-        s.last.retain(|x| *x != wid);
+        if s.windows.get(&idx) == Some(&wid) {
+            s.windows.remove(&idx);
+        }
+        // Still there at another index: it stays current and last.
+        let elsewhere = s.windows.values().any(|x| *x == wid);
+        if !elsewhere {
+            s.last.retain(|x| *x != wid);
+        }
         if s.windows.is_empty() {
             self.destroy_session(sid, host);
             return;
         }
-        if s.current == wid {
+        if s.current == wid && !elsewhere {
             // tmux's session_detach: the last window, else the previous one
             // (wrapping to the end).
             let next = s.last.first().copied().unwrap_or_else(|| {
-                s.windows.range(..w.index).next_back().or_else(|| s.windows.iter().next_back()).map(|(_, w)| *w).expect("not empty")
+                s.windows.range(..idx).next_back().or_else(|| s.windows.iter().next_back()).map(|(_, w)| *w).expect("not empty")
             });
             s.last.retain(|x| *x != next);
             s.current = next;
@@ -859,6 +1004,8 @@ impl Model {
         if renumber && self.sopt(Some(sid), "renumber-windows").as_flag() {
             self.renumber(sid);
         }
+        self.sync_group_quiet(sid);
+        self.flush_group_sync(host);
         host.redraw(Redraw::Session(sid));
     }
 
@@ -873,13 +1020,15 @@ impl Model {
         // there are at most MAX_WINDOW_INDEX + 1 of them and the zip below
         // drops none.
         let start = base.min(MAX_WINDOW_INDEX.saturating_sub(n.saturating_sub(1)));
+        let old: Vec<u32> = s.windows.keys().copied().collect();
         s.windows.clear();
-        for (wid, idx) in wins.into_iter().zip(start..=MAX_WINDOW_INDEX) {
+        for ((wid, idx), was) in wins.into_iter().zip(start..=MAX_WINDOW_INDEX).zip(old) {
             s.windows.insert(idx, wid);
             if let Some(w) = self.windows.get_mut(&wid) {
-                w.index = idx;
+                w.relink(sid, was, idx);
             }
         }
+        self.sync_group_quiet(sid);
     }
 
     /// Destroy a session: move or detach its clients (`detach-on-destroy`),
@@ -889,6 +1038,13 @@ impl Model {
         self.notify("session-closed", None, Some(sid), None, None);
         let Some(s) = self.sessions.remove(&sid) else { return };
         for wid in s.windows.values() {
+            // A window linked into another session lives on there.
+            if let Some(w) = self.windows.get_mut(wid) {
+                w.links.retain(|l| l.0 != sid);
+                if !w.links.is_empty() {
+                    continue;
+                }
+            }
             if let Some(w) = self.windows.remove(wid) {
                 for p in &w.panes {
                     host.kill_pane(*p);
@@ -1104,17 +1260,31 @@ impl Model {
         if !self.wopt(Some(wid), "monitor-bell").as_flag() {
             return;
         }
-        let sid = self.windows[&wid].session;
-        let current = self.sessions[&sid].current == wid;
-        if !current {
+        // In every session it is linked into; the flag when it is the
+        // current window of none of them.
+        let sessions = self.windows[&wid].sessions();
+        let current_somewhere = sessions.iter().any(|s| self.sessions.get(s).is_some_and(|s| s.current == wid));
+        if !current_somewhere {
             let w = self.windows.get_mut(&wid).expect("window");
             if !w.bell {
                 w.bell = true;
-                self.notify("alert-bell", None, Some(sid), Some(wid), Some(pane));
-                host.redraw(Redraw::Status(sid));
+                self.notify("alert-bell", None, Some(sessions[0]), Some(wid), Some(pane));
+                self.redraw_status_of(wid, host);
             }
         }
-        self.alert(sid, wid, current, "bell-action", "visual-bell", "Bell", host);
+        for sid in sessions {
+            let current = self.sessions.get(&sid).is_some_and(|s| s.current == wid);
+            self.alert(sid, wid, current, "bell-action", "visual-bell", "Bell", host);
+        }
+    }
+
+    /// Redraw the status lines of every session `wid` is linked into.
+    pub(crate) fn redraw_status_of(&self, wid: WindowId, host: &mut dyn Host) {
+        if let Some(w) = self.windows.get(&wid) {
+            for s in w.sessions() {
+                host.redraw(Redraw::Status(s));
+            }
+        }
     }
 
     /// Tell a session's clients about an alert in one of its windows, as
@@ -1134,7 +1304,8 @@ impl Model {
         }
         let visual = self.sopt(Some(sid), visual).as_num();
         let ms = self.sopt(Some(sid), "display-time").as_num() as u64;
-        let text = if current { format!("{what} in current window") } else { format!("{what} in window {}", self.windows[&wid].index) };
+        let idx = self.windows[&wid].index_in(sid).unwrap_or_else(|| self.windows[&wid].index());
+        let text = if current { format!("{what} in current window") } else { format!("{what} in window {idx}") };
         for c in self.clients_of(sid) {
             if visual != 1 {
                 host.bell(c);
@@ -1163,15 +1334,17 @@ impl Model {
         if self.wopt(Some(wid), "monitor-silence").as_num() <= 0 {
             return;
         }
-        let sid = self.windows[&wid].session;
-        let current = self.sessions[&sid].current == wid;
+        let sessions = self.windows[&wid].sessions();
+        let current = sessions.iter().any(|s| self.sessions.get(s).is_some_and(|s| s.current == wid));
         if current || self.windows[&wid].silence {
             return;
         }
         self.windows.get_mut(&wid).expect("window").silence = true;
-        self.notify("alert-silence", None, Some(sid), Some(wid), Some(pane));
-        host.redraw(Redraw::Status(sid));
-        self.alert(sid, wid, current, "silence-action", "visual-silence", "Silence", host);
+        self.notify("alert-silence", None, Some(sessions[0]), Some(wid), Some(pane));
+        self.redraw_status_of(wid, host);
+        for sid in sessions {
+            self.alert(sid, wid, false, "silence-action", "visual-silence", "Silence", host);
+        }
     }
 
     /// Destroy the sessions nobody is attached to that have
@@ -1202,15 +1375,17 @@ impl Model {
         if !self.wopt(Some(wid), "monitor-activity").as_flag() {
             return;
         }
-        let sid = self.windows[&wid].session;
-        if self.sessions[&sid].current != wid {
+        let sessions = self.windows[&wid].sessions();
+        if !sessions.iter().any(|s| self.sessions.get(s).is_some_and(|s| s.current == wid)) {
             let w = self.windows.get_mut(&wid).expect("window");
             if !w.activity {
                 w.activity = true;
-                self.notify("alert-activity", None, Some(sid), Some(wid), Some(pane));
-                host.redraw(Redraw::Status(sid));
+                self.notify("alert-activity", None, Some(sessions[0]), Some(wid), Some(pane));
+                self.redraw_status_of(wid, host);
                 // Once per flag, as in tmux: not for every line of output.
-                self.alert(sid, wid, false, "activity-action", "visual-activity", "Activity", host);
+                for sid in sessions {
+                    self.alert(sid, wid, false, "activity-action", "visual-activity", "Activity", host);
+                }
             }
         }
     }
@@ -1221,8 +1396,11 @@ impl Model {
         let Some(p) = self.panes.get(&pane) else { return };
         let wid = p.window;
         self.update_window_name(wid, host);
-        let sid = self.windows[&wid].session;
-        host.redraw(Redraw::Status(sid));
+        self.redraw_status_of(wid, host);
+        // A mode came or went: a modal scrollbar with it.
+        if self.popt(pane, "pane-scrollbars").as_num() == 1 {
+            self.sync_window(wid, host);
+        }
     }
 
     pub(crate) fn update_window_name(&mut self, wid: WindowId, host: &dyn Host) {
@@ -1232,7 +1410,7 @@ impl Model {
         let Some(w) = self.windows.get(&wid) else { return };
         let fmt = self.wopt(Some(wid), "automatic-rename-format").as_str().to_string();
         let name = {
-            let ctx = self.fctx(host, Some(w.session), Some(wid), Some(w.active), None, WallClock::default());
+            let ctx = self.fctx(host, Some(w.session()), Some(wid), Some(w.active), None, WallClock::default());
             format::expand(&fmt, &ctx)
         };
         if name.is_empty() {
@@ -1246,7 +1424,61 @@ impl Model {
 
     // ----- rendering helpers -------------------------------------------------
 
-    /// What `client` shows, or `None` if it is not attached.
+    /// The scrollbar `pane` shows now (`in_mode`: it is in copy mode, for
+    /// `modal`), if any.
+    pub(crate) fn scrollbar(&self, pane: PaneId, in_mode: bool) -> Option<Scrollbar> {
+        match self.popt(pane, "pane-scrollbars").as_num() {
+            2 => {}
+            1 if in_mode => {}
+            _ => return None,
+        }
+        let spec = self.popt(pane, "pane-scrollbars-style").as_str().to_string();
+        let mut width = 1u16;
+        let mut pad = 0u16;
+        let mut rest = Vec::new();
+        for part in spec.split(',') {
+            if let Some(v) = part.strip_prefix("width=") {
+                width = v.parse::<u16>().unwrap_or(1).clamp(1, 32);
+            } else if let Some(v) = part.strip_prefix("pad=") {
+                pad = v.parse::<u16>().unwrap_or(0).min(32);
+            } else {
+                rest.push(part);
+            }
+        }
+        let style = status::parse_style(&rest.join(","));
+        let over = self.popt(pane, "pane-scrollbars").as_num() == 1;
+        Some(Scrollbar { width, pad, left: self.popt(pane, "pane-scrollbars-position").as_num() == 1, style, over })
+    }
+
+    /// Split a pane's area into its content and its scrollbar's columns.
+    pub(crate) fn split_scrollbar(r: Rect, sb: &Scrollbar) -> (Rect, Rect) {
+        if sb.over {
+            let w = sb.width.min(r.cols);
+            return (r, Rect::new(if sb.left { r.x } else { r.x + r.cols - w }, r.y, w, r.rows));
+        }
+        let take = (sb.width + sb.pad).min(r.cols.saturating_sub(1));
+        let w = sb.width.min(take);
+        let content = Rect::new(if sb.left { r.x + take } else { r.x }, r.y, r.cols - take, r.rows);
+        let bar = Rect::new(if sb.left { r.x } else { r.x + r.cols - w }, r.y, w, r.rows);
+        (content, bar)
+    }
+
+    /// [`Model::client_view`] knowing which panes are in copy mode (for
+    /// `pane-scrollbars modal`).
+    pub fn client_view_with(&self, client: ClientId, host: &dyn Host) -> Option<ClientView> {
+        let mut v = self.client_view(client)?;
+        for (p, r) in v.panes.iter_mut() {
+            if let Some(sb) = self.scrollbar(*p, host.pane_info(*p).in_mode) {
+                let (content, bar) = Self::split_scrollbar(*r, &sb);
+                *r = content;
+                v.scrollbars.push((*p, bar, sb.style, sb.over));
+            }
+        }
+        Some(v)
+    }
+
+    /// What `client` shows, or `None` if it is not attached (without
+    /// scrollbars: see [`Model::client_view_with`]).
     pub fn client_view(&self, client: ClientId) -> Option<ClientView> {
         let c = self.clients.get(&client)?;
         let sid = c.session?;
@@ -1259,16 +1491,22 @@ impl Model {
         let Geometry { panes, borders } = w.layout.geometry();
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.cols, r.rows);
         let status_row = status.then(|| if top { 0 } else { c.info.size.rows.saturating_sub(1) });
+        // Over the tiled panes, unless one of them is zoomed.
+        let floating: Vec<(PaneId, Rect)> = if w.layout.zoomed().is_some() { Vec::new() } else { w.floating.iter().map(|(p, r)| (*p, shift(*r))).collect() };
+        let mut panes: Vec<(PaneId, Rect)> = panes.into_iter().map(|(p, r)| (p, shift(r))).collect();
+        panes.extend(floating.iter().map(|(p, r)| (*p, floating_inner(*r))));
         Some(ClientView {
             session: sid,
             window: w.id,
             active_pane: w.active,
             zoomed: w.layout.zoomed().is_some(),
-            panes: panes.into_iter().map(|(p, r)| (p, shift(r))).collect(),
+            panes,
             borders: borders.into_iter().map(shift).collect(),
             status_row,
             window_size: w.size,
             border_status,
+            floating,
+            scrollbars: Vec::new(),
         })
     }
 
@@ -1288,7 +1526,7 @@ impl Model {
         let Some(w) = self.windows.get(&p.window) else { return StyledLine::new() };
         let active = w.active == pane;
         let base = status::parse_style(self.popt(pane, if active { "pane-active-border-style" } else { "pane-border-style" }).as_str());
-        let ctx = self.fctx(host, Some(w.session), Some(w.id), Some(pane), None, now);
+        let ctx = self.fctx(host, Some(w.session()), Some(w.id), Some(pane), None, now);
         let text = format::expand(self.popt(pane, "pane-border-format").as_str(), &ctx);
         status::label(&text, base, width as usize)
     }
@@ -1298,7 +1536,7 @@ impl Model {
         let p = self.panes.get(&pane)?;
         if name.starts_with('@') {
             return p.options.user(name).map(str::to_string).or_else(|| {
-                let sid = self.windows.get(&p.window).map(|w| w.session);
+                let sid = self.windows.get(&p.window).map(|w| w.session());
                 self.user_option(name, sid, Some(p.window)).map(str::to_string)
             });
         }
@@ -1412,12 +1650,12 @@ impl Model {
         let right = format::expand_time(self.sopt(sid, "status-right").as_str(), &ctx);
         let last = s.last.first().copied();
         let mut windows = Vec::with_capacity(s.windows.len());
-        for wid in s.windows.values() {
+        for (idx, wid) in s.windows.iter() {
             let Some(w) = self.windows.get(wid) else { continue };
             let wo = Some(*wid);
             let is_cur = *wid == cur;
             let fmt = if is_cur { "window-status-current-format" } else { "window-status-format" };
-            let wctx = self.fctx(host, sid, wo, Some(w.active), None, now);
+            let wctx = self.fctx(host, sid, wo, Some(w.active), None, now).at_index(*idx);
             let text = format::expand_time(self.wopt(wo, fmt).as_str(), &wctx);
             let mut style = base;
             status::apply_style(self.wopt(wo, "window-status-style").as_str(), &mut style, base);
@@ -1474,7 +1712,7 @@ impl Model {
         c: Option<ClientId>,
         now: WallClock,
     ) -> Fctx<'a> {
-        Fctx { m: self, host, s, w, p, c, now, buffer: None }
+        Fctx { m: self, host, s, w, p, c, now, buffer: None, idx: None }
     }
 
     // ----- spawning -----------------------------------------------------------
@@ -1524,6 +1762,16 @@ pub(crate) struct Fctx<'a> {
     pub c: Option<ClientId>,
     pub now: WallClock,
     pub buffer: Option<&'a PasteBuffer>,
+    /// Which index of the window in `s` this is about, when it is linked
+    /// there twice (`list-windows`, the status line); else its first.
+    pub idx: Option<u32>,
+}
+
+impl<'a> Fctx<'a> {
+    /// The same context, about the window's link at `idx`.
+    pub(crate) fn at_index(self, idx: u32) -> Fctx<'a> {
+        Fctx { idx: Some(idx), ..self }
+    }
 }
 
 fn flag(b: bool) -> Option<String> {
@@ -1603,8 +1851,16 @@ impl Vars for Fctx<'_> {
                 "many_attached" => flag(m.attached_count(s.id) > 1),
                 "created" | "activity" => Some(s.created.to_string()),
                 "path" => Some(s.cwd.clone()),
-                "grouped" => flag(false),
-                "group" => Some(String::new()),
+                "grouped" => flag(s.group.is_some()),
+                "group" => Some(s.group.clone().unwrap_or_default()),
+                "group_size" => Some(if s.group.is_some() { m.group_members(s.id).len() } else { 0 }.to_string()),
+                "group_list" => Some(if s.group.is_some() {
+                    m.group_members(s.id).iter().map(|g| m.sessions[g].name.as_str()).collect::<Vec<_>>().join(",")
+                } else {
+                    String::new()
+                }),
+                "group_attached" => Some(if s.group.is_some() { m.group_members(s.id).iter().map(|g| m.attached_count(*g)).sum::<usize>() } else { 0 }.to_string()),
+                "group_many_attached" => flag(s.group.is_some() && m.group_members(s.id).iter().map(|g| m.attached_count(*g)).sum::<usize>() > 1),
                 "format" => flag(true),
                 "alerts" => {
                     let v: Vec<String> = s
@@ -1623,11 +1879,15 @@ impl Vars for Fctx<'_> {
         }
         if let Some(rest) = name.strip_prefix("window_") {
             let w = w?;
-            let sess = m.sessions.get(&w.session);
+            // A window linked into several sessions: as seen from the
+            // session in context, if it is one of them.
+            let sid = self.s.filter(|s| w.index_in(*s).is_some()).unwrap_or_else(|| w.session());
+            let widx = self.idx.filter(|i| w.links.contains(&(sid, *i))).or_else(|| w.index_in(sid)).unwrap_or_else(|| w.index());
+            let sess = m.sessions.get(&sid);
             let is_cur = sess.is_some_and(|s| s.current == w.id);
             let is_last = sess.is_some_and(|s| s.last.first() == Some(&w.id));
             return match rest {
-                "index" => Some(w.index.to_string()),
+                "index" => Some(widx.to_string()),
                 "name" => Some(w.name.clone()),
                 "id" => Some(w.id.to_string()),
                 "flags" | "raw_flags" => {
@@ -1661,15 +1921,21 @@ impl Vars for Fctx<'_> {
                 "activity_flag" => flag(w.activity),
                 "marked_flag" => flag(m.marked().is_some_and(|p| m.panes[&p].window == w.id)),
                 "silence_flag" => flag(w.silence),
-                "bigger" | "linked" => flag(false),
+                "bigger" => flag(false),
+                // tmux counts winlinks: two indexes of one session count twice.
+                "linked" => flag(w.links.len() > 1),
+                "linked_sessions" => Some(w.links.len().to_string()),
+                "linked_sessions_list" => {
+                    Some(w.links.iter().filter_map(|(s, _)| m.sessions.get(s)).map(|s| s.name.as_str()).collect::<Vec<_>>().join(","))
+                }
                 "zoomed_flag" => flag(w.layout.zoomed().is_some()),
                 "panes" => Some(w.panes.len().to_string()),
                 "width" => Some(w.size.cols.to_string()),
                 "height" => Some(w.size.rows.to_string()),
                 "layout" | "visible_layout" => Some(w.layout.dump()),
                 "offset_x" | "offset_y" => Some("0".into()),
-                "start_flag" => flag(sess.and_then(|s| s.windows.keys().next()) == Some(&w.index)),
-                "end_flag" => flag(sess.and_then(|s| s.windows.keys().next_back()) == Some(&w.index)),
+                "start_flag" => flag(sess.and_then(|s| s.windows.keys().next()) == Some(&widx)),
+                "end_flag" => flag(sess.and_then(|s| s.windows.keys().next_back()) == Some(&widx)),
                 "format" => flag(true),
                 _ => None,
             };
@@ -1678,7 +1944,7 @@ impl Vars for Fctx<'_> {
             let p = p?;
             let pw = m.windows.get(&p.window);
             let info = self.host.pane_info(p.id);
-            let rect = pw.and_then(|w| w.layout.unzoomed_geometry().rect(p.id));
+            let rect = pw.and_then(|w| w.floating.iter().find(|f| f.0 == p.id).map(|f| floating_inner(f.1)).or_else(|| w.layout.unzoomed_geometry().rect(p.id)));
             let wsize = pw.map(|w| w.layout.size()).unwrap_or_default();
             return match rest {
                 "index" => m.pane_index(p.id).map(|i| i.to_string()),
@@ -1702,6 +1968,7 @@ impl Vars for Fctx<'_> {
                 "synchronized" => flag(m.popt(p.id, "synchronize-panes").as_flag()),
                 "start_command" => Some(p.command.display()),
                 "start_path" => Some(p.cwd.clone()),
+                "floating_flag" => flag(pw.is_some_and(|w| w.is_floating(p.id))),
                 "left" => rect.map(|r| r.x.to_string()),
                 "top" => rect.map(|r| r.y.to_string()),
                 "right" => rect.map(|r| (r.right().saturating_sub(1)).to_string()),
@@ -1721,7 +1988,7 @@ impl Vars for Fctx<'_> {
         if let Some(rest) = name.strip_prefix("history_") {
             let p = p?;
             let info = self.host.pane_info(p.id);
-            let sid = m.windows.get(&p.window).map(|w| w.session);
+            let sid = m.windows.get(&p.window).map(|w| w.session());
             return match rest {
                 "size" => Some(info.history_size.to_string()),
                 "bytes" => Some(info.history_bytes.to_string()),
@@ -1764,7 +2031,7 @@ impl Vars for Fctx<'_> {
             _ => {}
         }
         // Like tmux, fall back to options.
-        let sid = self.s.or_else(|| w.map(|w| w.session));
+        let sid = self.s.or_else(|| w.map(|w| w.session()));
         m.option_text(name, sid, self.w)
     }
 }

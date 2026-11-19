@@ -40,7 +40,9 @@ mod command;
 mod grid;
 mod keys;
 mod mode;
-pub mod regex;
+/// The regular expression engine, which lives in `lif-core` so its
+/// commands and formats can use it too.
+pub use lif_core::regex;
 mod search;
 mod view;
 

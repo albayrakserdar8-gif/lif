@@ -1,3 +1,26 @@
+# 0.5.0 against 0.4.0 (2026-11-19)
+
+Same-run A/B, `bench/run.sh --tools lifbase,lif --only throughput,latency
+--tag 0.5.0-ab` (`lifbase`: the 0.4.0 commit built into
+`bench/tmp/ab/lif-head`), load average 3.4 at the start, 1.8 at the end:
+`results/2026-11-19-1539-0.5.0-ab-summary.md`.
+
+| | 0.4.0 | 0.5.0 |
+|---|---|---|
+| `cat` 100 MB ASCII / SGR / one line (MB/s) | 190.7 / 154.4 / 180.6 | 190.7 / 155.3 / 180.5 |
+| key echo, idle, p50 / p95 (us) | 110 / 155 | 112 / 168 |
+| key echo next to `yes`, p50 / p99 (us) | 39 / 98 | 23 / 54 |
+| bare ESC, escape-time 0, p50 (us) | 167 | 167 |
+
+The echo next to a flood is the `ECHO_PAUSE` of issues/0006. Idle, the
+same way (`--only idle`): 0.3 ms CPU and 1 interrupt wakeup in 30 s for
+0.4.0, 0.0 and 0 for 0.5.0 (noise of the machine either way). The full
+four-tool table of 0.5.0 is `results/2026-11-19-1543-0.5.0-summary.md`.
+
+Earlier tables measured `target/release/lif` as it happened to be built
+(the 0.4.0 table: a build that called itself 0.3.0); `bench/run.sh` now
+builds the lif it measures into `target-bench`.
+
 # lif after the performance tour vs tmux 3.8 vs zellij 0.46 vs none (2026-11-15)
 
 One run, all tools, same code, metric-major with throughput and latency

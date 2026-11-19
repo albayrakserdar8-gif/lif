@@ -200,6 +200,22 @@ fn a_stale_socket_is_replaced() {
     assert_eq!(env.ok(&["list-sessions", "-F", "#{session_name}"]), "x\n");
 }
 
+/// An exiting server removes its socket before it waits for its panes to
+/// die, so a client arriving meanwhile starts a new server instead of
+/// having its connection dropped (issues/0004).
+#[test]
+fn an_exiting_server_removes_its_socket_first() {
+    let env = Env::new();
+    // A pane that ignores the hangup keeps the server waiting for
+    // PANE_KILL_GRACE (500 ms) before it is killed.
+    env.ok(&["new-session", "-d", "-s", "x", "trap '' HUP TERM; echo ready; exec sleep 1000"]);
+    env.wait_capture("x", "ready");
+    env.ok(&["kill-server"]);
+    assert!(env.wait(Duration::from_millis(300), || !env.sock.exists()), "the socket outlived kill-server while the panes were dying");
+    env.ok(&["new-session", "-d", "-s", "y"]);
+    assert_eq!(env.ok(&["list-sessions", "-F", "#{session_name}"]), "y\n");
+}
+
 /// An exiting server removes the socket path only if it is still the
 /// socket it bound.
 #[test]

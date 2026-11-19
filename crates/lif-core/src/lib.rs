@@ -41,12 +41,17 @@ mod model;
 mod overlay;
 pub mod options;
 mod queue;
+mod customize;
+mod floating;
+mod groups;
+pub mod regex;
 pub(crate) mod status;
 pub use status::StatusRanges;
 mod target;
 pub mod time;
 
 pub use bindings::{Binding, KeyBindings, KeyDecision, KeyState, MouseBinding};
+pub use hooks::ControlEvent;
 pub use cmd::{Arg, Args, CmdError, Command, CommandList, escape_arg, parse, parse_list, parse_string};
 pub use exec::expand_prompt_template;
 pub use exec::MAX_STARTUP_COMMANDS;

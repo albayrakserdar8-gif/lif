@@ -1,4 +1,6 @@
-//! A small regular expression engine for copy-mode search.
+//! A small regular expression engine: copy-mode search (`lif-copy`),
+//! `find-window -r` and the `#{m/r:...}` format. It lives here, not in
+//! `lif-copy`, because `lif-copy` depends on this crate.
 //!
 //! Supports the POSIX extended syntax tmux's search-forward accepts in
 //! practice: literals, `.`, bracket expressions (ranges, negation and the
@@ -145,6 +147,29 @@ impl Regex {
             text.chars().map(|c| Inst::Char(if icase { fold(c) } else { c })).collect();
         prog.push(Inst::Match);
         Regex { prog, icase }
+    }
+
+    /// Whether the pattern matches anywhere in `text`, an empty match
+    /// included (as `regexec` does: `a*` matches `b`). Folds the text
+    /// itself when the pattern ignores case.
+    pub fn is_match(&self, text: &str) -> bool {
+        let chars: Vec<char> = if self.icase { text.chars().map(fold).collect() } else { text.chars().collect() };
+        let n = chars.len();
+        let mut sc = Scratch::default();
+        if self.find(&chars, 0, n + 1, false, &mut sc).is_some() {
+            return true;
+        }
+        // Empty matches: only `^` and `$` tell positions apart, so the
+        // start, the end and any one position between stand for all.
+        let mut at = vec![0, n];
+        if n >= 2 {
+            at.push(1);
+        }
+        at.into_iter().any(|i| {
+            sc.clist.reset(self.prog.len());
+            self.add(&mut sc.clist, &mut sc.stack, 0, i, i, n);
+            sc.clist.dense.iter().any(|&(pc, _)| matches!(self.prog[pc as usize], Inst::Match))
+        })
     }
 
     /// Whether text must be folded with [`fold`] before matching.

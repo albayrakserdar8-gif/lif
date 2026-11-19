@@ -13,7 +13,7 @@ A terminal multiplexer that keeps tmux's commands, flags, targets, formats,
 default key bindings (prefix `C-b`) and error messages, with a TOML config
 instead of `.tmux.conf`. Its reason to exist is speed and a small footprint:
 one server thread, one mio event loop, libghostty-vt as the terminal engine,
-a diff renderer that skips frames instead of queueing output. Version 0.4.0,
+a diff renderer that skips frames instead of queueing output. Version 0.5.0,
 developed on macOS / Apple Silicon; the tests also pass on Linux (arm64, in
 a VM, see below).
 
@@ -193,7 +193,9 @@ What differs on Linux, learned the hard way:
   (`lif_client::connect_stream` never does).
 - A signal interrupts `poll` in whichever test thread it lands on.
 - `$XDG_RUNTIME_DIR` is set and comes before `$TMPDIR` for the socket.
-- `echo_is_not_paced_next_to_a_flood` is ignored there (issues/0006).
+- Reading a flooding PTY delays the echo of other PTYs (the tty work
+  queue); the server pauses floods for `ECHO_PAUSE` after a key
+  (issues/0006).
 
 A change to `cfg(target_os)` code is not done until the cross-check
 passes, and should be run in the VM. `.github/workflows/ci.yml` runs

@@ -1,6 +1,6 @@
 # 0004: `a_stale_socket_is_replaced` failed once
 
-Status: handled in the client (0.4.0); the server side is not explained.
+Status: fixed (0.5.0): explained; the server removes its socket before it waits for its panes.
 
 ## What happened
 
@@ -63,11 +63,28 @@ A fourth, on macOS, in `dash_f_reaches_a_new_server_only` again
 
 ## Root cause
 
-Partly known. `kill-server` returns when the server has answered, not when
-it is gone, so the next client can find the socket of a server that is on
-its way out: its connection is taken and dropped. That explains the two
-`kill-server` sightings. Why a server just started on a stale socket would
-drop its first client (the other two) is not known.
+Two causes, both now explained.
+
+1. After `kill-server` (the two `dash_f_reaches_a_new_server_only`
+   sightings): `kill-server` returns when the server has answered, not
+   when it is gone. `Server::finish` then delivered what was pending,
+   hung up the panes and waited up to `PANE_KILL_GRACE` (500 ms) for them,
+   and only then removed the socket. A client arriving in that window
+   connected to a listener nobody would accept from again; the connection
+   was dropped when the process exited.
+2. The stale socket (the two `a_stale_socket_is_replaced` sightings) is
+   the test's own doing, not the server's. The test binds a listener in
+   the test process and drops it; another test thread of the same binary
+   that forks at that moment (`Term::spawn` forks a client onto a PTY)
+   gives its child a copy of the listener's descriptor, which stays open
+   until the child execs or exits. In that window the "stale" socket still
+   listens: `connect` succeeds into its queue and the client then reads
+   end of file (macOS) or ECONNRESET (Linux) when the copy closes. No lif
+   server is involved at all.
+
+   Reproduced without lif: a Python thread forking children that wait
+   3 ms before exiting while another thread binds, closes and connects to
+   400 sockets: 398 `ECONNREFUSED`, 2 "connected, then EOF".
 
 ## Fix
 
@@ -79,12 +96,28 @@ the second time. 300 rounds of `new-session; kill-server; new-session`
 gave no failure afterwards (none before either with a release build: the
 window is narrow).
 
+The server (0.5.0) removes its socket first in `Server::finish`, before
+it delivers the last messages and kills the panes. A client arriving
+meanwhile finds no socket and goes the start-up path, which waits for the
+exiting server's lock; that wait now polls every 2 ms instead of 10 ms
+(`crates/lif/src/start.rs`). The client's retry stays: it still covers a
+connection that was already in the queue, and the test artifact above.
+
+Test: `an_exiting_server_removes_its_socket_first` in
+`crates/lif/tests/server_limits.rs` (a pane that ignores SIGHUP keeps the
+server in its grace period; the socket must be gone within 300 ms of
+`kill-server`). It fails without the fix and passes with it.
+
 ## What is not fixed
 
-The server dropping a first client after a stale socket was replaced is
-only papered over by the retry. To catch it: run the start-up tests of
-`server_limits.rs` in a loop with `-v` and keep `lif-server-*.log`.
+The test artifact of cause 2 is not removed (the retry handles it, and any
+test that drops a listener while other threads fork can meet it).
 
 ## Measured cost
 
-None on the usual path: one more branch on a failed connect.
+6 parallel loops of 100 `new-session -d; kill-server` (debug build, load
+average about 1.8): 1.84 s per loop before, 2.28 s with the socket removed
+first and the 10 ms lock poll, 1.97 s with the 2 ms poll (about 1.3 ms more
+per back-to-back restart, now spent waiting for the old server's lock
+instead of on a dropped connection). No failures in any run. Nothing on the
+usual path.

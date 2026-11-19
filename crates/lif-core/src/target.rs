@@ -73,15 +73,32 @@ impl Model {
         Found { s, w: Some(w), p: self.windows.get(&w).map(|w| w.active), idx: None }
     }
 
+    /// The session and index a window is found at: `prefer` if it is
+    /// linked there, else the session the target is resolved for, else its
+    /// first link.
+    fn window_link(&self, win: &crate::model::Window, prefer: Option<SessionId>) -> (SessionId, u32) {
+        let s = prefer
+            .or(self.target_pref.get())
+            .filter(|s| win.index_in(*s).is_some())
+            .unwrap_or_else(|| win.session());
+        (s, win.index_in(s).unwrap_or_else(|| win.index()))
+    }
+
     fn found_window(&self, w: WindowId) -> Option<Found> {
+        self.found_window_in(w, None)
+    }
+
+    fn found_window_in(&self, w: WindowId, prefer: Option<SessionId>) -> Option<Found> {
         let win = self.windows.get(&w)?;
-        Some(Found { s: win.session, w: Some(w), p: Some(win.active), idx: Some(win.index) })
+        let (s, idx) = self.window_link(win, prefer);
+        Some(Found { s, w: Some(w), p: Some(win.active), idx: Some(idx) })
     }
 
     fn found_pane(&self, p: PaneId) -> Option<Found> {
         let w = self.panes.get(&p)?.window;
         let win = self.windows.get(&w)?;
-        Some(Found { s: win.session, w: Some(w), p: Some(p), idx: Some(win.index) })
+        let (s, idx) = self.window_link(win, None);
+        Some(Found { s, w: Some(w), p: Some(p), idx: Some(idx) })
     }
 
     /// The source of a command whose `-s` defaults to the marked pane
@@ -97,7 +114,11 @@ impl Model {
     /// found is remembered as the target of the command being run, for
     /// its `after-` hook.
     pub(crate) fn find_target(&self, ctx: &CmdContext, target: Option<&str>, kind: Kind, flags: Flags) -> Result<Found, CmdError> {
-        let f = self.resolve_target(ctx, target, kind, flags)?;
+        let pref = ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.session);
+        let old = self.target_pref.replace(pref);
+        let f = self.resolve_target(ctx, target, kind, flags);
+        self.target_pref.set(old);
+        let f = f?;
         self.last_found.set(Some(f));
         Ok(f)
     }
@@ -252,10 +273,10 @@ impl Model {
     fn get_window_with_session(&self, sid: SessionId, w: &str, exact: bool, window_index: bool) -> Option<Found> {
         let sess = self.sessions.get(&sid)?;
         if let Some(id) = WindowId::parse(w) {
-            return self.found_window(id).filter(|f| f.s == sid);
+            return self.found_window_in(id, Some(sid)).filter(|f| f.s == sid);
         }
-        let cur_idx = self.windows.get(&sess.current)?.index;
-        let by_index = |idx: u32| sess.windows.get(&idx).and_then(|wid| self.found_window(*wid));
+        let cur_idx = self.windows.get(&sess.current)?.index();
+        let by_index = |idx: u32| sess.windows.get(&idx).and_then(|wid| self.found_window_in(*wid, Some(sid))).map(|f| Found { idx: Some(idx), ..f });
         if !exact && (w.starts_with('+') || w.starts_with('-')) {
             let n: u32 = if w.len() > 1 { w[1..].parse().ok().filter(|n| *n >= 1)? } else { 1 };
             let plus = w.starts_with('+');
@@ -271,9 +292,9 @@ impl Model {
         }
         if !exact {
             match w {
-                "!" => return sess.last.first().and_then(|w| self.found_window(*w)),
-                "^" => return sess.windows.values().next().and_then(|w| self.found_window(*w)),
-                "$" => return sess.windows.values().next_back().and_then(|w| self.found_window(*w)),
+                "!" => return sess.last.first().and_then(|w| self.found_window_in(*w, Some(sid))),
+                "^" => return sess.windows.iter().next().and_then(|(i, w)| self.found_window_in(*w, Some(sid)).map(|f| Found { idx: Some(*i), ..f })),
+                "$" => return sess.windows.iter().next_back().and_then(|(i, w)| self.found_window_in(*w, Some(sid)).map(|f| Found { idx: Some(*i), ..f })),
                 _ => {}
             }
         }
@@ -291,7 +312,7 @@ impl Model {
         let unique = |pred: &dyn Fn(&str) -> bool| -> Option<Option<Found>> {
             let mut it = sess.windows.values().filter(|wid| self.windows.get(wid).is_some_and(|x| pred(&x.name)));
             match (it.next(), it.next()) {
-                (Some(wid), None) => Some(self.found_window(*wid)),
+                (Some(wid), None) => Some(self.found_window_in(*wid, Some(sid))),
                 (Some(_), Some(_)) => Some(None),
                 _ => None,
             }

@@ -1,0 +1,57 @@
+{
+ "tool": "lif",
+ "version": "lif 0.5.0",
+ "date": "2026-11-19T15:55:41",
+ "machine": {
+  "model": "Mac18,5",
+  "chip": "Apple M6",
+  "cores": "12",
+  "perflevels": [
+   "2 Super",
+   "4 Performance",
+   "6 Efficiency"
+  ],
+  "mem_bytes": 17179869184,
+  "macos": "macOS 27.2.1 26B131",
+  "kernel": "27.2.0",
+  "loadavg_at_start": [
+   2.07666015625,
+   2.34375,
+   2.64892578125
+  ],
+  "power": [
+   "Now drawing from 'AC Power'"
+  ]
+ },
+ "driver": "/Volumes/extssd/Development/lif/target-bench/release/lifbench-driver",
+ "size": "200x50",
+ "quick": false,
+ "reps": 5,
+ "metrics": {
+  "idle": {
+   "seconds": 30,
+   "client_alive": true,
+   "server": {
+    "cpu_ms": 0.0,
+    "idle_wakeups": 0,
+    "intr_wakeups": 0,
+    "ps_cputime_delta_s": 0.0
+   },
+   "client": {
+    "cpu_ms": 0.0,
+    "idle_wakeups": 0,
+    "intr_wakeups": 0,
+    "ps_cputime_delta_s": 0
+   }
+  }
+ },
+ "elapsed_s": {
+  "idle": 34.3
+ },
+ "loadavg": {
+  "idle": [
+   2.2841796875,
+   2.07421875
+  ]
+ }
+}

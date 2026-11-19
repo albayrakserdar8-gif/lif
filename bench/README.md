@@ -249,7 +249,7 @@ Write one subclass of `Adapter` in `lifbench.py` and add it to `ADAPTERS`:
 Everything must live in `self.sock_dir` / `self.work` (use `self.env()`) and honor
 `self.opts` (`history`: scrollback lines; `escape_time`: ms, where supported).
 
-The `lif` adapter drives `target/release/lif` with `-S <private socket>` and the
+The `lif` adapter drives `target-bench/release/lif` (which `run.sh` builds) with `-S <private socket>` and the
 tmux verbs `new-session -d -x 200 -y 50`, `attach -t`, `split-window -d -t [CMD]`
 (+ `select-layout tiled`), `list-panes -s`, `list-windows`, `has-session`,
 `kill-server`; detach is `C-b d`. The server is a daemon forked from the first

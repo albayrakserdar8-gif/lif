@@ -191,7 +191,8 @@ fn environment_commands_reach_new_panes() {
     session(&env);
     env.ok(&["set-environment", "-g", "GV", "global"]);
     env.ok(&["set-environment", "-t", "s:", "SV", "of session"]);
-    assert_eq!(env.ok(&["show-environment", "-t", "s:"]), "SV=of session\n");
+    // (The session also lists the update-environment variables.)
+    assert_eq!(env.ok(&["show-environment", "-t", "s:", "SV"]), "SV=of session\n");
     assert_eq!(env.ok(&["show-environment", "-t", "s:", "-s", "SV"]), "SV=\"of session\"; export SV;\n");
     assert_eq!(out(&env.run(&["show-environment", "-t", "s:", "NOPE"])), (1, String::new(), "unknown variable: NOPE\n".into()));
     env.ok(&["new-window", "-t", "s:", "-e", "EV=flag", "-e", "GV=overridden"]);
@@ -281,4 +282,25 @@ fn shell_commands_are_bounded_and_end_with_the_server() {
     assert!(pid_alive(pid));
     env.ok(&["kill-server"]);
     assert!(env.wait(secs(10), || !pid_alive(pid)), "the job outlived the server");
+}
+
+/// update-environment: the variables it names come from the client that
+/// creates (attaches to, switches to) a session, into the session's
+/// environment and its new panes; one the client lacks is removed; -E
+/// leaves the session's environment alone.
+#[test]
+fn update_environment_copies_the_clients_variables() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "s"]);
+    env.ok(&["set-option", "-g", "update-environment", "UPD_VAR UPD_GONE"]);
+    let run = |vars: &[(&str, &str)], args: &[&str]| {
+        let o = env.command().envs(vars.iter().copied()).args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&[("UPD_VAR", "from-client"), ("UPD_OTHER", "x")], &["new-session", "-d", "-s", "u"]);
+    assert_eq!(env.ok(&["show-environment", "-t", "u"]), "-UPD_GONE\nUPD_VAR=from-client\n");
+    env.ok(&["send-keys", "-t", "u:", "echo [$UPD_VAR][$UPD_OTHER]", "Enter"]);
+    env.wait_capture("u:", "[from-client][]");
+    run(&[("UPD_VAR", "skipped")], &["new-session", "-d", "-E", "-s", "e"]);
+    assert_eq!(env.ok(&["show-environment", "-t", "e"]), "");
 }

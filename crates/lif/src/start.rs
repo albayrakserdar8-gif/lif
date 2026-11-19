@@ -121,7 +121,9 @@ pub(crate) fn start_server(socket: &Path, verbose: bool, config: Option<&Path>) 
         if Instant::now() >= deadline {
             return Err(not_responding(socket));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Usually a server that is exiting (its socket is already gone):
+        // the lock is free a few milliseconds later.
+        std::thread::sleep(Duration::from_millis(2));
     }
     remove_stale(socket)?;
     let mut fds = [0; 2];

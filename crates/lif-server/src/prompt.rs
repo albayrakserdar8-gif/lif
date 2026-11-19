@@ -1,6 +1,9 @@
 //! The status-line prompt: `command-prompt` (a small line editor with
 //! history) and `confirm-before`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use lif_core::{KeyCode, PaneId, Prompt};
 use lif_render::char_width;
 use lif_types::{Color, Key, KeyAction, KeyEvent, Mods, Span, Style, StyledLine};
@@ -16,6 +19,8 @@ pub(crate) enum PromptAction {
     Cancel,
     /// Parse and run this command string.
     Run(String),
+    /// Run this command string and keep the prompt open (`-i`).
+    RunKeep(String),
     /// A copy-mode prompt's text changed (incremental search).
     CopyChanged(PaneId, String),
     /// C-s (true) or C-r in an incremental copy-mode prompt.
@@ -42,6 +47,20 @@ pub(crate) struct PromptState {
     hist: Option<usize>,
     saved: Vec<char>,
     copy: Option<CopyPrompt>,
+    /// `-i`: the `-I` text, which C-s or C-r on an empty line brings back.
+    recall: String,
+    /// The job id the commands after `command-prompt` wait for, and where
+    /// to report it: whichever way the prompt goes (answered, cancelled,
+    /// replaced, its client gone), dropping it reports it.
+    done: Option<(u64, Rc<RefCell<Vec<u64>>>)>,
+}
+
+impl Drop for PromptState {
+    fn drop(&mut self) {
+        if let Some((job, list)) = self.done.take() {
+            list.borrow_mut().push(job);
+        }
+    }
 }
 
 pub(crate) fn message_style() -> Style {
@@ -50,10 +69,41 @@ pub(crate) fn message_style() -> Style {
 
 impl PromptState {
     pub(crate) fn new(prompt: Prompt) -> Self {
-        let mut s =
-            PromptState { prompt, step: 0, answers: Vec::new(), line: Vec::new(), cursor: 0, hist: None, saved: Vec::new(), copy: None };
+        let mut s = PromptState {
+            prompt,
+            step: 0,
+            answers: Vec::new(),
+            line: Vec::new(),
+            cursor: 0,
+            hist: None,
+            saved: Vec::new(),
+            copy: None,
+            recall: String::new(),
+            done: None,
+        };
         s.load_input();
         s
+    }
+
+    /// Report the prompt's job to `list` when it goes (see [`PromptState::done`]).
+    pub(crate) fn report_to(&mut self, list: &Rc<RefCell<Vec<u64>>>) {
+        if let Prompt::Command { job: Some(job), .. } | Prompt::Confirm { job: Some(job), .. } = &self.prompt {
+            self.done = Some((*job, list.clone()));
+        }
+    }
+
+    /// The job the commands after `command-prompt` wait for, taken: the
+    /// caller reports it (dropping the prompt then reports nothing).
+    pub(crate) fn take_job(&mut self) -> Option<u64> {
+        self.done.take().map(|(job, _)| job)
+    }
+
+    /// `-i`: the command to run as the prompt opens (with `=`).
+    pub(crate) fn initial_run(&self) -> Option<String> {
+        match &self.prompt {
+            Prompt::Command { incremental: true, template, .. } => Some(lif_core::expand_prompt_template(template, &["="])),
+            _ => None,
+        }
     }
 
     /// A prompt for copy mode in `pane` (`(search up)` ...); its edits and
@@ -66,6 +116,9 @@ impl PromptState {
             single_key: false,
             key_name: false,
             numeric: false,
+            incremental: false,
+            backspace_cancels: false,
+            job: None,
         });
         s.copy = Some(CopyPrompt { pane, incremental });
         s
@@ -88,10 +141,14 @@ impl PromptState {
 
     fn load_input(&mut self) {
         self.line.clear();
-        if let Prompt::Command { inputs, .. } = &self.prompt
+        if let Prompt::Command { inputs, incremental, .. } = &self.prompt
             && let Some(i) = inputs.get(self.step)
         {
-            self.line.extend(i.chars());
+            if *incremental {
+                self.recall = i.clone();
+            } else {
+                self.line.extend(i.chars());
+            }
         }
         self.cursor = self.line.len();
         self.hist = None;
@@ -125,15 +182,23 @@ impl PromptState {
         if let Some(c) = self.copy {
             return self.copy_key(c, key, history);
         }
-        let (single_key, key_name, numeric) = match &self.prompt {
+        let (single_key, key_name, numeric, incremental, backspace_cancels) = match &self.prompt {
             Prompt::Confirm { command, default_yes, .. } => {
                 let yes = matches!(key.key, Key::Char('y') | Key::Char('Y')) && !key.mods.contains(Mods::CTRL)
                     || (*default_yes && key.key == Key::Enter);
                 return if yes { PromptAction::Run(command.clone()) } else { PromptAction::Cancel };
             }
-            Prompt::Command { single_key, key_name, numeric, .. } => (*single_key, *key_name, *numeric),
+            Prompt::Command { single_key, key_name, numeric, incremental, backspace_cancels, .. } => {
+                (*single_key, *key_name, *numeric, *incremental, *backspace_cancels)
+            }
         };
         let ctrl = key.mods.contains(Mods::CTRL);
+        if backspace_cancels && self.line.is_empty() && (key.key == Key::Backspace || (ctrl && key.key == Key::Char('h'))) {
+            return PromptAction::Cancel;
+        }
+        if incremental {
+            return self.incremental_key(key, ctrl, history);
+        }
         if key_name {
             let name = KeyCode::from_event(key).map(|k| k.to_string()).unwrap_or_default();
             return self.answer(name, history);
@@ -203,6 +268,43 @@ impl PromptState {
             }
         }
         PromptAction::Continue
+    }
+
+    /// A key in a `-i` prompt: Enter and Escape close it without running
+    /// anything (what was typed already ran); C-s and C-r run the command
+    /// again with `+` or `-`; an edit runs it with `=`.
+    fn incremental_key(&mut self, key: &KeyEvent, ctrl: bool, history: &mut Vec<String>) -> PromptAction {
+        let Prompt::Command { template, .. } = &self.prompt else { return PromptAction::Cancel };
+        let template = template.clone();
+        let run = |s: &Self, mark: char| {
+            let text: String = std::iter::once(mark).chain(s.line.iter().copied()).collect();
+            PromptAction::RunKeep(lif_core::expand_prompt_template(&template, &[&text]))
+        };
+        match key.key {
+            Key::Enter => return PromptAction::Cancel,
+            Key::Char('m') | Key::Char('j') if ctrl => return PromptAction::Cancel,
+            Key::Char('s') | Key::Char('r') if ctrl => {
+                if self.line.is_empty() && !self.recall.is_empty() {
+                    self.line = self.recall.chars().collect();
+                    self.cursor = self.line.len();
+                    return run(self, '=');
+                }
+                return run(self, if key.key == Key::Char('s') { '+' } else { '-' });
+            }
+            _ => {}
+        }
+        let before = self.line.clone();
+        let Prompt::Command { incremental, .. } = &mut self.prompt else { return PromptAction::Cancel };
+        *incremental = false;
+        let action = self.key(key, history);
+        if let Prompt::Command { incremental, .. } = &mut self.prompt {
+            *incremental = true;
+        }
+        match action {
+            PromptAction::Continue if self.line != before => run(self, '='),
+            PromptAction::Run(_) => PromptAction::Cancel,
+            a => a,
+        }
     }
 
     fn copy_key(&mut self, c: CopyPrompt, key: &KeyEvent, history: &mut Vec<String>) -> PromptAction {
@@ -332,14 +434,72 @@ mod tests {
     use super::*;
 
     fn cmd_prompt() -> PromptState {
+        with_template("%1", false, false, "")
+    }
+
+    fn flagged(incremental: bool, backspace_cancels: bool, input: &str) -> PromptState {
+        with_template("run %1", incremental, backspace_cancels, input)
+    }
+
+    fn with_template(template: &str, incremental: bool, backspace_cancels: bool, input: &str) -> PromptState {
         PromptState::new(Prompt::Command {
             prompts: vec![":".into()],
-            inputs: vec![String::new()],
-            template: "%1".into(),
+            inputs: vec![input.into()],
+            template: template.into(),
             single_key: false,
             key_name: false,
             numeric: false,
+            incremental,
+            backspace_cancels,
+            job: Some(7),
         })
+    }
+
+    fn keep(a: PromptAction) -> String {
+        match a {
+            PromptAction::RunKeep(s) => s,
+            _ => panic!("not RunKeep"),
+        }
+    }
+
+    /// What tmux 3.8 runs for each key of a `command-prompt -i`.
+    #[test]
+    fn incremental() {
+        let mut h = Vec::new();
+        let mut p = flagged(true, false, "zz");
+        assert_eq!(p.initial_run().as_deref(), Some("run ="));
+        assert_eq!(p.line, Vec::<char>::new(), "-I is not typed in");
+        // An empty line: C-s brings the -I text back.
+        assert_eq!(keep(p.key(&ctrl('s'), &mut h)), "run =zz");
+        assert_eq!(keep(p.key(&ctrl('s'), &mut h)), "run +zz");
+        assert_eq!(keep(p.key(&ctrl('r'), &mut h)), "run -zz");
+        assert_eq!(keep(p.key(&k(Key::Backspace), &mut h)), "run =z");
+        assert_eq!(keep(p.key(&k(Key::Char('a')), &mut h)), "run =za");
+        assert!(matches!(p.key(&k(Key::Left), &mut h), PromptAction::Continue), "no change, no run");
+        assert!(matches!(p.key(&k(Key::Enter), &mut h), PromptAction::Cancel), "Enter only closes");
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn backspace_on_empty_cancels_with_e() {
+        let mut h = Vec::new();
+        let mut p = flagged(false, true, "");
+        p.key(&k(Key::Char('k')), &mut h);
+        assert!(matches!(p.key(&k(Key::Backspace), &mut h), PromptAction::Continue));
+        assert!(matches!(p.key(&k(Key::Backspace), &mut h), PromptAction::Cancel));
+        let mut p = flagged(false, false, "");
+        assert!(matches!(p.key(&k(Key::Backspace), &mut h), PromptAction::Continue));
+    }
+
+    /// The commands after command-prompt wait for it whichever way it goes.
+    #[test]
+    fn job_reported_when_dropped() {
+        let list = Rc::new(RefCell::new(Vec::new()));
+        let mut p = cmd_prompt();
+        p.report_to(&list);
+        assert!(list.borrow().is_empty());
+        drop(p);
+        assert_eq!(*list.borrow(), [7]);
     }
 
     fn k(key: Key) -> KeyEvent {
@@ -405,9 +565,9 @@ mod tests {
     #[test]
     fn confirm() {
         let mut h = Vec::new();
-        let mut p = PromptState::new(Prompt::Confirm { prompt: "kill? (y/n)".into(), command: "kill-pane".into(), default_yes: false });
+        let mut p = PromptState::new(Prompt::Confirm { prompt: "kill? (y/n)".into(), command: "kill-pane".into(), default_yes: false, job: None });
         assert!(matches!(p.key(&k(Key::Char('y')), &mut h), PromptAction::Run(s) if s == "kill-pane"));
-        let mut p = PromptState::new(Prompt::Confirm { prompt: "x".into(), command: "c".into(), default_yes: false });
+        let mut p = PromptState::new(Prompt::Confirm { prompt: "x".into(), command: "c".into(), default_yes: false, job: None });
         assert!(matches!(p.key(&k(Key::Enter), &mut h), PromptAction::Cancel));
     }
 }

@@ -32,6 +32,9 @@ pub(crate) enum Kind {
     DimStr,
     Key,
     Choice(&'static [&'static str]),
+    /// Words separated by spaces (tmux's array options); `set -a` adds a
+    /// word.
+    List,
 }
 
 /// One option's definition.
@@ -111,6 +114,8 @@ pub(crate) static DEFS: &[Def] = &[
     d("exit-empty", Server, Flag, "on"),
     d("focus-events", Server, Flag, "on"),
     d("history-limit", Session, Number(0, MAXI), "4000"),
+    d("lock-after-time", Session, Number(0, MAXI), "0"),
+    d("lock-command", Session, Str, "lock -np"),
     d("main-pane-height", Window, SizeStr, "24"),
     d("main-pane-width", Window, SizeStr, "80"),
     d("menu-border-lines", Window, Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"]), "single"),
@@ -132,6 +137,9 @@ pub(crate) static DEFS: &[Def] = &[
     d("pane-border-format", Window, Str, "#{?pane_active,#[reverse],}#{pane_index}#[default] \"#{pane_title}\""),
     d("pane-border-status", Window, Choice(&["off", "top", "bottom"]), "off"),
     d("pane-border-style", Window, Str, "default"),
+    d("pane-scrollbars", Window, Choice(&["off", "modal", "on"]), "off"),
+    d("pane-scrollbars-position", Window, Choice(&["right", "left"]), "right"),
+    d("pane-scrollbars-style", Window, Str, "bg=brightblack,fg=white,width=1,pad=0"),
     d("popup-border-lines", Window, Choice(&["single", "rounded", "double", "heavy", "simple", "padded", "none"]), "single"),
     d("popup-border-style", Window, Str, "default"),
     d("popup-style", Window, Str, "default"),
@@ -164,6 +172,7 @@ pub(crate) static DEFS: &[Def] = &[
     d("synchronize-panes", Window, Flag, "off"),
     d("tiled-layout-max-columns", Window, Number(0, MAXI), "0"),
     d("tmux-compat", Server, Flag, "off"),
+    d("update-environment", Session, List, "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"),
     d("visual-activity", Session, Choice(&["off", "on", "both"]), "off"),
     d("visual-bell", Session, Choice(&["off", "on", "both"]), "off"),
     d("visual-silence", Session, Choice(&["off", "on", "both"]), "off"),
@@ -267,6 +276,11 @@ pub(crate) fn parse_value(def: &Def, current: &Value, text: Option<&str>, append
                 DimStr if parse_dim(&s).is_none() => Err(format!("invalid value: {s}")),
                 _ => Ok(Value::Str(s)),
             }
+        }
+        List => {
+            let t = text.unwrap_or("").trim();
+            let cur = current.as_str();
+            Ok(Value::Str(if append && !cur.is_empty() && !t.is_empty() { format!("{cur} {t}") } else if append { format!("{cur}{t}") } else { t.to_string() }))
         }
         Key => {
             let t = text.ok_or_else(|| "empty value".to_string())?;

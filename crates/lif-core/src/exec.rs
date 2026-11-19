@@ -65,7 +65,7 @@ const LIST_PANES: &str = "#{pane_index}: [#{pane_width}x#{pane_height}] [history
 const LIST_CLIENTS: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?client_flags, (,}#{client_flags}#{?client_flags,),}";
 const LIST_BUFFERS: &str = "#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\"";
 const DISPLAY_MESSAGE: &str = "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)";
-const NEW_WINDOW: &str = "#{session_name}:#{window_index}.#{pane_index}";
+pub(crate) const NEW_WINDOW: &str = "#{session_name}:#{window_index}.#{pane_index}";
 const NEW_SESSION: &str = "#{session_name}:";
 
 /// `list-commands -F`: tmux's `command_list_*` variables over the usual ones.
@@ -266,9 +266,30 @@ impl Model {
                 let cid = self.attached_client(ctx, a.get('t'))?;
                 host.suspend_client(cid).map(|()| CmdOutput::default()).map_err(CmdError)
             }
+            "lock-client" => {
+                let cid = self.attached_client(ctx, a.get('t'))?;
+                self.lock_client(cid, host).map(|()| CmdOutput::default()).map_err(CmdError)
+            }
+            "lock-session" => {
+                let f = self.find_target(ctx, a.get('t'), Kind::Session, Flags::default())?;
+                for c in self.clients_of(f.s) {
+                    let _ = self.lock_client(c, host);
+                }
+                ok()
+            }
+            "lock-server" => {
+                let all: Vec<ClientId> = self.clients.values().filter(|c| c.session.is_some()).map(|c| c.id).collect();
+                for c in all {
+                    let _ = self.lock_client(c, host);
+                }
+                ok()
+            }
             "choose-buffer" => self.cmd_choose(a, crate::choose::ChooseKind::Buffers, ctx, host),
             "choose-client" => self.cmd_choose(a, crate::choose::ChooseKind::Clients, ctx, host),
             "choose-tree" => self.cmd_choose(a, crate::choose::ChooseKind::Tree, ctx, host),
+            "customize-mode" => self.cmd_choose(a, crate::choose::ChooseKind::Customize, ctx, host),
+            "link-window" => self.cmd_link_window(a, ctx, host),
+            "unlink-window" => self.cmd_unlink_window(a, ctx, host),
             "find-window" => self.cmd_find_window(a, ctx, host),
             "clock-mode" => {
                 let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
@@ -311,6 +332,8 @@ impl Model {
                 ok()
             }
             "join-pane" => self.cmd_join_pane(a, ctx, host),
+            "move-pane" => self.cmd_move_pane(a, ctx, host),
+            "new-pane" => self.cmd_new_pane(a, ctx, host),
             "if-shell" => self.cmd_if_shell(a, ctx, host),
             "run-shell" => self.cmd_run_shell(a, ctx, host),
             "wait-for" => self.cmd_wait_for(a, ctx),
@@ -486,6 +509,18 @@ impl Model {
             "paste-buffer" => self.cmd_paste(a, ctx, host),
             "refresh-client" => {
                 let cid = self.attached_client(ctx, a.get('t'))?;
+                // -C WxH (or W,H): a control client's size, which then
+                // counts for its windows as a terminal's would.
+                if let Some(sz) = a.get('C') {
+                    let (w, h) = sz.split_once(['x', 'X', ',']).ok_or_else(|| CmdError(format!("bad size argument: {sz}")))?;
+                    let (w, h) = (w.parse::<u16>().ok(), h.parse::<u16>().ok());
+                    let ok_dim = |n: &u16| (1..=crate::MAX_WINDOW_DIM).contains(n);
+                    let (Some(w), Some(h)) = (w.filter(ok_dim), h.filter(ok_dim)) else {
+                        return err(format!("size too small or too big: {sz}"));
+                    };
+                    self.client_resized(cid, Size::new(w, h), host);
+                    return ok();
+                }
                 if a.has('S') {
                     host.redraw(Redraw::Status(self.clients[&cid].session.expect("attached")));
                 } else {
@@ -681,7 +716,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn print_new(&self, a: &Args, default: &str, s: SessionId, w: WindowId, p: PaneId, ctx: &CmdContext, host: &dyn Host) -> R {
+    pub(crate) fn print_new(&self, a: &Args, default: &str, s: SessionId, w: WindowId, p: PaneId, ctx: &CmdContext, host: &dyn Host) -> R {
         // What was made is what the command's after-hook is about.
         self.last_found.set(Some(Found { s, w: Some(w), p: Some(p), idx: None }));
         if !a.has('P') {
@@ -780,7 +815,7 @@ impl Model {
         let params = self.preset_params(w);
         let win = self.windows.get_mut(&w).expect("window");
         win.old_layout = Some(win.layout.clone());
-        let panes = win.panes.clone();
+        let panes = win.tiled_panes();
         let size = win.size;
         win.layout.apply_preset(preset, &panes, size, &params);
         win.last_preset = Some(preset);
@@ -789,11 +824,12 @@ impl Model {
 
     fn rotate(&mut self, w: WindowId, down: bool, keep_zoom: bool, host: &mut dyn Host) {
         let win = self.windows.get_mut(&w).expect("window");
-        if win.panes.len() < 2 {
+        // The tiled panes turn; floating ones stay where they are.
+        let old = win.tiled_panes();
+        if old.len() < 2 {
             return;
         }
         let was_zoomed = win.layout.unzoom();
-        let old = win.panes.clone();
         let mut new = old.clone();
         if down {
             new.rotate_right(1);
@@ -801,9 +837,17 @@ impl Model {
             new.rotate_left(1);
         }
         win.layout.reassign(&old, &new);
-        let pos = old.iter().position(|p| *p == win.active).unwrap_or(0);
-        let active = new[pos];
-        win.panes = new;
+        let pos = old.iter().position(|p| *p == win.active);
+        let active = pos.map_or(win.active, |i| new[i]);
+        let mut it = new.into_iter();
+        let floating: Vec<PaneId> = win.floating.iter().map(|f| f.0).collect();
+        for slot in win.panes.iter_mut() {
+            if !floating.contains(slot)
+                && let Some(n) = it.next()
+            {
+                *slot = n;
+            }
+        }
         self.set_active_pane(w, active, host);
         if was_zoomed && keep_zoom {
             self.windows.get_mut(&w).expect("window").layout.zoom(active);
@@ -821,7 +865,7 @@ impl Model {
             if let Some(w) = s.windows.remove(&(last - 1)) {
                 s.windows.insert(last, w);
                 if let Some(win) = self.windows.get_mut(&w) {
-                    win.index = last;
+                    win.relink(sid, last - 1, last);
                 }
             }
             last -= 1;
@@ -858,7 +902,7 @@ impl Model {
         }
         let base = match f.idx {
             Some(i) => Self::check_index(i)?,
-            None => self.windows[&self.sessions[&f.s].current].index,
+            None => self.windows[&self.sessions[&f.s].current].index(),
         };
         let idx = if a.has('a') {
             match base.checked_add(1) {
@@ -906,7 +950,7 @@ impl Model {
                     if !a.has('k') {
                         return err(if what.is_empty() { format!("index in use: {i}") } else { format!("{what}index {i} in use") });
                     }
-                    if self.sessions[&sid].windows.len() == 1 && moving.is_none_or(|m| self.windows[&m].session != sid) {
+                    if self.sessions[&sid].windows.len() == 1 && moving.is_none_or(|m| self.windows[&m].session() != sid) {
                         // Killing the only window now would destroy the
                         // session the window goes into; replace it instead.
                         return Ok((i, Some(existing)));
@@ -927,10 +971,18 @@ impl Model {
             host.kill_pane(*p);
             self.panes.remove(p);
         }
-        if let Some(s) = self.sessions.get_mut(&w.session) {
+        for sid in w.sessions() {
+            let Some(s) = self.sessions.get_mut(&sid) else { continue };
             s.last.retain(|x| *x != old);
             if s.current == old {
                 s.current = new;
+            }
+            // Its other links (another session): gone with it.
+            let gone: Vec<u32> = s.windows.iter().filter(|(_, w)| **w == old).map(|(i, _)| *i).collect();
+            for i in gone {
+                if s.windows.get(&i) == Some(&old) {
+                    s.windows.remove(&i);
+                }
             }
         }
     }
@@ -940,10 +992,9 @@ impl Model {
     fn insert_window(&mut self, sid: SessionId, idx: u32, wid: WindowId) {
         let s = self.sessions.get_mut(&sid).expect("session");
         s.windows.insert(idx, wid);
-        let w = self.windows.get_mut(&wid).expect("window");
-        w.index = idx;
-        w.session = sid;
+        self.windows.get_mut(&wid).expect("window").link(sid, idx);
         self.notify("window-linked", None, Some(sid), Some(wid), None);
+        self.sync_group_quiet(sid);
     }
 
     /// Default directory for a new window / session: the client's when it is
@@ -958,7 +1009,7 @@ impl Model {
         sid.and_then(|s| self.sessions.get(&s)).map(|s| s.cwd.clone()).unwrap_or_default()
     }
 
-    fn cwd_arg(&self, a: &Args, f: Option<&Found>, ctx: &CmdContext, host: &dyn Host, default: String) -> String {
+    pub(crate) fn cwd_arg(&self, a: &Args, f: Option<&Found>, ctx: &CmdContext, host: &dyn Host, default: String) -> String {
         match a.get('c') {
             Some(c) => {
                 let c = match f {
@@ -996,8 +1047,9 @@ impl Model {
             wid,
             Window {
                 id: wid,
-                session: sid,
-                index: 0,
+                links: Vec::new(),
+                home: sid,
+                floating: Vec::new(),
                 name: wname,
                 layout,
                 panes: vec![pid],
@@ -1030,11 +1082,6 @@ impl Model {
     // ----- sessions and clients ----------------------------------------
 
     fn cmd_new_session(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        if a.has('E') {
-            // A new session's panes, and an attach, always take the client's
-            // environment: there is no update-environment to skip.
-            return err("new-session -E is not supported: lif has no update-environment option");
-        }
         let client = ctx.client.and_then(|c| self.clients.get(&c)).map(|c| (c.id, c.info.clone(), c.session));
         if a.has('A')
             && let Some(name) = a.get('s')
@@ -1045,9 +1092,22 @@ impl Model {
             if a.has('D') || a.has('X') {
                 self.kick_others(sid, cid, a.has('X'), host);
             }
+            if !a.has('E') {
+                self.update_environment(sid, cid, &*host);
+            }
             self.switch_client(cid, sid, host);
             return ok();
         }
+        // -t: a session in the target's group, with its windows.
+        let group_with = match a.get('t') {
+            Some(t) => {
+                if a.get('n').is_some() || !a.strings(0).is_empty() {
+                    return err("command or window name given with target");
+                }
+                Some(self.find_target(ctx, Some(t), Kind::Session, Flags::default())?.s)
+            }
+            None => None,
+        };
         let detached = a.has('d') || client.is_none();
         if !detached
             && let Some((_, info, _)) = &client
@@ -1122,8 +1182,33 @@ impl Model {
                 size,
                 hooks: Default::default(),
                 environ: Default::default(),
+                group: None,
             },
         );
+        // Before the first pane starts, so that it has them.
+        if !a.has('E')
+            && let Some(c) = ctx.client
+        {
+            self.update_environment(id, c, &*host);
+        }
+        if let Some(t) = group_with {
+            let group = self.sessions[&t].group.clone().unwrap_or_else(|| self.sessions[&t].name.clone());
+            let (windows, current) = (self.sessions[&t].windows.clone(), self.sessions[&t].current);
+            self.sessions.get_mut(&t).expect("target").group = Some(group.clone());
+            for (idx, wid) in &windows {
+                self.windows.get_mut(wid).expect("window").link(id, *idx);
+            }
+            let s = self.sessions.get_mut(&id).expect("session");
+            s.windows = windows;
+            s.current = current;
+            s.group = Some(group);
+            let pid = self.windows[&current].active;
+            self.notify("session-created", ctx.client, Some(id), Some(current), Some(pid));
+            if !detached && let Some((cid, _, _)) = client {
+                self.switch_client(cid, id, host);
+            }
+            return self.print_new(a, NEW_SESSION, id, current, pid, ctx, &*host);
+        }
         let wname = a.get('n').map(|n| format::expand(n, &self.fctx(&*host, Some(id), None, None, ctx.client, ctx.now)));
         let args = a.strings(0);
         let (wid, pid) = match self.spawn_window(id, wname, &args, cwd, size, ctx.client, crate::environ::flag_env(a), host) {
@@ -1164,6 +1249,9 @@ impl Model {
         }
         if a.has('d') || a.has('x') {
             self.kick_others(f.s, cid, a.has('x'), host);
+        }
+        if !a.has('E') {
+            self.update_environment(f.s, cid, &*host);
         }
         self.switch_client(cid, f.s, host);
         ok()
@@ -1255,6 +1343,9 @@ impl Model {
             }
             f.s
         };
+        if !a.has('E') {
+            self.update_environment(target, cid, &*host);
+        }
         self.switch_client(cid, target, host);
         ok()
     }
@@ -1285,11 +1376,6 @@ impl Model {
     }
 
     fn cmd_command_prompt(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        if a.has('i') {
-            // Copy mode's incremental searches (tmux's own -i bindings) are
-            // run by copy mode itself, without this command.
-            return err("command-prompt -i is not supported (incremental prompts work only for copy-mode searches)");
-        }
         let cid = self.attached_client(ctx, a.get('t'))?;
         let mut template = match a.values().first() {
             Some(Arg::Str(s)) => s.clone(),
@@ -1300,7 +1386,14 @@ impl Model {
             let f = self.current_state(ctx, false)?;
             template = self.expand_found(&f, ctx, &*host, &template);
         }
-        let split = |s: Option<&str>| -> Vec<String> { s.map(|s| s.split(',').map(|x| x.to_string()).collect()).unwrap_or_default() };
+        // -l: one prompt and one input, commas and all.
+        let split = |s: Option<&str>| -> Vec<String> {
+            match s {
+                Some(s) if a.has('l') => vec![s.to_string()],
+                Some(s) => s.split(',').map(|x| x.to_string()).collect(),
+                None => Vec::new(),
+            }
+        };
         let mut prompts: Vec<String> = split(a.get('p')).into_iter().map(|p| format!("{p} ")).collect();
         if prompts.is_empty() {
             prompts.push(match a.values().first() {
@@ -1313,10 +1406,25 @@ impl Model {
             let f = self.current_state(ctx, false)?;
             inputs = inputs.iter().map(|i| self.expand_found(&f, ctx, &*host, i)).collect();
         }
-        host.prompt(
-            cid,
-            Prompt::Command { prompts, inputs, template, single_key: a.has('1'), key_name: a.has('k'), numeric: a.has('N') },
-        );
+        // Without -b the commands after it wait until the prompt closes, as
+        // in tmux. (-C changes nothing: panes are always updated.)
+        let job = (!a.has('b')).then(|| self.next_job());
+        let prompt = Prompt::Command {
+            prompts,
+            inputs,
+            template,
+            single_key: a.has('1'),
+            key_name: a.has('k'),
+            numeric: a.has('N'),
+            // A one-key prompt has no text to follow (tmux ignores -i there).
+            incremental: a.has('i') && !a.has('1') && !a.has('k'),
+            backspace_cancels: a.has('e'),
+            job,
+        };
+        host.prompt(cid, prompt);
+        if let Some(id) = job {
+            self.q.block = Some(crate::queue::Block { key: crate::queue::WaitKey::Job(id), then: crate::queue::Then::Nothing, background: false });
+        }
         ok()
     }
 
@@ -1335,7 +1443,12 @@ impl Model {
             }
             None => format!("Confirm '{}'? (y/n) ", command.split_whitespace().next().unwrap_or("")),
         };
-        host.prompt(cid, Prompt::Confirm { prompt, command, default_yes: a.has('y') });
+        // Without -b the commands after it wait for the answer, as in tmux.
+        let job = (!a.has('b')).then(|| self.next_job());
+        host.prompt(cid, Prompt::Confirm { prompt, command, default_yes: a.has('y'), job });
+        if let Some(id) = job {
+            self.q.block = Some(crate::queue::Block { key: crate::queue::WaitKey::Job(id), then: crate::queue::Then::Nothing, background: false });
+        }
         ok()
     }
 
@@ -1407,9 +1520,9 @@ impl Model {
         let default = if a.has('a') { LIST_WINDOWS_ALL } else { LIST_WINDOWS };
         let mut out = String::new();
         for sid in sessions {
-            for wid in self.sessions[&sid].windows.values() {
+            for (idx, wid) in self.sessions[&sid].windows.iter() {
                 let w = &self.windows[wid];
-                let c = self.fctx(&*host, Some(sid), Some(*wid), Some(w.active), ctx.client, ctx.now);
+                let c = self.fctx(&*host, Some(sid), Some(*wid), Some(w.active), ctx.client, ctx.now).at_index(*idx);
                 if let Some(filter) = a.get('f')
                     && !format::is_true(&format::expand(filter, &c))
                 {
@@ -1459,10 +1572,11 @@ impl Model {
         text(out)
     }
 
-    /// Move window `wid` to `idx` in `dst` (another session or the same).
-    fn relink_window(&mut self, wid: WindowId, dst: SessionId, idx: u32, select: bool, host: &mut dyn Host) {
-        let src = self.windows[&wid].session;
-        let old_idx = self.windows[&wid].index;
+    /// Move window `wid`'s link at `old_idx` of `src` to `idx` in `dst`
+    /// (another session or the same). Its other links stay.
+    fn relink_window(&mut self, wid: WindowId, (src, old_idx): (SessionId, u32), dst: SessionId, idx: u32, select: bool, host: &mut dyn Host) {
+        self.windows.get_mut(&wid).expect("window").unlink(src, old_idx);
+        self.sync_group_quiet(src);
         let s = self.sessions.get_mut(&src).expect("session");
         s.windows.remove(&old_idx);
         let was_current = s.current == wid;
@@ -1497,6 +1611,58 @@ impl Model {
         host.redraw(Redraw::Session(dst));
     }
 
+    /// `link-window`: the window also appears at the target index (`-a`,
+    /// `-b`, `-k` as for `move-window`); it is the same window, its panes
+    /// shown in both places.
+    fn cmd_link_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let src = self.find_target(ctx, a.get('s'), Kind::Window, Flags::default())?;
+        let wid = need_window(&src)?;
+        let dst = self.find_target(ctx, a.get('t'), Kind::Window, Flags { window_index: true, ..Flags::default() })?;
+        let (idx, displaced) = self.place_index(&dst, a, Some(wid), "", host)?;
+        if !self.windows.contains_key(&wid) || !self.sessions.contains_key(&dst.s) {
+            return ok();
+        }
+        self.insert_window(dst.s, idx, wid);
+        self.replace_killed(displaced, wid, host);
+        if let Some(sz) = self.desired_size(dst.s, Some(wid)) {
+            self.resize_window(wid, sz, host);
+        }
+        if !a.has('d') {
+            self.select_window(dst.s, wid, host);
+        }
+        host.redraw(Redraw::Session(dst.s));
+        ok()
+    }
+
+    /// `unlink-window`: take one link of a window away; its last one only
+    /// with `-k`, which kills it.
+    fn cmd_unlink_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+        let f = self.find_target(ctx, a.get('t'), Kind::Window, Flags::default())?;
+        let wid = need_window(&f)?;
+        let idx = f.idx.or_else(|| self.windows[&wid].index_in(f.s)).unwrap_or_else(|| self.windows[&wid].index());
+        // Linked only within this session's group (or only here): that is
+        // its last place, as tmux's session_is_linked has it.
+        let group = self.group_members(f.s);
+        let outside = self.windows[&wid].links.iter().filter(|(s, _)| !group.contains(s)).count();
+        let here = self.windows[&wid].links.iter().filter(|(s, _)| *s == f.s).count();
+        if outside == 0 && here <= 1 {
+            if !a.has('k') {
+                return err("window only linked to one session");
+            }
+            self.remove_window(wid, None, host);
+            return ok();
+        }
+        self.windows.get_mut(&wid).expect("window").unlink(f.s, idx);
+        self.notify("window-unlinked", None, Some(f.s), Some(wid), None);
+        self.drop_link(f.s, idx, wid, true, host);
+        if let Some(s) = self.windows.get(&wid).map(|w| w.session())
+            && let Some(sz) = self.desired_size(s, Some(wid))
+        {
+            self.resize_window(wid, sz, host);
+        }
+        ok()
+    }
+
     fn cmd_move_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         if a.has('r') {
             let f = self.find_target(ctx, a.get('t'), Kind::Session, Flags::default())?;
@@ -1511,7 +1677,8 @@ impl Model {
         if !self.windows.contains_key(&wid) || !self.sessions.contains_key(&dst.s) {
             return ok();
         }
-        self.relink_window(wid, dst.s, idx, !a.has('d'), host);
+        let old_idx = src.idx.or_else(|| self.windows[&wid].index_in(src.s)).unwrap_or_else(|| self.windows[&wid].index());
+        self.relink_window(wid, (src.s, old_idx), dst.s, idx, !a.has('d'), host);
         self.replace_killed(displaced, wid, host);
         ok()
     }
@@ -1524,21 +1691,25 @@ impl Model {
             return ok();
         }
         let (ss, sd) = (src.s, dst.s);
-        let (is, id) = (self.windows[&ws].index, self.windows[&wd].index);
+        // The indexes the targets named (a window can be at two).
+        let is = src.idx.or_else(|| self.windows[&ws].index_in(ss)).unwrap_or_else(|| self.windows[&ws].index());
+        let id = dst.idx.or_else(|| self.windows[&wd].index_in(sd)).unwrap_or_else(|| self.windows[&wd].index());
         self.sessions.get_mut(&ss).expect("session").windows.insert(is, wd);
         self.sessions.get_mut(&sd).expect("session").windows.insert(id, ws);
         {
             let w = self.windows.get_mut(&ws).expect("window");
-            w.index = id;
-            w.session = sd;
+            w.unlink(ss, is);
+            w.link(sd, id);
         }
         {
             let w = self.windows.get_mut(&wd).expect("window");
-            w.index = is;
-            w.session = ss;
+            w.unlink(sd, id);
+            w.link(ss, is);
         }
         // tmux keeps the current and last windows as indexes (winlinks), so
         // they now show the other window.
+        self.sync_group_quiet(ss);
+        self.sync_group_quiet(sd);
         let swap = |x: WindowId| if x == ws { wd } else if x == wd { ws } else { x };
         let both = if ss == sd { vec![ss] } else { vec![ss, sd] };
         for sid in both {
@@ -1571,9 +1742,13 @@ impl Model {
 
     // ----- panes ----------------------------------------------------------
 
-    fn cmd_split(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+    pub(crate) fn cmd_split(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let (wid, target) = (need_window(&f)?, need_pane(&f)?);
+        // A floating pane splits into another floating pane, below it (tmux).
+        if self.windows[&wid].is_floating(target) {
+            return self.split_floating(a, ctx, &f, host);
+        }
         let axis = if a.has('h') { Axis::LeftRight } else { Axis::TopBottom };
         let cur = {
             let p = &self.panes[&target];
@@ -1669,7 +1844,7 @@ impl Model {
             for pane in [old, self.marked_pane].into_iter().flatten() {
                 if let Some(w) = self.panes.get(&pane).map(|p| p.window) {
                     host.redraw(Redraw::Window(w));
-                    host.redraw(Redraw::Status(self.windows[&w].session));
+                    self.redraw_status_of(w, host);
                 }
             }
             return ok();
@@ -1699,7 +1874,7 @@ impl Model {
             Some(d) => {
                 let w = &self.windows[&wid];
                 let rec = |id: PaneId| self.panes.get(&id).map(|p| p.active_point).unwrap_or(0);
-                match w.layout.neighbor(p, d, &w.panes, rec) {
+                match w.layout.neighbor(p, d, &w.tiled_panes(), rec) {
                     Some(n) => n,
                     None => return ok(),
                 }
@@ -1718,6 +1893,9 @@ impl Model {
         if a.has('M') {
             // From a mouse key on a border: the drag resizes.
             host.mouse_request(crate::host::MouseRequest::ResizeBorder);
+            return ok();
+        }
+        if !a.has('Z') && self.resize_floating(a, wid, p, host)? {
             return ok();
         }
         if a.has('Z') {
@@ -1773,9 +1951,21 @@ impl Model {
         let keep_zoom = a.has('Z');
         let src_zoomed = self.windows.get_mut(&sw).expect("window").layout.unzoom();
         let dst_zoomed = self.windows.get_mut(&dw).expect("window").layout.unzoom();
+        if sw != dw && (self.windows[&sw].is_floating(sp) || self.windows[&dw].is_floating(dp)) {
+            return err("can't swap a floating pane with a pane of another window");
+        }
         if sw == dw {
             let w = self.windows.get_mut(&sw).expect("window");
+            // Places are swapped: in the layout, and among the floating
+            // panes (a floating pane can trade places with a tiled one).
             w.layout.swap(sp, dp);
+            for f in &mut w.floating {
+                if f.0 == sp {
+                    f.0 = dp;
+                } else if f.0 == dp {
+                    f.0 = sp;
+                }
+            }
             let (i, j) = (w.panes.iter().position(|p| *p == sp).expect("src"), w.panes.iter().position(|p| *p == dp).expect("dst"));
             w.panes.swap(i, j);
         } else {
@@ -1853,7 +2043,9 @@ impl Model {
                 w.name = n;
                 w.options.set("automatic-rename", Value::Flag(false));
             }
-            self.relink_window(sw, dst.s, idx, !a.has('d'), host);
+            let old_idx = src.idx.or_else(|| self.windows[&sw].index_in(src.s)).unwrap_or_else(|| self.windows[&sw].index());
+            let old_s = if self.windows[&sw].index_in(src.s).is_some() { src.s } else { self.windows[&sw].session() };
+            self.relink_window(sw, (old_s, old_idx), dst.s, idx, !a.has('d'), host);
             self.replace_killed(displaced, sw, host);
             let p = self.windows[&sw].active;
             return self.print_new(a, NEW_WINDOW, dst.s, sw, p, ctx, &*host);
@@ -1865,7 +2057,7 @@ impl Model {
         {
             let w = self.windows.get_mut(&sw).expect("window");
             w.layout.unzoom();
-            w.layout.remove(p);
+            w.take_out(p);
             let pos = w.panes.iter().position(|x| *x == p).expect("pane");
             w.last_panes.retain(|x| *x != p);
             if w.active == p {
@@ -1894,8 +2086,9 @@ impl Model {
             wid,
             Window {
                 id: wid,
-                session: dst.s,
-                index: 0,
+                links: Vec::new(),
+                home: dst.s,
+                floating: Vec::new(),
                 name: wname,
                 layout: Layout::new(p, size),
                 panes: vec![p],
@@ -1925,7 +2118,7 @@ impl Model {
     /// `join-pane`: take the source pane out of its window and put it
     /// next to the target pane by splitting that, as `split-window` would
     /// for a new pane. A window left without panes goes away.
-    fn cmd_join_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
+    pub(crate) fn cmd_join_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let dst = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let src = self.find_source(ctx, a.get('s'), Kind::Pane)?;
         let (dw, target) = (need_window(&dst)?, need_pane(&dst)?);
@@ -1960,7 +2153,7 @@ impl Model {
         if !last_of_window {
             let w = self.windows.get_mut(&sw).expect("window");
             w.layout.unzoom();
-            w.layout.remove(p);
+            w.take_out(p);
         }
         let w = self.windows.get_mut(&dw).expect("window");
         w.layout.unzoom();
@@ -2014,12 +2207,9 @@ impl Model {
     fn cmd_pipe_pane(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
         let f = self.find_target(ctx, a.get('t'), Kind::Pane, Flags::default())?;
         let p = need_pane(&f)?;
-        if a.has('I') {
-            return err("pipe-pane -I is not supported: lif pipes a pane's output, not a command's into it");
-        }
         let piping = host.pane_info(p).pipe;
         // The old pipe goes first, whatever comes next (tmux 3.8).
-        host.pipe_pane(p, None, "").map_err(CmdError)?;
+        host.pipe_pane(p, None, "", false, false).map_err(CmdError)?;
         let Some(command) = a.value(0).filter(|c| !c.is_empty()) else { return ok() };
         // -o: a key that toggles; with a pipe open it only closes it.
         if a.has('o') && piping {
@@ -2027,7 +2217,10 @@ impl Model {
         }
         let command = self.expand_found(&f, ctx, &*host, command);
         let cwd = self.default_cwd(ctx, Some(f.s));
-        host.pipe_pane(p, Some(&command), &cwd).map_err(CmdError)?;
+        // -I: the command's output is typed into the pane; -O (the default
+        // without -I): the pane's output goes to the command.
+        let input = a.has('I');
+        host.pipe_pane(p, Some(&command), &cwd, input, a.has('O') || !input).map_err(CmdError)?;
         ok()
     }
 
@@ -2100,10 +2293,11 @@ impl Model {
         let panes = self.windows[&wid].panes.clone();
         if !a.has('k') && panes.iter().any(|p| !self.panes[p].dead) {
             let s = &self.sessions[&f.s].name;
-            return err(format!("respawn window failed: window {s}:{} still active", self.windows[&wid].index));
+            return err(format!("respawn window failed: window {s}:{} still active", self.windows[&wid].index()));
         }
-        let first = panes[0];
-        for p in &panes[1..] {
+        // The first tiled pane stays (a floating one cannot be the last).
+        let first = self.windows[&wid].tiled_panes()[0];
+        for p in panes.iter().filter(|p| **p != first) {
             self.remove_pane(*p, true, host);
         }
         let args = a.strings(0);
@@ -2141,7 +2335,7 @@ impl Model {
         let (wid, p) = (need_window(&f)?, need_pane(&f)?);
         if !self.panes[&p].dead && !a.has('k') {
             let s = &self.sessions[&f.s].name;
-            let widx = self.windows[&wid].index;
+            let widx = self.windows[&wid].index();
             let pidx = self.pane_index(p).unwrap_or(0);
             return err(format!("respawn pane failed: pane {s}:{widx}.{pidx} still active"));
         }
@@ -2212,7 +2406,7 @@ impl Model {
                     Ok(p) => Some(p),
                     Err(e) => {
                         let w = &self.windows[&wid];
-                        match Layout::parse(name, &w.panes, w.size) {
+                        match Layout::parse(name, &w.tiled_panes(), w.size) {
                             Ok(l) => {
                                 let w = self.windows.get_mut(&wid).expect("window");
                                 w.old_layout = Some(std::mem::replace(&mut w.layout, l));
@@ -2782,7 +2976,22 @@ impl Model {
         for s in sids {
             self.recalc_session(s, host);
         }
+        // Scrollbars take (or give back) columns of the panes.
+        if a.value(0).is_some_and(|n| n.starts_with("pane-scrollbars")) {
+            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+            for w in wids {
+                self.sync_window(w, host);
+            }
+        }
         ok()
+    }
+
+    /// Lock one attached client with its session's `lock-command` (also
+    /// what the server does for `lock-after-time`).
+    pub fn lock_client(&mut self, client: ClientId, host: &mut dyn Host) -> Result<(), String> {
+        let session = self.clients.get(&client).and_then(|c| c.session);
+        let command = self.sopt(session, "lock-command").as_str().to_string();
+        host.lock_client(client, &command)
     }
 
     fn cmd_show_options(&mut self, a: &Args, window_flag: bool, ctx: &CmdContext) -> R {
@@ -2816,37 +3025,49 @@ impl Model {
             }
         };
         let mut out = String::new();
-        let mut line = |name: &str, value: String| {
+        let mut one = |name: &str, value: &str| {
             if a.has('v') {
-                out.push_str(&value);
+                out.push_str(value);
             } else {
                 out.push_str(name);
                 out.push(' ');
-                out.push_str(&escape_arg(&value));
+                out.push_str(&escape_arg(value));
             }
             out.push('\n');
         };
+        // An array option (update-environment) shows one line per word,
+        // `name[i] word`, as in tmux.
+        let mut line = |name: &str, value: String, list: bool| {
+            if list {
+                for (i, w) in value.split_whitespace().enumerate() {
+                    one(&format!("{name}[{i}]"), w);
+                }
+            } else {
+                one(name, &value);
+            }
+        };
+        let is_list = |d: &options::Def| matches!(d.kind, options::Kind::List);
         match (only, def) {
             (Some(n), None) => {
                 if let Some(v) = set.user(n) {
-                    line(n, v.to_string());
+                    line(n, v.to_string(), false);
                 } else if !a.has('q') {
                     return err(format!("invalid option: {n}"));
                 }
             }
             (Some(_), Some(d)) => {
                 if let Some(v) = set.get(d.name) {
-                    line(d.name, options::value_text(d, v));
+                    line(d.name, options::value_text(d, v), is_list(d));
                 }
             }
             (None, _) => {
                 for (n, v) in set.iter() {
                     if let Some(d) = options::DEFS.iter().find(|d| d.name == n) {
-                        line(n, options::value_text(d, v));
+                        line(n, options::value_text(d, v), is_list(d));
                     }
                 }
                 for (n, v) in set.user_iter() {
-                    line(n, v.to_string());
+                    line(n, v.to_string(), false);
                 }
             }
         }

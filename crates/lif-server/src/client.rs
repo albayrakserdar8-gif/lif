@@ -33,7 +33,7 @@ use lif_core::{ClientId, ClientView, PaneId, SessionId};
 use lif_input::{CapsProbe, InputEvent, InputParser};
 use lif_proto::{BYTES_HEADER_LEN, Caps, ClientMsg, Decoder, ExitReason, Hello, MAX_BYTES_CHUNK, ServerMsg, encode_output, output_header};
 use lif_render::Renderer;
-use lif_types::{OuterCaps, StyledLine};
+use lif_types::{OuterCaps, PaneFrame, Rect, StyledLine};
 use mio::Token;
 
 use crate::prompt::PromptState;
@@ -112,6 +112,12 @@ pub(crate) struct Attached {
     /// The terminal is not the server's to use (see [`Suspension`]): no
     /// frames, no other output, no reading.
     pub(crate) suspended: Option<Suspension>,
+    /// The borders of the floating panes of its view: pane, rectangle and
+    /// the drawn border (rebuilt with the view).
+    pub(crate) floating: Vec<(PaneId, Rect, PaneFrame)>,
+    /// When the client last typed (or attached, or came back from a lock):
+    /// its session's activity for `lock-after-time`.
+    pub(crate) last_input: Instant,
     /// OSC 52 reads relayed to this terminal, in order.
     pub(crate) clip_reads: VecDeque<(PaneId, u8)>,
     /// Styles of borders and copy-mode overlays (from the options).
@@ -279,6 +285,11 @@ pub(crate) struct ClientRt {
     pub(crate) token: Token,
     pub(crate) dec: Decoder<ClientMsg>,
     pub(crate) hello: Option<Hello>,
+    /// A control-mode client (`Caps::CONTROL`): its state.
+    pub(crate) control: Option<Box<crate::control::Control>>,
+    /// The client's variables that `update-environment` names (when it
+    /// said hello), for `Host::client_env`.
+    pub(crate) update_env: Vec<(String, String)>,
     /// `Stdin` sent for the next command.
     pub(crate) stdin: Option<Vec<u8>>,
     /// Protocol bytes for the socket; `out[out_pos..]` is unsent.
@@ -311,6 +322,8 @@ impl ClientRt {
             token,
             dec: Decoder::new(),
             hello: None,
+            control: None,
+            update_env: Vec::new(),
             out: Vec::new(),
             out_pos: 0,
             want_write: false,
@@ -387,6 +400,28 @@ impl ClientRt {
         }
     }
 
+    /// Protocol text for a control client, as `Output`. Not `important`
+    /// (pane output) is the caller's to bound (see `control.rs`); the rest
+    /// goes out unless even twice the bound is waiting, when the client is
+    /// too slow and is closed.
+    pub(crate) fn send_control(&mut self, bytes: &[u8], important: bool) {
+        if self.closing || bytes.is_empty() {
+            return;
+        }
+        if important && self.control_backlog() > crate::control::CONTROL_BACKLOG_MAX * 2 {
+            log!("client {}: control client too slow, closed", self.id);
+            self.closing = true;
+            return;
+        }
+        self.compact();
+        encode_output(bytes, &mut self.out);
+    }
+
+    /// Bytes waiting for a control client's socket.
+    pub(crate) fn control_backlog(&self) -> usize {
+        self.pending_len()
+    }
+
     /// Queues `msg` for the socket. False if it cannot be encoded (too
     /// large): nothing was queued. Never logs the payload, which can be
     /// megabytes (a Debug dump of it froze the loop for minutes).
@@ -439,7 +474,8 @@ impl ClientRt {
     /// Terminal bytes outside a frame (bell, OSC 52 / 9, mode switches).
     /// Dropped when a stalled client already has [`MAX_EXTRA`] pending.
     pub(crate) fn send_output(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() || self.closing || self.suspended() {
+        // A control client's stream is protocol text only.
+        if bytes.is_empty() || self.closing || self.suspended() || self.control.is_some() {
             return;
         }
         self.compact();
@@ -578,6 +614,7 @@ pub(crate) fn msg_summary(msg: &ServerMsg) -> String {
         ServerMsg::Attached => "Attached".into(),
         ServerMsg::Tty { direct } => format!("Tty({direct})"),
         ServerMsg::Suspended => "Suspended".into(),
+        ServerMsg::Lock { .. } => "Lock".into(),
         ServerMsg::Unknown { type_id } => format!("Unknown({type_id:#x})"),
     }
 }

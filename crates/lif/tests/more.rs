@@ -194,3 +194,69 @@ fn detach_client_p_hangs_up_the_parent() {
     assert!(flag2.exists(), "client did not detach");
     assert!(!flag.exists(), "SIGHUP without -P");
 }
+
+/// A window linked into two sessions (and a session grouped with another)
+/// is one window: what one client types, the other client sees.
+#[test]
+fn linked_window_is_shared_between_sessions() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "a", "-x", "80", "-y", "24"]);
+    env.ok(&["new-session", "-d", "-s", "b", "-x", "80", "-y", "24"]);
+    env.ok(&["link-window", "-s", "a:0", "-t", "b:1"]);
+    env.ok(&["new-session", "-d", "-s", "g", "-t", "a"]);
+    let mut ta = Term::spawn(&env, &["attach", "-t", "a"], Size::new(80, 25));
+    let mut tb = Term::spawn(&env, &["attach", "-t", "b:1"], Size::new(80, 25));
+    ta.wait_text("$");
+    tb.wait_text("[b]");
+    ta.type_str("echo sha''red-$((6*7))\r");
+    ta.wait_text("shared-42");
+    tb.wait_text("shared-42");
+    assert!(tb.screen().contains("1:"), "{}", tb.screen());
+    assert_eq!(env.ok(&["display-message", "-p", "-t", "g:0", "#{window_linked_sessions_list}"]).trim(), "a,b,g");
+    // Killed from one session, it is gone from all; b keeps its own window.
+    env.ok(&["kill-window", "-t", "b:1"]);
+    assert_eq!(env.ok(&["list-sessions", "-F", "#{session_name}"]), "b\n");
+    tb.wait_for("b's own window", std::time::Duration::from_secs(10), |t| t.screen().contains("0:") && !t.screen().contains("shared-42"));
+}
+
+/// A floating pane is drawn over the tiled ones in a box, gets the keys
+/// while it is active, and what it covered is drawn again once it is gone.
+#[test]
+fn floating_pane_is_drawn_over_the_tiled_ones() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24"]);
+    env.wait_capture("f", "$");
+    env.ok(&["send-keys", "-t", "f", "clear; for i in 1 2 3 4 5 6 7 8 9; do echo BEHIND-BEHIND-BEHIND-BEHIND; done", "Enter"]);
+    env.wait_capture("f", "BEHIND");
+    let mut t = Term::spawn(&env, &["attach", "-t", "f"], Size::new(80, 25));
+    t.wait_text("BEHIND");
+    env.ok(&["new-pane", "-t", "f", "-x", "30", "-y", "6", "-X", "4", "-Y", "2"]);
+    t.wait_for("the box", Duration::from_secs(10), |t| t.lines().get(2).is_some_and(|l| l.chars().nth(4) == Some('┌')));
+    let l = t.lines();
+    assert_eq!(l[2].chars().nth(33), Some('┐'), "{}", t.screen());
+    assert_eq!(l[7].chars().nth(4), Some('└'), "{}", t.screen());
+    assert_eq!(env.ok(&["display-message", "-p", "-t", "f", "#{pane_floating_flag} #{pane_width}x#{pane_height}"]), "1 28x4\n");
+    // Keys go to it: it is the active pane.
+    t.wait_for("its prompt", Duration::from_secs(10), |t| t.lines()[3].contains('$'));
+    t.type_str("echo flo''at\r");
+    t.wait_for("its echo", Duration::from_secs(10), |t| t.lines().iter().skip(3).take(4).any(|l| l.contains("float")));
+    // Killed: the tiled pane under it shows again.
+    env.ok(&["kill-pane", "-t", "f"]);
+    t.wait_for("the tiled pane again", Duration::from_secs(10), |t| t.lines()[2].starts_with("BEHIND") && !t.screen().contains('┌'));
+}
+
+/// A pane scrollbar takes the pane's last column: output wraps before it.
+#[test]
+fn scrollbar_takes_the_last_column() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "sb", "-x", "80", "-y", "24"]);
+    env.ok(&["set-option", "-g", "pane-scrollbars", "on"]);
+    let mut t = Term::spawn(&env, &["attach", "-t", "sb"], Size::new(80, 25));
+    t.wait_text("$");
+    t.type_str("clear; printf '%085d\\n' 0\r");
+    t.wait_for("the wrapped line", Duration::from_secs(10), |t| t.lines().iter().any(|l| l.trim_end() == "0".repeat(79)));
+    let l = t.lines();
+    let i = l.iter().position(|l| l.trim_end() == "0".repeat(79)).unwrap();
+    assert!(l[i + 1].starts_with("000000") && !l[i + 1].starts_with("0000000"), "{}", t.screen());
+    assert_eq!(env.ok(&["display-message", "-p", "-t", "sb", "#{pane_width}"]), "79\n");
+}

@@ -45,6 +45,45 @@ fn pipe_pane_copies_output_to_a_command() {
     assert!(env.wait(secs(10), || show(&env, "s:", "#{pane_pipe}") == "0"));
 }
 
+/// -I: what the command prints is typed into the pane; the pipe is over
+/// when the command has exited and all of it was read (even when it exits
+/// before the server reads anything).
+#[test]
+fn pipe_pane_i_types_a_commands_output_into_the_pane() {
+    let env = Env::new();
+    session(&env);
+    env.ok(&["pipe-pane", "-I", "-t", "s:", "echo echo pi''ped-in-$((40+2))"]);
+    env.wait_capture("s:", "piped-in-42");
+    assert!(env.wait(secs(10), || show(&env, "s:", "#{pane_pipe}") == "0"));
+    // Without -O the pane's output does not go to the command.
+    let log = env.home.join("out.log");
+    env.ok(&["pipe-pane", "-I", "-t", "s:", &format!("cat > {}; sleep 300", log.display())]);
+    env.ok(&["send-keys", "-t", "s:", "echo vis''ible", "Enter"]);
+    env.wait_capture("s:", "visible");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    assert_eq!(show(&env, "s:", "#{pane_pipe}"), "1");
+}
+
+/// -I into a program that never reads its input: the server takes what
+/// fits in the pane's input queue (1 MiB) and leaves the rest to the
+/// command, which then waits.
+#[test]
+fn pipe_pane_i_into_a_pane_that_never_reads_is_bounded() {
+    let env = Env::new();
+    session(&env);
+    env.ok(&["new-window", "-d", "-t", "s:", "-n", "deaf", "sleep 300"]);
+    env.ok(&["pipe-pane", "-I", "-t", "s:deaf", "yes"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let rss = rss_kib(env.server_pid());
+    assert!(rss < 60 * 1024, "the server holds {rss} KiB");
+    assert_eq!(show(&env, "s:deaf", "#{pane_pipe}"), "1");
+    // The server still answers, and the rest of the session works.
+    env.ok(&["send-keys", "-t", "s:0", "echo st''ill", "Enter"]);
+    env.wait_capture("s:0", "still");
+    env.ok(&["kill-server"]);
+}
+
 #[test]
 fn pipe_pane_to_a_command_that_never_reads_does_not_hold_the_pane() {
     let env = Env::new();
@@ -58,6 +97,94 @@ fn pipe_pane_to_a_command_that_never_reads_does_not_hold_the_pane() {
     assert!(rss < 200 * 1024, "the server holds {rss} KiB");
     // kill-server ends the command with the pane.
     env.ok(&["kill-server"]);
+}
+
+/// command-prompt -i, -e and the wait without -b, against what tmux 3.8
+/// runs for the same keys.
+#[test]
+fn command_prompt_incremental_backspace_and_wait() {
+    let env = Env::new();
+    session(&env);
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
+    t.wait_text("$");
+    let log = env.home.join("prompt.log");
+    let record = format!("run-shell 'printf \"[%%]\\n\" >> {}'", log.display());
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let client = env.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // -i: runs as it opens, then on every change; Enter only closes it.
+    // (Recorded in an option: run-shell jobs could finish out of order.)
+    let seen = || env.ok(&["show-options", "-gqv", "@seen"]);
+    env.ok(&["command-prompt", "-t", &client, "-b", "-i", "-p", "inc", "set -ga @seen '[%%]'"]);
+    t.wait_text("inc");
+    t.type_str("ab");
+    t.write(b"\x7f");
+    assert!(env.wait(secs(10), || seen() == "[=][=a][=ab][=a]\n"), "{:?}", seen());
+    t.write(b"\r");
+    t.wait_for("the prompt to close", secs(10), |t| !t.screen().contains("inc"));
+    assert_eq!(seen(), "[=][=a][=ab][=a]\n");
+    // -e: BSpace on the empty line cancels.
+    env.ok(&["command-prompt", "-t", &client, "-b", "-e", "-p", "eee", &record]);
+    t.wait_text("eee");
+    t.write(b"\x7f");
+    t.wait_for("the prompt to close", secs(10), |t| !t.screen().contains("eee"));
+    assert_eq!(read(), "");
+    // Without -b the rest of the list waits for the answer (the client that
+    // ran it too).
+    let _ = std::fs::remove_file(&log);
+    let mut waiting = env
+        .command()
+        .args(["command-prompt", "-t", &client, "-p", "blk", &record, ";", "run-shell", &format!("echo AFTER >> {}", log.display())])
+        .spawn()
+        .unwrap();
+    t.wait_text("blk");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(read(), "", "nothing ran before the answer");
+    assert!(waiting.try_wait().unwrap().is_none(), "the client waits for the prompt");
+    t.type_str("m\r");
+    assert!(env.wait(secs(10), || read() == "[m]\nAFTER\n"), "{:?}", read());
+    assert!(waiting.wait().unwrap().success());
+    // Cancelled, the rest still runs.
+    let _ = std::fs::remove_file(&log);
+    let mut waiting = env.command().args(["command-prompt", "-t", &client, "-p", "blk", &record, ";", "run-shell", &format!("echo AFTER >> {}", log.display())]).spawn().unwrap();
+    t.wait_text("blk");
+    t.write(b"\x1b");
+    assert!(env.wait(secs(10), || read() == "AFTER\n"), "{:?}", read());
+    assert!(waiting.wait().unwrap().success());
+}
+
+/// lock-client runs lock-command on the client's terminal and the client
+/// comes back when it exits; lock-after-time does it for an idle session.
+#[test]
+fn lock_client_and_lock_after_time() {
+    let env = Env::new();
+    session(&env);
+    let mut t = Term::spawn(&env, &["attach", "-t", "s:"], Size::new(80, 24));
+    t.wait_text("$");
+    env.ok(&["set-option", "-g", "lock-command", "clear; printf 'LOCKED-%s' $((40+2)); read line"]);
+    let client = env.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    env.ok(&["lock-client", "-t", &client]);
+    t.wait_text("LOCKED-42");
+    assert!(!t.screen().contains("[s]"), "the session is not drawn while locked:\n{}", t.screen());
+    t.write(b"\r");
+    t.wait_text("[s]");
+    // Typing goes to the pane again.
+    t.type_str("echo un''locked\r");
+    t.wait_text("unlocked");
+    // lock-after-time: one idle second.
+    env.ok(&["set-option", "-g", "lock-after-time", "1"]);
+    t.wait_for("the idle lock", secs(10), |t| t.screen().contains("LOCKED-42"));
+    t.write(b"\r");
+    t.wait_text("[s]");
+    env.ok(&["set-option", "-g", "lock-after-time", "0"]);
+    // lock-session and lock-server reach the same clients.
+    env.ok(&["lock-session", "-t", "s"]);
+    t.wait_text("LOCKED-42");
+    t.write(b"\r");
+    t.wait_text("[s]");
+    env.ok(&["lock-server"]);
+    t.wait_text("LOCKED-42");
+    t.write(b"\r");
+    t.wait_text("[s]");
 }
 
 #[test]

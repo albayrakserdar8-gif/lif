@@ -319,6 +319,18 @@ pub enum Prompt {
         key_name: bool,
         /// `-N`: accept only digits.
         numeric: bool,
+        /// `-i`: run the command whenever the text changes, with `%%` as
+        /// `=text` (`+text` for C-s, `-text` for C-r), and once with `=`
+        /// when the prompt opens; Enter and Escape only close it. The
+        /// `inputs` are not typed in: C-s or C-r on an empty line brings
+        /// them back, as in tmux.
+        incremental: bool,
+        /// `-e`: BSpace on an empty line cancels.
+        backspace_cancels: bool,
+        /// Without `-b`: the commands after `command-prompt` wait for the
+        /// prompt to close (answered or not); the server then reports this
+        /// id to [`Model::job_done`](crate::Model::job_done).
+        job: Option<u64>,
     },
     /// `confirm-before`: show `prompt`; on `y` (or Enter when
     /// `default_yes`) parse and run `command` with the client as context;
@@ -330,6 +342,8 @@ pub enum Prompt {
         command: String,
         /// `-y`: Enter means yes.
         default_yes: bool,
+        /// Without `-b`: as for [`Prompt::Command`]'s `job`.
+        job: Option<u64>,
     },
 }
 
@@ -374,6 +388,14 @@ pub trait Host {
     fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
         let _ = client;
         Err("suspend-client: not supported".into())
+    }
+
+    /// `lock-client` and the rest: restore `client`'s terminal and have
+    /// the client run `command` (`lock-command`) on it; it carries on when
+    /// the command exits. An error if the client cannot be locked.
+    fn lock_client(&mut self, client: ClientId, command: &str) -> Result<(), String> {
+        let _ = (client, command);
+        Err("lock-client: not supported".into())
     }
 
     /// Start a shell command. When it has exited and its output is read to
@@ -444,12 +466,13 @@ pub trait Host {
         let _ = pane;
     }
 
-    /// `pipe-pane`: from now on, also write what the program in `pane`
-    /// prints to the standard input of `command` (`/bin/sh -c`, started
-    /// in `cwd`); `None` stops a pipe. A pane has at most one: a new
-    /// command replaces the old.
-    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str) -> Result<(), String> {
-        let _ = (pane, cwd);
+    /// `pipe-pane`: from now on, with `output` also write what the program
+    /// in `pane` prints to the standard input of `command` (`/bin/sh -c`,
+    /// started in `cwd`), and with `input` write what `command` prints to
+    /// `pane` as its input; `None` stops a pipe. A pane has at most one:
+    /// a new command replaces the old.
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str, input: bool, output: bool) -> Result<(), String> {
+        let _ = (pane, cwd, input, output);
         match command {
             Some(c) => Err(format!("{c}: shell commands are not supported here")),
             None => Ok(()),
@@ -494,6 +517,13 @@ pub trait Host {
     /// a message for `reason`. The model has already forgotten the
     /// attachment.
     fn detach_client(&mut self, client: ClientId, reason: DetachReason);
+
+    /// The environment of `client`'s process, for `update-environment`
+    /// (only the variables it may name need to be there).
+    fn client_env(&self, client: ClientId) -> Vec<(String, String)> {
+        let _ = client;
+        Vec::new()
+    }
 
     /// `detach-client -P`, `attach-session -x`: send SIGHUP to the parent
     /// process of `client` (usually its shell, which then exits), after

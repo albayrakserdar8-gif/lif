@@ -14,7 +14,7 @@
 use crate::cmd::{Args, CmdError};
 use crate::format;
 use crate::host::Host;
-use crate::ids::SessionId;
+use crate::ids::{ClientId, SessionId};
 use crate::model::{CmdContext, CmdOutput, Model};
 use crate::target::{Flags, Kind};
 use std::collections::BTreeMap;
@@ -37,6 +37,12 @@ struct Var {
 pub(crate) struct Environ(BTreeMap<String, Var>);
 
 impl Environ {
+    /// Every variable but the hidden ones: its value, or `None` for one
+    /// to be removed.
+    pub(crate) fn entries(&self) -> Vec<(String, Option<String>)> {
+        self.0.iter().filter(|(_, v)| !v.hidden).map(|(k, v)| (k.clone(), v.value.clone())).collect()
+    }
+
     fn overrides(&self) -> impl Iterator<Item = (String, Option<String>)> + '_ {
         self.0.iter().filter(|(_, v)| !v.hidden).map(|(k, v)| (k.clone(), v.value.clone()))
     }
@@ -71,6 +77,32 @@ impl Model {
             v.extend(s.environ.overrides());
         }
         v
+    }
+
+    /// `update-environment`: each variable it names is copied from
+    /// `client`'s environment into `session`'s, or marked to be removed
+    /// when the client has none (tmux's `-NAME`). Run when a session is
+    /// created or a client attaches or switches to it, unless `-E`.
+    pub(crate) fn update_environment(&mut self, session: SessionId, client: ClientId, host: &dyn Host) {
+        let names = self.sopt(Some(session), "update-environment").as_str().to_string();
+        if names.is_empty() {
+            return;
+        }
+        let from = host.client_env(client);
+        let Some(s) = self.sessions.get_mut(&session) else { return };
+        for name in names.split_whitespace() {
+            if name.contains('=') {
+                continue;
+            }
+            let value = from.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            if name.len() + value.as_ref().map_or(0, |v| v.len()) > MAX_ENV_BYTES {
+                continue;
+            }
+            if !s.environ.0.contains_key(name) && s.environ.0.len() >= MAX_ENV_VARS {
+                break;
+            }
+            s.environ.0.insert(name.to_string(), Var { value, hidden: false });
+        }
     }
 
     fn environ_of(&mut self, a: &Args, ctx: &CmdContext) -> Result<&mut Environ, CmdError> {

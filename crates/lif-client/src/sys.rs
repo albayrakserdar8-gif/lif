@@ -119,6 +119,17 @@ pub(crate) fn is_foreground(tty: RawFd) -> bool {
     fg < 0 || fg == unsafe { libc::getpgrp() }
 }
 
+/// A close-on-exec copy of `fd` (the child's stdio gets its own copy).
+pub(crate) fn dup(fd: RawFd) -> io::Result<std::os::fd::OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC on an fd the caller holds.
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if new < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh fd that nothing else owns.
+    Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(new) })
+}
+
 pub(crate) fn isatty(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the fd.
     unsafe { libc::isatty(fd) == 1 }

@@ -1,6 +1,6 @@
 # 0006: on Linux an echo next to a flooding pane takes milliseconds
 
-Status: open. Linux only; found the first time the tests ran on Linux
+Status: fixed (0.5.0). Linux only; found the first time the tests ran on Linux
 (Ubuntu 26.04, kernel 7.0, arm64, 6 CPUs, in a Lima VM on the M-series Mac).
 
 ## What happened
@@ -62,22 +62,66 @@ a thread: with a pane flooding, every turn of its loop finds more to read.
 
 ## Root cause
 
-Unknown.
+Reading the flood is what delays the echo. Every read of the flooded PTY
+frees room, so its program writes more, and the kernel moves that output
+through the tty layer as queued work; the key's echo, and later the frame
+that carries it to the client's terminal, are queued behind it. A thread
+that reads the flood without a break keeps that queue full. (Hypothesis 1
+was close: it is not the CPU the reader runs on but the work its reads
+generate. That is why neither `sched_yield` nor a 1 us sleep helped: the
+loop still read the flood on every turn.)
+
+The Python reproduction, in the VM, with the reader stopping reading the
+flood after the key until the echo arrives (only the typed PTY in epoll):
+
+| after the key | median | p95 | max |
+|---|---|---|---|
+| keep reading the flood (`epoll_wait(0)` loop) | 891 us | 3,516 us | 6,414 us |
+| wait up to 200 us / 1 ms / 5 ms for the echo alone | 18 to 21 us | 74 to 83 us | 91 us |
+
+Blocking in `epoll_wait` with a timeout while the flood stays registered
+changes nothing (about 1 ms): the flood keeps reporting new edges.
 
 ## Fix
 
-None. The test is ignored on Linux with a pointer here, so the rest of the
-Linux run stays meaningful; it still runs on macOS.
+`ECHO_PAUSE` (`crates/lif-server/src/lib.rs`): when a client's input is
+written to a pane (`Rt::write_input`), the server stops reading every
+other pane for 2 ms. A paused pane that becomes readable gets `read_more`
+(the edge is not reported again) and `Server::next_deadline` gives the end
+of the pause instead of a zero timeout. The pause is not ended by the echo:
+ended there, the flood was read again while the echo's frame went to the
+client's terminal, and that frame waited instead (end to end, median
+0.9 to 3.1 ms against 140 to 380 us with the full pause).
+
+The same code runs on macOS, where it was not needed and costs nothing
+measurable. `echo_is_not_paced_next_to_a_flood` runs on Linux again.
 
 ## What is not fixed
 
-The latency itself. Things to try: reading the flood on a schedule (a
-budget per millisecond rather than per turn), `EPOLLEXCLUSIVE` or
-level-triggered reads for panes, a second look with `perf sched` and
-`ftrace` on the tty workqueue, and the same measurement on bare metal
-(a VM's scheduler may be part of it).
+The key's way in: until the server has read the key from the client's
+terminal it does not know it is coming, so that read still waits behind
+the flood. This is what is left in the maximum (3 to 9 ms on Linux).
+Input from the mouse pauses floods too; a program asking for every mouse
+motion can make another pane's flood wait up to 2 ms per motion event.
 
 ## Measured cost
 
-Median echo next to a flooding pane: about 4 ms on Linux in this VM,
-against 40 us on macOS.
+Linux VM (6 CPUs), `echo_is_not_paced_next_to_a_flood`, 3 runs each:
+
+| | test median | max | server key-to-echo-read median / p90 / max |
+|---|---|---|---|
+| before | 2.4 to 4.2 ms | 6.8 to 11 ms | 397 to 867 / 896 to 3,031 / 2,276 to 6,148 us |
+| after | 112 to 119 us | 3.1 to 9.4 ms | 29 / 58 to 81 / 93 to 106 us |
+
+macOS, `bench/run.sh --tools lifbase,lif --only throughput,latency`, the
+0.4.0 commit (`lifbase`) against 0.5.0 in one interleaved run
+(`bench/results/2026-11-19-1539-0.5.0-ab-summary.md`, load average 3.4 to
+1.8): throughput 190.7 / 154.4 / 180.6 MB/s before, 190.7 / 155.3 / 180.5
+after (ASCII / SGR / one line); key echo next to `yes` p50 / p99 39 / 98 us
+before, 23 / 54 us after; idle key echo p50 110 before, 112 after. (A first
+measurement earlier the same day is not valid: the harness measured a stale
+`target/release/lif` instead of the tree, which `bench/run.sh` now builds.)
+
+macOS, same test: median 60 us after (40 to 84 us before; the machine
+load varies more than that). A flood next to someone typing loses at most
+2 ms of reading per key; a flood nobody types next to is not affected.

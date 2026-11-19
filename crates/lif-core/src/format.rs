@@ -369,11 +369,27 @@ fn expand_var(content: &str, cx: &mut Cx, out: &mut String, depth: u32) {
         cx.push_char(out, if is_true(&v) { '0' } else { '1' });
         return;
     }
-    if let Some(rest) = content.strip_prefix("m:") {
+    // #{m:glob,s}, #{m/r:regex,s}, with i for either to ignore case.
+    if let Some(rest) = content.strip_prefix('m')
+        && let Some((flags, rest)) = match rest.strip_prefix(':') {
+            Some(r) => Some(("", r)),
+            // tmux ignores flags it does not know.
+            None => rest.strip_prefix('/').and_then(|r| r.split_once(':')),
+        }
+    {
         let parts = split_args(rest);
         if parts.len() == 2 {
             let (pat, s) = (sub(parts[0], cx, depth), sub(parts[1], cx, depth));
-            cx.push_char(out, if glob(pat.as_bytes(), s.as_bytes()) { '1' } else { '0' });
+            let icase = flags.contains('i');
+            let hit = if flags.contains('r') {
+                // A pattern that does not compile matches nothing, as in tmux.
+                crate::regex::Regex::new(&pat, icase).is_ok_and(|re| re.is_match(&s))
+            } else if icase {
+                glob(pat.to_lowercase().as_bytes(), s.to_lowercase().as_bytes())
+            } else {
+                glob(pat.as_bytes(), s.as_bytes())
+            };
+            cx.push_char(out, if hit { '1' } else { '0' });
         }
         return;
     }
@@ -694,6 +710,17 @@ mod tests {
         assert_eq!(x("#{n:window_name} #{w:window_name}"), "3 3");
         assert_eq!(x("#{s/vi/Vi/:window_name}"), "Vim");
         assert_eq!(x("#{q:pane_title}"), "a\\ very\\ long\\ pane\\ title\\ that\\ goes\\ on");
+    }
+
+    /// `m` with its flags, each answer checked against tmux 3.8.
+    #[test]
+    fn matching() {
+        assert_eq!(x("#{m:v*,#{window_name}}#{m:V*,#{window_name}}#{m/i:V*,#{window_name}}"), "101");
+        assert_eq!(x("#{m/r:^al.*a$,alpha}#{m/r:AL,alpha}#{m/ri:AL,alpha}"), "101");
+        // An empty match counts; a pattern that does not compile matches nothing.
+        assert_eq!(x("#{m/r:a*,bbb}#{m/r:(,x}#{m/r:i,#{window_name}}"), "101");
+        // Unknown flags are ignored.
+        assert_eq!(x("#{m/x:a,a}"), "1");
     }
 
     #[test]

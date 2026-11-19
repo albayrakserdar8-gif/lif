@@ -19,6 +19,7 @@ mod log;
 mod choose;
 mod client;
 mod clock;
+mod control;
 mod frame;
 mod host;
 mod input;
@@ -60,6 +61,16 @@ pub const ECHO_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Output after a key beyond which the pane counts as flooding again.
 pub const ECHO_WINDOW_BYTES: usize = 64 * 1024;
+
+/// How long, after a key was written to a pane, the server stops reading
+/// other panes that are flooding. On Linux every read of a flooded PTY
+/// lets its program write more, and the kernel moves that through the tty
+/// layer on the same work queue as the key's echo and as the frame that
+/// carries it to the client's terminal: read without a break, the flood
+/// keeps both waiting for milliseconds (issues/0006). The pause covers
+/// the echo (tens of microseconds) and its frame; it costs a flood next to
+/// someone typing at most this much per key.
+pub const ECHO_PAUSE: Duration = Duration::from_millis(2);
 
 /// Bytes read from one PTY per loop iteration before other panes and the
 /// clients get their turn.

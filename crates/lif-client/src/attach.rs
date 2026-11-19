@@ -218,6 +218,8 @@ struct Relay {
     suspend: Suspend,
     /// The server sent `Suspended`: stop.
     got_suspended: bool,
+    /// The server sent `Lock`: run this command on the terminal.
+    got_lock: Option<String>,
     /// The SIGCONT that continued our own stop is still in the pipe.
     skip_cont: bool,
     /// Writing to the socket failed with EPIPE / ECONNRESET: the server
@@ -262,6 +264,7 @@ impl Relay {
             tty: TtyUse::Relay,
             suspend: Suspend::Running,
             got_suspended: false,
+            got_lock: None,
             skip_cont: false,
             sock_shut: false,
         }
@@ -323,6 +326,10 @@ impl Relay {
             let asked_too_long = matches!(self.suspend, Suspend::Asked(t) if Instant::now() >= t);
             if std::mem::take(&mut self.got_suspended) || asked_too_long {
                 self.stop(conn, fds, guard)?;
+                continue;
+            }
+            if let Some(command) = self.got_lock.take() {
+                self.lock(&command, conn, fds, guard)?;
                 continue;
             }
             if self.resize_pending && self.sock_pending() < SOCK_HIGH && self.suspend == Suspend::Running {
@@ -432,6 +439,36 @@ impl Relay {
         // Our SIGCONT handler has written to the pipe: it is handled here.
         self.skip_cont = true;
         self.suspend = Suspend::Background;
+        self.resume(conn, fds, guard)
+    }
+
+    /// `Lock`: the terminal is restored; run `lock-command` on it with
+    /// the terminal's modes as the shell left them, wait for it, then take
+    /// the terminal back (`Resume`). Like system(3), SIGINT and SIGQUIT
+    /// (which the terminal sends again now) are ignored here while the
+    /// command runs and get their default action in it.
+    fn lock(&mut self, command: &str, conn: &mut Connection, fds: &TermFds, guard: &mut RawGuard) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let _ = self.flush_sock_until(conn.stream.as_raw_fd(), Instant::now() + HANGUP_FLUSH);
+        guard.leave_raw();
+        let stdio = |fd: RawFd| sys::dup(fd).map(std::process::Stdio::from);
+        let mut c = std::process::Command::new("/bin/sh");
+        c.arg("-c").arg(command).stdin(stdio(fds.input)?).stdout(stdio(fds.output)?).stderr(stdio(fds.output)?);
+        // SAFETY: only async-signal-safe signal(2) calls between fork and exec.
+        unsafe {
+            c.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let ignored = signals::ignore_interrupts();
+        let status = c.status();
+        drop(ignored);
+        if let Err(e) = status {
+            // Nothing locked the terminal: say so where the user looks.
+            let _ = sys::write_all_until(fds.output, format!("lif: lock-command: {e}\r\n").as_bytes(), Instant::now() + HANGUP_FLUSH);
+        }
         self.resume(conn, fds, guard)
     }
 
@@ -575,6 +612,11 @@ impl Relay {
                 // stop, whether we asked (SIGTSTP) or not (suspend-client).
                 ServerMsg::Suspended => {
                     self.got_suspended = true;
+                    return Ok(None);
+                }
+                // The same, then the lock command, then back.
+                ServerMsg::Lock { command } => {
+                    self.got_lock = Some(command);
                     return Ok(None);
                 }
                 _ => {}

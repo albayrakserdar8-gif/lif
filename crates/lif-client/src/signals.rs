@@ -190,6 +190,41 @@ pub(crate) fn reraise(sig: libc::c_int) {
     }
 }
 
+/// SIGINT and SIGQUIT ignored until the guard is dropped, which puts the
+/// previous dispositions back (what system(3) does while it waits).
+pub(crate) struct IgnoreInterrupts([Option<libc::sigaction>; 2]);
+
+const INTERRUPTS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
+
+pub(crate) fn ignore_interrupts() -> IgnoreInterrupts {
+    let mut old = [None; 2];
+    for (i, &sig) in INTERRUPTS.iter().enumerate() {
+        // SAFETY: sigaction structs are plain data initialized by zeroing
+        // and sigemptyset; the pointers are valid for the call.
+        unsafe {
+            let mut ign: libc::sigaction = std::mem::zeroed();
+            ign.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ign.sa_mask);
+            let mut prev: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, &ign, &mut prev) == 0 {
+                old[i] = Some(prev);
+            }
+        }
+    }
+    IgnoreInterrupts(old)
+}
+
+impl Drop for IgnoreInterrupts {
+    fn drop(&mut self) {
+        for (i, &sig) in INTERRUPTS.iter().enumerate() {
+            if let Some(prev) = self.0[i].take() {
+                // SAFETY: prev came from a successful sigaction call.
+                unsafe { libc::sigaction(sig, &prev, std::ptr::null_mut()) };
+            }
+        }
+    }
+}
+
 fn restore(st: &mut Installed) {
     for (i, &sig) in SIGNALS.iter().enumerate() {
         if let Some(old) = st.previous[i].take() {

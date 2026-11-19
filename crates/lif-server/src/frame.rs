@@ -81,7 +81,7 @@ impl Server {
         ids.clear();
         ids.extend(self.rt.clients.values().filter(|c| c.att.is_some()).map(|c| c.id));
         for &id in &ids {
-            let Some(view) = self.model.client_view(id) else { continue };
+            let Some(view) = self.model.client_view_with(id, &self.rt) else { continue };
             let mouse = self.model.option_text("mouse", Some(view.session), None).as_deref() == Some("on");
             let (theme, msg_style) = self.theme(view.session, view.active_pane);
             let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { continue };
@@ -94,6 +94,18 @@ impl Server {
                 a.msg_style = msg_style;
                 a.status_stale = true;
             }
+            // Floating panes' borders, in the border styles (active or not).
+            let floating: Vec<(PaneId, Rect, PaneFrame)> = view
+                .floating
+                .iter()
+                .map(|(p, r)| {
+                    let name = if *p == view.active_pane { "pane-active-border-style" } else { "pane-border-style" };
+                    let style = self.model.pane_option_text(*p, name).map(|s| lif_core::parse_style(&s)).unwrap_or_default();
+                    (*p, *r, crate::overlay::box_frame(r.size(), lif_core::BorderLines::Single, "", style, Style::default()))
+                })
+                .collect();
+            let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { continue };
+            a.floating = floating;
             let mut view = view;
             // A popup's terminal is one more pane of the view, on top.
             if let Some(crate::overlay::Overlay::Popup(p)) = &a.overlay {
@@ -255,11 +267,24 @@ impl Server {
     }
 
     pub(crate) fn frame_tick(&mut self, now: Instant) {
+        // Scrollbars follow the history and copy mode's scrolling.
+        for c in self.rt.clients.values() {
+            let Some(view) = c.att.as_ref().and_then(|a| a.view.as_ref()) else { continue };
+            for (p, r, style, _) in &view.scrollbars {
+                if let Some(pr) = self.rt.panes.get_mut(p) {
+                    pr.update_scrollbar(r.size(), *style);
+                }
+            }
+        }
         let mut due = std::mem::take(&mut self.due);
         due.clear();
         {
             let panes = &self.rt.panes;
             for (id, c) in self.rt.clients.iter_mut() {
+                // A control client has no terminal to draw on.
+                if c.control.is_some() {
+                    continue;
+                }
                 // A suspended client's terminal is not ours to draw on.
                 let pending = c.out_pending() || c.closing || c.suspended();
                 let Some(a) = c.att.as_mut() else { continue };
@@ -567,6 +592,37 @@ fn draw_client(
         for (i, (pid, rect)) in view.panes.iter().enumerate() {
             let Some(p) = panes.get(pid) else { continue };
             let Some(rect) = clip(*rect, size) else { continue };
+            // A floating pane: its border under it, over what is behind.
+            if let Some((_, r, f)) = a.floating.iter().find(|x| x.0 == *pid)
+                && let Some(r) = clip(*r, size)
+            {
+                sp.push(ScenePane {
+                    id: crate::overlay::BORDER_SCENE_ID + 1 + pid.0 as u64,
+                    rect: r,
+                    frame: f,
+                    active: false,
+                    selection: None,
+                    matches: &[],
+                    indicator: None,
+                    base: Style::default(),
+                });
+            }
+            // Its scrollbar, beside it (so under whatever floats above).
+            if let Some((_, r, _, _)) = view.scrollbars.iter().find(|x| x.0 == *pid && !x.3)
+                && let Some((_, f)) = p.scrollbar.as_ref()
+                && let Some(r) = clip(*r, size)
+            {
+                sp.push(ScenePane {
+                    id: crate::overlay::BORDER_SCENE_ID + (1 << 33) + pid.0 as u64,
+                    rect: r,
+                    frame: f,
+                    active: false,
+                    selection: None,
+                    matches: &[],
+                    indicator: None,
+                    base: Style::default(),
+                });
+            }
             if let Some(pp) = popup.filter(|pp| pp.pane == *pid) {
                 // The popup: its border first, its terminal over that,
                 // and the cursor is its program's.
@@ -612,6 +668,22 @@ fn draw_client(
                 indicator,
                 base: p.base_style,
             });
+            // A modal scrollbar is over the pane's own columns: after it.
+            if let Some((_, r, _, _)) = view.scrollbars.iter().find(|x| x.0 == *pid && x.3)
+                && let Some((_, f)) = p.scrollbar.as_ref()
+                && let Some(r) = clip(*r, size)
+            {
+                sp.push(ScenePane {
+                    id: crate::overlay::BORDER_SCENE_ID + (1 << 33) + pid.0 as u64,
+                    rect: r,
+                    frame: f,
+                    active: false,
+                    selection: None,
+                    matches: &[],
+                    indicator: None,
+                    base: Style::default(),
+                });
+            }
         }
         if let Some(crate::overlay::Overlay::Menu(m)) = &a.overlay
             && let Some(r) = clip(m.state.rect, size)

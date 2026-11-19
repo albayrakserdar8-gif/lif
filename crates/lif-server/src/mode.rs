@@ -192,6 +192,11 @@ pub trait PaneMode {
     /// Read-only output (view mode): q and Escape leave.
     fn is_view(&self) -> bool;
     fn overlays(&self) -> &Overlays;
+    /// `(offset, history)` of a mode that scrolls the history (copy mode):
+    /// rows scrolled up from the bottom, rows of history. For scrollbars.
+    fn position(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// What to draw instead of the pane's terminal, if anything.
     fn frame(&self) -> Option<&PaneFrame>;
     /// After a frame tick, like `PaneFrame::clear_dirty` on the pane's own.
@@ -306,6 +311,10 @@ impl CopyPane {
 }
 
 impl PaneMode for CopyPane {
+    fn position(&self) -> Option<(usize, usize)> {
+        Some(self.copy.position())
+    }
+
     fn key(&mut self, key: &KeyEvent, ctx: &mut ModeCtx<'_>) -> ModeAction {
         self.run(ctx, |c, v| c.handle_key(key, v)).into()
     }

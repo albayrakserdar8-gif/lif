@@ -1,6 +1,85 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.5.0 (unreleased)
+
+- Fixed: an exiting server kept its socket until its panes had died (up
+  to 500 ms), so a client arriving meanwhile had its connection dropped.
+  The socket now goes first, and a new server starts as soon as the old
+  one lets go of its lock (issues/0004, now explained).
+- Fixed on Linux: a key's echo next to a pane flooding output took about
+  4 ms (median). After a key the server now stops reading other panes for
+  up to 2 ms (`ECHO_PAUSE`), since reading a flood keeps the kernel's tty
+  work queue busy in front of the echo; the median is about 115 us and
+  `echo_is_not_paced_next_to_a_flood` runs on Linux again (issues/0006).
+  On macOS the same echo went from 39 to 23 us (p50).
+- The README's benchmark table is re-measured with 0.5.0
+  (`bench/results/2026-11-19-1543-0.5.0-summary.md`); an A/B run against
+  0.4.0 is in `bench/results/2026-11-19-1539-0.5.0-ab-summary.md`.
+- Fixed: `bench/run.sh` measured whatever `target/release/lif` held (a
+  build that called itself 0.3.0 for the 0.4.0 table); it now builds lif into
+  `target-bench` and measures that.
+- `find-window -r` (a regular expression, with copy-mode search's
+  syntax) and the format matches `#{m/r:regex,s}`, `#{m/i:glob,s}`
+  and `#{m/ri:...}`, as in tmux. The regular expression engine moved
+  from `lif-copy` to `lif-core` (`lif_copy::regex` still names it).
+- `pipe-pane -I`: what the command prints is typed into the pane (with
+  `-O` as well, both ways). Read only while the pane's input queue has
+  room, so a program that does not read its input makes the command wait,
+  not the server. A pipe now closes once its command has exited and all it
+  printed was read.
+- `command-prompt` has all of tmux's flags: `-i` (runs the command as
+  the text changes, with `=text`, `+text` for C-s and `-text` for C-r),
+  `-e` (BSpace on an empty line cancels), `-l` (no splitting at commas),
+  `-b` and `-C`. Changed, as in tmux: without `-b` the commands after
+  `command-prompt` or `confirm-before` wait until the prompt closes (after
+  the answer's commands, their own waits included), and so does a client
+  that ran them.
+- `update-environment` (86 tmux options now), with tmux's default list,
+  and `-E` of `new-session`, `attach-session` and `switch-client`: the
+  variables it names are copied from the client into the session's
+  environment (`show-environment` lists them; one the client lacks is
+  `-NAME`). A list option, shown as `update-environment[0] DISPLAY`...;
+  in `config.toml` a TOML array. The client now sends its environment in
+  `Hello` (at most 512 variables); the server keeps only
+  `ENV_ALLOW_LIST` and what `update-environment` names.
+- Locking: `lock-client`, `lock-session`, `lock-server` and the options
+  `lock-command` and `lock-after-time` (88 tmux options, 85 of the 92
+  commands now). A locked client restores its terminal, runs
+  `lock-command` on it and comes back when that exits. New in the
+  protocol for it: `ServerMsg::Lock` and `Caps::LOCK` (an older client
+  cannot be locked and says so). `lock-after-time` is a deadline that
+  exists only while some session has the option set.
+- `customize-mode` (`C-b C`, 86 of the 92 commands): tmux's headings
+  (options by scope, hooks, environments, key tables), Enter edits the
+  selected setting on the status line, `d` / `u` put the default back,
+  and the mode stays up with the new value. The preview shows the scope
+  and value of an option, not tmux's description.
+- Linked windows and session groups (88 of the 92 commands): `link-window`,
+  `unlink-window`, `new-session -t`. A window can now be in several
+  sessions (and at two indexes of one); its panes show wherever it is,
+  `kill-window` removes it everywhere, it takes the size the clients of
+  all its sessions ask for, and alerts reach all of them. Group members
+  share their window list. Real values for `window_linked`,
+  `window_linked_sessions[_list]` and the `session_group*` formats.
+  Model interface: `Window::links`, `Window::index_in`.
+- Control mode: `lif -C` and `-CC` speak tmux's control-mode protocol
+  (command answers in `%begin`/`%end`/`%error`, `%output`, and the
+  session, window and layout notifications), with `refresh-client -C`.
+  Pane output waits for a slow control client up to 1 MiB, then is
+  paused (`%pause`/`%continue`). New in the protocol: `Caps::CONTROL`;
+  in the model, `ControlEvent`, `Model::set_control_events` and
+  `ClientInfo::control`.
+- Floating panes (90 of the 92 commands): `new-pane` and `move-pane`
+  with tmux's sizes, positions and depth, drawn in a box over the tiled
+  panes; `resize-pane`, `split-window`, `swap-pane` and the mouse know
+  them; `#{pane_floating_flag}`. Not yet: modal panes, `-A`, dragging,
+  the `move` table. Model interface: `Window::floating`,
+  `ClientView::floating`.
+- Pane scrollbars: `pane-scrollbars` (`on`, `modal`),
+  `pane-scrollbars-position`, `pane-scrollbars-style` (91 tmux options).
+  `ClientView::scrollbars`, `Model::client_view_with`.
+
+## 0.4.0
 
 - Mouse keys: what the mouse does outside copy mode is bound in the root
   table under tmux 3.8's names (`MouseDown1Pane`, `MouseDrag1Border`,

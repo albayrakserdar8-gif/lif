@@ -10,6 +10,41 @@ use lif_vt::VtEngine;
 
 use crate::mode::{Engine, ModeCtx, PaneMode};
 
+/// What a scrollbar shows: its size, the history and how far it is
+/// scrolled up, and its style.
+pub(crate) type ScrollbarKey = (lif_types::Size, usize, usize, lif_types::Style);
+
+impl PaneRt {
+    /// Bring the scrollbar frame up to date for a bar of `size` in `style`
+    /// (`bg`: the track, `fg`: the part of the history on screen).
+    pub(crate) fn update_scrollbar(&mut self, size: lif_types::Size, style: lif_types::Style) {
+        let (offset, history) = self.mode.as_deref().and_then(|m| m.position()).unwrap_or((0, self.engine.scrollback_rows()));
+        let key = (size, history, offset, style);
+        if self.scrollbar.as_ref().is_some_and(|s| s.0 == key) {
+            return;
+        }
+        let rows = size.rows.max(1) as usize;
+        let total = history + rows;
+        let len = (rows * rows / total.max(1)).clamp(1, rows);
+        let top = history.saturating_sub(offset);
+        let pos = (top * rows / total.max(1)).min(rows - len);
+        let track = lif_types::Style { bg: style.bg, ..lif_types::Style::default() };
+        let slider = lif_types::Style { bg: style.fg, ..lif_types::Style::default() };
+        let mut f = PaneFrame::new(size);
+        for (y, row) in f.rows.iter_mut().enumerate() {
+            let s = if y >= pos && y < pos + len { slider } else { track };
+            for c in row.cells.iter_mut() {
+                *c = lif_types::Cell { style: s, ..lif_types::Cell::BLANK };
+            }
+        }
+        self.scrollbar = Some((key, f));
+    }
+}
+
+/// Most output a pane copies for control clients between two drains (the
+/// server drains after every read, so this bounds one read turn).
+pub(crate) const TAP_MAX: usize = 1024 * 1024;
+
 /// Bytes waiting for a pane's program. A PTY takes about 1 KiB before
 /// EAGAIN, so writes are always partial-write aware.
 #[derive(Default)]
@@ -91,6 +126,12 @@ pub(crate) struct PaneRt {
     pub(crate) mode: Option<Box<dyn PaneMode>>,
     /// `pipe-pane`: the command that also gets the pane's output.
     pub(crate) pipe: Option<crate::pipe::PanePipe>,
+    /// A copy of what was read, for control clients' `%output` (only while
+    /// one is connected); at most [`TAP_MAX`] between two drains.
+    pub(crate) tap: Option<Vec<u8>>,
+    /// Its scrollbar as last drawn: what it showed (size, history, offset,
+    /// style) and the cells. Rebuilt only when that changes.
+    pub(crate) scrollbar: Option<(ScrollbarKey, PaneFrame)>,
     /// The mode's search runs: step it once per loop turn.
     pub(crate) searching: bool,
     /// Who started the mode's current search (its messages go there).
@@ -176,6 +217,8 @@ impl PaneRt {
             output_seen: false,
             mode: None,
             pipe: None,
+            tap: None,
+            scrollbar: None,
             searching: false,
             search_client: None,
             search_rows: lif_copy::DEFAULT_SEARCH_STEP_ROWS,
@@ -275,6 +318,10 @@ impl PaneRt {
                 }
                 if let Some(pipe) = self.pipe.as_mut() {
                     pipe.push(&buf[..filled]);
+                }
+                if let Some(tap) = self.tap.as_mut() {
+                    let take = filled.min(TAP_MAX.saturating_sub(tap.len()));
+                    tap.extend_from_slice(&buf[..take]);
                 }
                 res.bytes += filled;
             }

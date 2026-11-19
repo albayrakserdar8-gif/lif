@@ -199,6 +199,25 @@ allow-passthrough = "off"
 # See docs/claude-code.md.
 tmux-compat = false
 
+# Pane scrollbars: "off", "on" (beside each pane, taking its columns) or
+# "modal" (over the pane while it is in copy mode). The style's bg is the
+# track, fg the part of the history on screen; width and pad in columns.
+pane-scrollbars = "off"
+pane-scrollbars-position = "right"
+pane-scrollbars-style = "bg=brightblack,fg=white,width=1,pad=0"
+
+# Lock an idle session after this many seconds (0: never): its clients run
+# lock-command on their terminal and come back when it exits. lock-client,
+# lock-session and lock-server (C-b has no key for them) do it at once.
+lock-after-time = 0
+lock-command = "lock -np"
+
+# Variables copied from the client's environment into a session's (and so
+# into its new panes) when the client creates it, attaches or switches to
+# it (not with -E); ones the client does not have are removed. tmux's list.
+# (COLORTERM, LANG, SSH_AUTH_SOCK and a few more reach new panes anyway.)
+update-environment = ["DISPLAY", "KRB5CCNAME", "MSYSTEM", "SSH_ASKPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_CONNECTION", "WINDOWID", "XAUTHORITY"]
+
 # ---------------------------------------------------------- status line -----
 
 [status]

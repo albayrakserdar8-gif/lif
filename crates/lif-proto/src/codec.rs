@@ -279,6 +279,7 @@ impl ServerMsg {
                 put_bytes(o, stdout);
                 put_bytes(o, stderr);
             }),
+            ServerMsg::Lock { command } => frame(out, type_id::LOCK, |o| put_bytes(o, command.as_bytes())),
             ServerMsg::Unknown { .. } => Err(ProtoError::NotEncodable),
         }
     }
@@ -310,6 +311,7 @@ impl ServerMsg {
                 stdout: r.opt(|r| r.bytes().map(<[u8]>::to_vec))?,
                 stderr: r.opt(|r| r.bytes().map(<[u8]>::to_vec))?,
             },
+            type_id::LOCK => ServerMsg::Lock { command: r.opt(Reader::string)? },
             _ => ServerMsg::Unknown { type_id },
         })
     }

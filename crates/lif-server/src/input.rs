@@ -22,8 +22,14 @@ pub(crate) const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration:
 
 impl Server {
     pub(crate) fn client_input(&mut self, id: ClientId, bytes: &[u8], now: Instant) {
+        // A control client sends command lines, not keys.
+        if self.rt.clients.get(&id).is_some_and(|c| c.control.is_some()) {
+            self.control_input(id, bytes);
+            return;
+        }
         let esc = self.rt.escape_time;
         let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) else { return };
+        a.last_input = now;
         let mut events = std::mem::take(&mut a.events);
         a.parser.feed(bytes, &mut events);
         // A lone ESC (legacy keyboard only) waits escape-time for the rest
@@ -223,6 +229,22 @@ impl Server {
                 PromptAction::Cancel => self.rt.needs_frame(id),
                 PromptAction::Run(s) => {
                     self.rt.needs_frame(id);
+                    // The commands that wait for the prompt (no -b) go on
+                    // when the answer's have ended, their waits included,
+                    // as in tmux.
+                    self.release_after = p.take_job();
+                    drop(p);
+                    self.run_string(id, &s);
+                    // Not taken (the answer did not parse): release it now.
+                    if let Some(job) = self.release_after.take() {
+                        self.rt.prompts_done.borrow_mut().push(job);
+                    }
+                }
+                PromptAction::RunKeep(s) => {
+                    if let Some(a) = self.rt.clients.get_mut(&id).and_then(|c| c.att.as_mut()) {
+                        a.prompt = Some(p);
+                        a.needs_frame = true;
+                    }
                     self.run_string(id, &s);
                 }
                 PromptAction::CopyChanged(pane, text) => {
@@ -932,7 +954,14 @@ impl Server {
             }
             return;
         }
-        let hit = view.panes.iter().find(|(_, r)| r.contains(x, y)).map(|(p, r)| (*p, *r));
+        // The top one: floating panes are last, front last. A click on a
+        // floating pane's border counts as on the pane.
+        let hit = view
+            .panes
+            .iter()
+            .rev()
+            .find(|(p, r)| r.contains(x, y) || view.floating.iter().any(|(fp, fr)| fp == p && fr.contains(x, y)))
+            .map(|(p, r)| (*p, *r));
         let Some((pane, rect)) = hit else {
             // On a border.
             if mouse_opt && let Some(event) = pressed {
@@ -957,6 +986,13 @@ impl Server {
         };
         let active = view.active_pane;
         let window = view.window;
+        // On a floating pane's border: it is selected, nothing more.
+        if !rect.contains(x, y) {
+            if m.action == MouseAction::Press && pane != active && mouse_opt {
+                self.run_string(id, &format!("select-pane -t {pane}"));
+            }
+            return;
+        }
         let local = MouseEvent { cell: Pos { x: x - rect.x, y: y - rect.y }, ..*m };
         let at = lif_core::MouseAt { pane: Some(pane), window: Some(window), screen: (x, y), cell: (local.cell.x, local.cell.y), status_x: None };
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
@@ -1358,12 +1394,13 @@ impl Server {
         }
     }
 
-    /// Attached clients whose session contains `pane`.
+    /// Attached clients whose session contains `pane` (its window may be
+    /// linked into several).
     fn clients_of_pane(&self, pane: PaneId) -> Vec<ClientId> {
-        let Some(sid) = self.model.pane(pane).and_then(|p| self.model.window(p.window())).map(|w| w.session()) else {
+        let Some(w) = self.model.pane(pane).and_then(|p| self.model.window(p.window())) else {
             return Vec::new();
         };
-        self.rt.clients.values().filter(|c| c.att.as_ref().is_some_and(|a| a.session == sid)).map(|c| c.id).collect()
+        self.rt.clients.values().filter(|c| c.att.as_ref().is_some_and(|a| w.index_in(a.session).is_some())).map(|c| c.id).collect()
     }
 
     /// OSC 52 from a pane, or a copy from a mode (`own`, already stored

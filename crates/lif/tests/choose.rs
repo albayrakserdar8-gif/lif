@@ -196,3 +196,30 @@ fn tree_marks_swaps_windows_and_shows_help() {
     t.write(b"q");
     assert!(env.wait(secs(10), || show(&env, "#{pane_in_mode}") == "0"));
 }
+
+/// customize-mode (C-b C): headings, a setting edited on the status line,
+/// the mode still up afterwards with the new value.
+#[test]
+fn customize_mode_edits_an_option() {
+    let env = Env::new();
+    env.ok(&["new-session", "-d", "-s", "s", "-x", "100", "-y", "40"]);
+    let mut t = Term::spawn(&env, &["attach", "-t", "s"], Size::new(100, 41));
+    t.wait_text("$");
+    t.write(b"\x02C");
+    t.wait_text("+ Window & Pane Options");
+    t.wait_text("+ Key Table - prefix");
+    t.write(b"\x1b[B\x1b[C");
+    t.wait_text("base-index: 0");
+    // Down to base-index (the second option of the session's).
+    t.write(b"\x1b[B\x1b[B");
+    t.wait_text("This is a session option.");
+    t.write(b"\r");
+    t.wait_text("(base-index) 0");
+    t.write(b"\x7f7\r");
+    t.wait_text("base-index: 7");
+    assert_eq!(env.ok(&["show-options", "-gv", "base-index"]), "7\n");
+    t.write(b"d");
+    t.wait_text("base-index: 0");
+    t.write(b"q");
+    t.wait_for("the mode to close", std::time::Duration::from_secs(10), |t| !t.screen().contains("Session Options"));
+}

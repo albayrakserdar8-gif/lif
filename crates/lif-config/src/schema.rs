@@ -36,6 +36,9 @@ pub(crate) enum Kind {
     Bytes,
     /// A style table or tmux style string.
     Style,
+    /// A list of words (tmux's array options): a TOML array of strings, or
+    /// one string of words separated by spaces.
+    List,
 }
 
 /// One setting of the file and the lif option it sets.
@@ -107,12 +110,18 @@ pub(crate) static TOP: &[Opt] = &[
     o("repeat-time", "repeat-time", Int),
     o("scrollback", "scrollback-bytes", Bytes),
     srv("set-clipboard", Choice(&["off", "external", "on"])),
+    o("lock-after-time", "lock-after-time", Int),
+    o("lock-command", "lock-command", Str),
+    o("pane-scrollbars", "pane-scrollbars", Choice(&["off", "modal", "on"])),
+    o("pane-scrollbars-position", "pane-scrollbars-position", Choice(&["right", "left"])),
+    o("pane-scrollbars-style", "pane-scrollbars-style", Str),
     o("set-titles", "set-titles", Bool),
     o("silence-action", "silence-action", Choice(&["none", "any", "current", "other"])),
     o("set-titles-string", "set-titles-string", Str),
     o("synchronize-panes", "synchronize-panes", Bool),
     o("tiled-layout-max-columns", "tiled-layout-max-columns", Int),
     srv("tmux-compat", Bool),
+    o("update-environment", "update-environment", List),
     o("visual-activity", "visual-activity", Choice(&["off", "on", "both"])),
     o("visual-bell", "visual-bell", Choice(&["off", "on", "both"])),
     o("visual-silence", "visual-silence", Choice(&["off", "on", "both"])),
@@ -514,6 +523,18 @@ impl Tr<'_> {
                 let bools = if list.contains(&"off") && list.contains(&"on") { "true, false or " } else { "" };
                 e(format!("expected {bools}one of: {}, found {got}", list.join(", ")))
             }
+            (List, DeValue::String(s)) => Ok(s.split_whitespace().collect::<Vec<_>>().join(" ")),
+            (List, DeValue::Array(a)) => {
+                let mut words = Vec::new();
+                for item in a.iter() {
+                    match item.get_ref() {
+                        DeValue::String(s) if !s.is_empty() && !s.contains(char::is_whitespace) => words.push(s.to_string()),
+                        other => return Err((item.span().start, format!("expected a name without spaces, found {}", describe(other)))),
+                    }
+                }
+                Ok(words.join(" "))
+            }
+            (List, _) => e(format!("expected a list of names such as [\"DISPLAY\", \"SSH_AUTH_SOCK\"], found {got}")),
             (Style, DeValue::String(s)) => style::check_string(s).map(|_| s.to_string()).map_err(|m| (at, m)),
             (Style, DeValue::Table(t)) => style_table(t),
             (Style, _) => e(format!("expected a style table such as {{ fg = \"black\", bg = \"green\" }} or a tmux style string, found {got}")),
@@ -831,7 +852,12 @@ mod tests {
         for cmd in ["show-options -g", "show-options -s", "show-options -gw"] {
             let list = parse_string(cmd).unwrap();
             let out = m.execute_list(&list, &CmdContext::none(WallClock::new(0, 0)), &mut NullHost).unwrap().stdout;
-            names.extend(out.lines().filter_map(|l| l.split(' ').next()).map(|s| s.to_string()));
+            // (An array option shows as name[0], name[1]...)
+            for name in out.lines().filter_map(|l| l.split(' ').next()).map(|s| s.split('[').next().unwrap_or(s).to_string()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
         }
         assert!(names.len() > 40, "{names:?}");
         names

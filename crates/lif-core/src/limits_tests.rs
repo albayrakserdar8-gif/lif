@@ -175,7 +175,7 @@ fn delays_are_bounded() {
     let mut t = M::new();
     t.m.client_connect(
         ClientId(1),
-        ClientInfo { name: "/dev/ttys001".into(), term: "xterm".into(), size: Size::new(80, 25), cwd: "/".into(), pid: 9, terminal: true },
+        ClientInfo { name: "/dev/ttys001".into(), term: "xterm".into(), size: Size::new(80, 25), cwd: "/".into(), pid: 9, terminal: true, control: false },
     );
     t.ctx = CmdContext { client: Some(ClientId(1)), ..CmdContext::none(NOW) };
     t.ok("attach -t a");

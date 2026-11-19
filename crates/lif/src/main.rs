@@ -21,7 +21,7 @@ use std::process::exit;
 use lif_client::{CommandOutcome, attach_loop, connect_with, hello_from_env, resolve_socket_path, run_command, secure_dir};
 use lif_proto::{ExitReason, Hello};
 
-const USAGE: &str = "usage: lif [-2uvV] [-f file] [-L socket-name] [-S socket-path] [command [flags]]";
+const USAGE: &str = "usage: lif [-2CuvV] [-f file] [-L socket-name] [-S socket-path] [command [flags]]";
 
 /// The tmux version lif's commands follow, for `tmux -V`.
 const TMUX_VERSION: &str = "3.8";
@@ -34,6 +34,8 @@ struct Cli {
     /// `-f`: the configuration file a server started now reads.
     config: Option<PathBuf>,
     verbose: bool,
+    /// `-C` given once (1) or twice (2, `-CC`): control mode.
+    control: u8,
     argv: Vec<String>,
 }
 
@@ -43,7 +45,7 @@ fn usage() -> ! {
 }
 
 fn parse_cli(args: Vec<String>, as_tmux: bool) -> Cli {
-    let mut cli = Cli { as_tmux, socket: None, label: None, config: None, verbose: false, argv: Vec::new() };
+    let mut cli = Cli { as_tmux, socket: None, label: None, config: None, verbose: false, control: 0, argv: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -67,6 +69,7 @@ fn parse_cli(args: Vec<String>, as_tmux: bool) -> Cli {
                     exit(0);
                 }
                 'v' => cli.verbose = true,
+                'C' => cli.control = cli.control.saturating_add(1).min(2),
                 // tmux's -2 (256 colors) and -u (UTF-8) are always on in lif.
                 '2' | 'u' => {}
                 f @ ('S' | 'L' | 'f') => {
@@ -136,8 +139,15 @@ fn socket_path(cli: &Cli) -> io::Result<PathBuf> {
 
 /// `Hello` for this process, plus the pane we run in when `$LIF` names
 /// this server (so `lif split-window` inside a pane splits that pane).
-fn hello(socket: &Path) -> Hello {
+fn hello(socket: &Path, control: bool) -> Hello {
     let mut h = hello_from_env();
+    if control {
+        // No terminal: the server neither draws for it nor reads keys from
+        // it, and its size counts only after refresh-client -C.
+        h.caps = lif_proto::Caps(lif_proto::Caps::CONTROL.0 | lif_proto::Caps::OUTPUT_STREAM.0);
+        h.size = Default::default();
+        h.pixels = Default::default();
+    }
     for (var, pane_var) in [("LIF", "LIF_PANE"), ("TMUX", "TMUX_PANE")] {
         if let (Ok(env), Ok(pane)) = (std::env::var(var), std::env::var(pane_var)) {
             let sock = env.split(',').next().unwrap_or("");
@@ -354,7 +364,7 @@ fn main() {
     let connect = || {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            match connect_with(&socket, hello(&socket)) {
+            match connect_with(&socket, hello(&socket, cli.control > 0)) {
                 Err(e)
                     if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
                         && std::time::Instant::now() < end =>
@@ -414,6 +424,13 @@ fn main() {
             let _ = io::stderr().write_all(&stderr);
             exit(status);
         }
+        Ok(CommandOutcome::Attached) if cli.control > 0 => match lif_client::control_loop(conn, cli.control > 1) {
+            Ok(()) => exit(0),
+            Err(e) => {
+                eprintln!("lif: {e}");
+                exit(1);
+            }
+        },
         Ok(CommandOutcome::Attached) => match attach_loop(conn) {
             Ok(info) => exit(if info.reason == ExitReason::Error { 1 } else { 0 }),
             Err(e) => {

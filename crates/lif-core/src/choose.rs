@@ -1,5 +1,6 @@
-//! The chooser modes: `choose-tree`, `choose-buffer`, `choose-client` and
-//! `find-window` (tmux's tree, buffer and client modes).
+//! The chooser modes: `choose-tree`, `choose-buffer`, `choose-client`,
+//! `find-window` and `customize-mode` (tmux's tree, buffer, client and
+//! customize modes).
 //!
 //! The model builds the list ([`Model::choose_items`]): one [`ChooseItem`]
 //! per session, window and pane (or buffer, or client), in display order,
@@ -43,6 +44,10 @@ pub enum ChooseKind {
     Buffers,
     /// Attached clients.
     Clients,
+    /// `customize-mode`: options, hooks, environments and key tables,
+    /// each line a setting. Enter edits it on the status line, `d` or `u`
+    /// puts it back to its default; the mode stays up.
+    Customize,
 }
 
 impl ChooseKind {
@@ -53,6 +58,7 @@ impl ChooseKind {
             ChooseKind::Tree => &["index", "name", "activity"],
             ChooseKind::Buffers => &["creation", "name", "size"],
             ChooseKind::Clients => &["name", "size", "creation", "activity"],
+            ChooseKind::Customize => &["name"],
         }
     }
 
@@ -61,6 +67,8 @@ impl ChooseKind {
             ChooseKind::Tree => "switch-client -t '%%'",
             ChooseKind::Buffers => "paste-buffer -p -b '%%'",
             ChooseKind::Clients => "detach-client -t '%%'",
+            // An item's target is the command that edits it.
+            ChooseKind::Customize => "%%",
         }
     }
 }
@@ -126,7 +134,8 @@ pub struct ChooseItem {
     pub text: String,
     /// What the preview shows for it.
     pub preview: Preview,
-    /// The question `x` asks and the command a yes runs.
+    /// The question `x` asks and the command a yes runs. In
+    /// `customize-mode`: no question, and the command `d` and `u` run.
     pub kill: Option<(String, String)>,
 }
 
@@ -231,7 +240,9 @@ impl ChooseState {
     /// selected if it is there.
     pub fn new(spec: ChooseSpec, items: Vec<ChooseItem>, start: Option<&str>) -> ChooseState {
         let mut expanded = BTreeSet::new();
-        for it in &items {
+        // customize-mode starts with every heading closed, as tmux's does.
+        let custom = spec.kind == ChooseKind::Customize;
+        for it in items.iter().filter(|_| !custom) {
             let open = match it.depth {
                 0 => !spec.sessions_collapsed,
                 1 => !spec.sessions_collapsed && !spec.windows_collapsed,
@@ -399,7 +410,7 @@ impl ChooseState {
     fn help_lines(&self) -> Vec<(&'static str, &'static str)> {
         // The texts are fixed per kind, so they are picked, not built.
         let pick = |tree: &'static str, buffers: &'static str, clients: &'static str| match self.spec.kind {
-            ChooseKind::Tree => tree,
+            ChooseKind::Tree | ChooseKind::Customize => tree,
             ChooseKind::Buffers => buffers,
             ChooseKind::Clients => clients,
         };
@@ -427,6 +438,12 @@ impl ChooseState {
             ("v", "Toggle preview"),
             ("Enter", pick("Choose selected item", "Paste selected buffer", "Choose selected client")),
         ];
+        if self.spec.kind == ChooseKind::Customize {
+            // (Its Enter edits; d and u put the default back.)
+            v.retain(|(k, _)| !matches!(*k, "O" | "r" | "f" | "c" | "Enter"));
+            v.extend([("Enter", "Set option value"), ("d", "Set to default value"), ("u", "Unset an option (set to default value if global)")]);
+            return v;
+        }
         match self.spec.kind {
             ChooseKind::Tree => v.extend([
                 ("S-Up", "Swap current and previous window"),
@@ -454,6 +471,7 @@ impl ChooseState {
                 ("Z", "Suspend tagged clients"),
                 (":", "Run a command for each tagged client"),
             ]),
+            ChooseKind::Customize => {}
         }
         v.push(("q, Escape", "Exit mode"));
         v
@@ -496,11 +514,37 @@ impl ChooseState {
                     Some(_) => None,
                 };
                 if sc.as_deref() == Some(name.as_str()) {
+                    if self.spec.kind == ChooseKind::Customize {
+                        // As Enter on that line.
+                        self.current = self.items[*i].id.clone();
+                        return self.key(&KeyEvent::new(Key::Enter, Mods::NONE));
+                    }
                     return ChooseOutcome::Choose(self.command_for(&self.spec.template.clone(), *i));
                 }
             }
         }
         let kind = self.spec.kind;
+        if kind == ChooseKind::Customize {
+            // A setting is edited in place; a heading opens or closes.
+            if is("Enter") {
+                if self.items[cur].depth == 0 {
+                    if !self.expanded.remove(&self.current) {
+                        self.expanded.insert(self.current.clone());
+                    }
+                    return ChooseOutcome::Redraw;
+                }
+                return ChooseOutcome::Run(vec![self.items[cur].target.clone()]);
+            }
+            if plain('d') || plain('u') {
+                return match &self.items[cur].kill {
+                    Some((_, reset)) => ChooseOutcome::Run(vec![reset.clone()]),
+                    None => ChooseOutcome::None,
+                };
+            }
+            if plain('x') || plain('X') {
+                return ChooseOutcome::None;
+            }
+        }
         if is("Enter") {
             return ChooseOutcome::Choose(self.command_for(&self.spec.template.clone(), cur));
         }
@@ -693,6 +737,7 @@ impl ChooseState {
                     return ChooseOutcome::Run(all(self, "suspend-client -t '%%'"));
                 }
             }
+            ChooseKind::Customize => {}
         }
         ChooseOutcome::None
     }
@@ -780,6 +825,7 @@ impl ChooseState {
                 None => "",
             };
             match self.spec.kind {
+                ChooseKind::Customize => name.to_string(),
                 ChooseKind::Buffers => format!("{name} (sort: {order}{rev}){filter}"),
                 _ => format!("{name} (sort: {order}{rev}){filter} (view: preview)"),
             }
@@ -827,12 +873,19 @@ impl ChooseState {
         if self.has_children(i) {
             s.push_str(if self.expanded.contains(&it.id) { "- " } else { "+ " });
         }
+        let custom = self.spec.kind == ChooseKind::Customize;
+        if custom && it.depth > 0 {
+            // tmux keeps the place of the +/- of headings.
+            s.push_str("  ");
+        }
         s.push_str(&it.name);
         if self.tagged.contains(&it.id) {
             s.push('*');
         }
-        s.push_str(": ");
-        s.push_str(&it.text);
+        if !(custom && it.depth == 0) {
+            s.push_str(": ");
+            s.push_str(&it.text);
+        }
         // Cut to the pane (by characters; the server cuts by cells too).
         if s.chars().count() > cols {
             s = s.chars().take(cols).collect();
@@ -926,19 +979,23 @@ impl Model {
                 }
                 for sid in sessions {
                     let s = &self.sessions[&sid];
-                    let mut windows: Vec<WindowId> = s.windows.values().copied().collect();
+                    let mut windows: Vec<(u32, WindowId)> = s.windows.iter().map(|(i, w)| (*i, *w)).collect();
                     if order == "name" {
-                        windows.sort_by(|a, b| self.windows[a].name.cmp(&self.windows[b].name));
+                        windows.sort_by(|a, b| self.windows[&a.1].name.cmp(&self.windows[&b.1].name));
                     }
                     if spec.reverse {
                         windows.reverse();
                     }
                     if let Some(only) = &spec.only_windows {
-                        windows.retain(|w| only.contains(w));
+                        windows.retain(|w| only.contains(&w.1));
                     }
                     let at = out.len();
-                    for wid in windows {
+                    for (widx, wid) in windows {
                         let w = &self.windows[&wid];
+                        // A window linked elsewhere too: its first link keeps
+                        // the plain ids, the others get the session and index
+                        // in front, so that every line is unique.
+                        let uid = |id: String| if w.links.first() == Some(&(sid, widx)) { id } else { format!("{sid}:{widx}{id}") };
                         let wat = out.len();
                         let mut panes: Vec<PaneId> = w.panes.clone();
                         if spec.reverse {
@@ -952,8 +1009,8 @@ impl Model {
                             }
                             let idx = self.pane_index(*pid).unwrap_or(0);
                             out.push(ChooseItem {
-                                id: pid.to_string(),
-                                target: format!("={}:{}.{pid}", s.name, w.index),
+                                id: uid(pid.to_string()),
+                                target: format!("={}:{widx}.{pid}", s.name),
                                 depth: 2,
                                 name: idx.to_string(),
                                 text: cut_text(format::expand(fmt, &vars)),
@@ -979,13 +1036,13 @@ impl Model {
                         out.insert(
                             wat,
                             ChooseItem {
-                                id: wid.to_string(),
-                                target: format!("={}:{}.", s.name, w.index),
+                                id: uid(wid.to_string()),
+                                target: format!("={}:{widx}.", s.name),
                                 depth: 1,
-                                name: w.index.to_string(),
+                                name: widx.to_string(),
                                 text: cut_text(format::expand(fmt, &vars)),
                                 preview: Preview::Panes(labels),
-                                kill: Some((format!("Kill window {}?", w.index), format!("kill-window -t {wid}"))),
+                                kill: Some((format!("Kill window {widx}?"), format!("kill-window -t {wid}"))),
                             },
                         );
                     }
@@ -997,9 +1054,9 @@ impl Model {
                     }
                     let labels = s
                         .windows
-                        .values()
-                        .filter_map(|wid| self.windows.get(wid))
-                        .map(|w| (w.active, cut_text(format!("{}:{}", w.index, w.name))))
+                        .iter()
+                        .filter_map(|(i, wid)| Some((*i, self.windows.get(wid)?)))
+                        .map(|(i, w)| (w.active, cut_text(format!("{i}:{}", w.name))))
                         .collect();
                     out.insert(
                         at,
@@ -1081,6 +1138,7 @@ impl Model {
                     });
                 }
             }
+            ChooseKind::Customize => out = self.customize_items(client),
         }
         out.truncate(MAX_CHOOSE_ITEMS);
         out
@@ -1095,7 +1153,7 @@ impl Model {
                 let s = self.sessions.get(&c.session?)?;
                 Some(self.windows.get(&s.current)?.active.to_string())
             }
-            ChooseKind::Buffers => None,
+            ChooseKind::Buffers | ChooseKind::Customize => None,
             ChooseKind::Clients => Some(c.info.name.clone()),
         }
     }
@@ -1167,9 +1225,6 @@ impl Model {
 
     /// `find-window`: the tree, with only the windows that match.
     pub(crate) fn cmd_find_window(&mut self, a: &Args, ctx: &CmdContext, host: &mut dyn Host) -> R {
-        if a.has('r') {
-            return Err(CmdError::new("find-window -r is not supported: lif matches with shell patterns"));
-        }
         let pattern = a.value(0).unwrap_or("");
         // tmux matches `*pattern*` against names, titles and contents
         // unless flags pick some of them.
@@ -1179,7 +1234,14 @@ impl Model {
         }
         let fold = |s: &str| if a.has('i') { s.to_lowercase() } else { s.to_string() };
         let glob = format!("*{}*", fold(pattern));
-        let hit = |s: &str| format::glob(glob.as_bytes(), fold(s).as_bytes());
+        // -r: a regular expression, found anywhere; one that does not
+        // compile finds nothing (tmux shows the whole tree then).
+        let re = a.has('r').then(|| crate::regex::Regex::new(pattern, a.has('i')).ok());
+        let hit = |s: &str| match &re {
+            Some(Some(re)) => re.is_match(s),
+            Some(None) => false,
+            None => format::glob(glob.as_bytes(), fold(s).as_bytes()),
+        };
         let mut only = Vec::new();
         for (wid, w) in &self.windows {
             let mut found = names && hit(&w.name);
@@ -1187,7 +1249,7 @@ impl Model {
                 if found {
                     break;
                 }
-                let title = self.fctx(&*host, Some(w.session), Some(*wid), Some(*p), None, ctx.now).var("pane_title").unwrap_or_default();
+                let title = self.fctx(&*host, Some(w.session()), Some(*wid), Some(*p), None, ctx.now).var("pane_title").unwrap_or_default();
                 found = (titles && hit(&title))
                     || (contents && {
                         let range = crate::host::CaptureRange {

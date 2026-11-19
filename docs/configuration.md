@@ -149,10 +149,16 @@ Value types used below:
 | `pane-border-format` | string | `'#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'` | What that line shows (a format; `#[...]` styles work). | `pane-border-format` |
 | `popup-border-lines` | choice: `"single"`, `"rounded"`, `"double"`, `"heavy"`, `"simple"`, `"padded"`, `"none"` | `"single"` | The lines a popup's border is drawn with (`display-popup -b`). | `popup-border-lines` |
 | `menu-border-lines` | the same choices | `"single"` | The same for menus (`display-menu -b`). | `menu-border-lines` |
+| `pane-scrollbars` | choice: `"off"`, `"modal"`, `"on"` | `"off"` | A scrollbar beside each pane (`on`, taking its columns) or over it in copy mode (`modal`). | `pane-scrollbars` |
+| `pane-scrollbars-position` | choice: `"right"`, `"left"` | `"right"` | Which side. | `pane-scrollbars-position` |
+| `pane-scrollbars-style` | string | `"bg=brightblack,fg=white,width=1,pad=0"` | bg the track, fg the part on screen; width and pad in columns. | `pane-scrollbars-style` |
+| `lock-after-time` | integer | `0` | Seconds a session may be idle (none of its clients typing) before its clients are locked; 0 never. | `lock-after-time` |
+| `lock-command` | string | `"lock -np"` | What a locked client runs on its terminal (with `/bin/sh`); it comes back when that exits. | `lock-command` |
 | `set-titles` | bool | `false` | Set the outer terminal's title. | `set-titles` |
 | `set-titles-string` | string | `'#S:#I:#W - "#T"'` | The title, a format. | `set-titles-string` |
 | `allow-passthrough` | choice: `"off"`, `"on"`, `"all"` | `"off"` | Unwrap tmux's passthrough escape (`ESC P tmux; ... ESC \`) from programs; the wrapped clipboard writes and notifications then reach the outer terminal. | `allow-passthrough` |
 | `tmux-compat` | bool | `false` | New panes get `TMUX` and `TMUX_PANE` pointing at lif, and passthrough is unwrapped, for programs that only know tmux (see [claude-code.md](claude-code.md)). | `tmux-compat` (lif only) |
+| `update-environment` | array of names (or one string of names) | tmux's list: `["DISPLAY", "KRB5CCNAME", "MSYSTEM", "SSH_ASKPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_CONNECTION", "WINDOWID", "XAUTHORITY"]` | Variables copied from the client's environment into a session's when the client creates, attaches or switches to it (not with `-E`); ones the client lacks are removed. | `update-environment` |
 
 `status = false` (or `true`) at the top level is accepted as a shortcut for
 `[status] enabled`, unless the file also has a `[status]` section (TOML

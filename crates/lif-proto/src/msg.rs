@@ -20,12 +20,15 @@ pub mod type_id {
     pub const TTY: u16 = 0x106;
     pub const SUSPENDED: u16 = 0x107;
     pub const COMMAND_OUTPUT: u16 = 0x108;
+    pub const LOCK: u16 = 0x109;
 }
 
-/// Environment variables a client may pass in `Hello`. The client sends
-/// only these, and the server drops anything else a client sends (a raw
-/// client could otherwise plant `LD_PRELOAD` or `PATH` into every pane
-/// of a session). `LIF_PANE` is not on it: it never reaches a pane, the
+/// Environment variables of a client's `Hello` that the server passes on
+/// to the panes of the sessions the client creates or attaches to. The
+/// server drops every other variable a client sends (a raw client could
+/// otherwise plant `LD_PRELOAD` or `PATH` into every pane of a session),
+/// except those its `update-environment` option names, which go into the
+/// session environment as in tmux. `LIF_PANE` is not on it: it never reaches a pane, the
 /// server only reads it to find the pane a command runs in.
 pub const ENV_ALLOW_LIST: &[&str] = &[
     "COLORTERM",
@@ -61,6 +64,14 @@ impl Caps {
     /// messages before `CommandDone`, so output larger than one frame
     /// can be delivered.
     pub const OUTPUT_STREAM: Caps = Caps(4);
+    /// The client can be locked (`lock-client`, `lock-server`,
+    /// `lock-session`, `lock-after-time`): `Lock`, answered by `Resume`.
+    pub const LOCK: Caps = Caps(8);
+    /// A control-mode client (`lif -C`, tmux's): attached without a
+    /// terminal of its own. Its `Input` is lines of commands; every
+    /// `Output` it gets is protocol text (`%begin`, `%output`, ...) to
+    /// print as it is.
+    pub const CONTROL: Caps = Caps(16);
 
     pub const fn contains(self, other: Caps) -> bool {
         self.0 & other.0 == other.0
@@ -84,8 +95,9 @@ pub struct Hello {
     pub term: String,
     /// The client's working directory (default start directory for new panes).
     pub cwd: String,
-    /// Environment the client wants new sessions to inherit and existing
-    /// sessions to refresh (e.g. `COLORTERM`, `SSH_AUTH_SOCK`, `DISPLAY`).
+    /// The client's environment (since 0.5.0; before, only the variables of
+    /// [`ENV_ALLOW_LIST`]). The server keeps what it uses: see
+    /// [`ENV_ALLOW_LIST`].
     pub env: Vec<(String, String)>,
     /// Whether the client's stdin and stdout are both a terminal. The server
     /// refuses to attach a client that is not.
@@ -177,6 +189,11 @@ pub enum ServerMsg {
     /// by more `CommandOutput` and finally `CommandDone` (which carries
     /// the rest). The client prints the parts in order.
     CommandOutput { stdout: Vec<u8>, stderr: Vec<u8> },
+    /// With [`Caps::LOCK`]: the terminal is restored and the server no
+    /// longer touches it, as after `Suspended`. The client leaves raw mode,
+    /// runs `command` (`lock-command`, with `/bin/sh -c`) on its terminal,
+    /// waits for it and sends `Resume`.
+    Lock { command: String },
     /// A frame type this build does not know. Never sent.
     Unknown { type_id: u16 },
 }

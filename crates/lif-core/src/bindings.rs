@@ -109,6 +109,7 @@ const DEFAULTS: &[(&str, bool, &str)] = &[
         "display-menu -T \"#[align=centre]#{pane_index} (#{pane_id})\" -x P -y P \"#{?pane_in_mode,Go To Top,}\" < { send-keys -X history-top } \"#{?pane_in_mode,Go To Bottom,}\" > { send-keys -X history-bottom } '' \"#{?pane_in_mode,,Paste}\" p { paste-buffer } '' \"Horizontal Split\" h { split-window -h } \"Vertical Split\" v { split-window -v } '' \"#{?#{>:#{window_panes},1},,-}Swap Up\" u { swap-pane -U } \"#{?#{>:#{window_panes},1},,-}Swap Down\" d { swap-pane -D } \"#{?pane_marked_set,,-}Swap Marked\" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } \"#{?pane_marked,Unmark,Mark}\" m { select-pane -m } \"#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}\" z { resize-pane -Z }",
     ),
     ("?", false, "list-keys"),
+    ("C", false, "customize-mode -Z"),
     ("D", false, "choose-client -Z"),
     ("E", false, "select-layout -E"),
     ("L", false, "switch-client -l"),

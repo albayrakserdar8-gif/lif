@@ -34,7 +34,7 @@ fn names_aliases_prefixes() {
     assert_eq!(err(&["foo"]), "unknown command: foo");
     assert_eq!(err(&["sel"]), "ambiguous command: sel, could be: select-layout, select-pane, select-window");
     assert_eq!(err(&["kill-s"]), "ambiguous command: kill-s, could be: kill-server, kill-session");
-    assert_eq!(err(&["customize-mode"]), "unsupported command: customize-mode");
+    assert_eq!(err(&["switch-mode"]), "unsupported command: switch-mode");
     assert_eq!(parse(&["choose-window".to_string()]).unwrap().name(), "choose-tree", "tmux's command-alias");
 }
 

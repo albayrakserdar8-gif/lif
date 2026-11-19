@@ -470,6 +470,7 @@ fn convert(kind: Kind, key: &str, name: &str, v: &str) -> Result<String, String>
         Kind::Key if v.eq_ignore_ascii_case("none") || KeyCode::parse(v).is_some() => Ok(toml_str(v)),
         Kind::Key => bad(),
         Kind::Str | Kind::Dim | Kind::Style => Ok(toml_str(v)),
+        Kind::List => Ok(format!("[{}]", v.split_whitespace().map(toml_str).collect::<Vec<_>>().join(", "))),
     }
 }
 

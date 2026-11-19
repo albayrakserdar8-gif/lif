@@ -1,6 +1,6 @@
 //! The event loop.
 
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener as StdListener;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::ServerOptions;
 use crate::client::{CLIENT_READ_BUDGET, ClientRt, TermOut, Tty};
-use crate::host::{CLIENT_TOKEN, JOB_TOKEN, PANE_PIPE_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
+use crate::host::{CLIENT_TOKEN, JOB_TOKEN, PANE_PIPE_IN_TOKEN, PANE_PIPE_TOKEN, PANE_TOKEN, PIPE_TOKEN, Rt, TTY_TOKEN};
 use crate::sys::{self, SignalPipe};
 
 const LISTENER: Token = Token(0);
@@ -34,7 +34,7 @@ const READ_BUF: usize = 64 * 1024;
 const TTY_READ_BUF: usize = 16 * 1024;
 
 /// Optional protocol features this server implements.
-const SERVER_CAPS: Caps = Caps(Caps::TTY.0 | Caps::SUSPEND.0 | Caps::OUTPUT_STREAM.0);
+const SERVER_CAPS: Caps = Caps(Caps::TTY.0 | Caps::SUSPEND.0 | Caps::OUTPUT_STREAM.0 | Caps::LOCK.0 | Caps::CONTROL.0);
 
 /// About how long one step of a copy-mode search may take before the loop
 /// looks at its descriptors again.
@@ -75,6 +75,14 @@ pub(crate) struct Server {
     /// Copy-mode bindings run from `send-keys` that are running now, so a
     /// binding that sends its own key cannot recurse without end.
     binding_depth: u32,
+    /// For the next `run_commands`: the job a `command-prompt` (no `-b`)
+    /// left its following commands waiting for, released when the
+    /// answer's list ends.
+    pub(crate) release_after: Option<u64>,
+    /// Some session has `lock-after-time` set (`apply_options`).
+    lock_on: bool,
+    /// When `check_locks` next has something to lock.
+    lock_deadline: Option<Instant>,
     /// A descriptor kept open to be closed when `accept` fails for lack of
     /// descriptors: it makes room to accept the waiting connection, tell
     /// it why and close it, so the listener's queue is drained and its
@@ -147,6 +155,9 @@ impl Server {
             scratch_clients: Vec::new(),
             scratch_views: Vec::new(),
             binding_depth: 0,
+            release_after: None,
+            lock_on: false,
+            lock_deadline: None,
             spare_fd: sys::spare_fd(),
             socket_id,
             // SAFETY: getuid cannot fail.
@@ -259,6 +270,7 @@ impl Server {
             REAPER => self.reap(now),
             SIGNALS => self.handle_signals(),
             Token(t) if t & PANE_PIPE_TOKEN != 0 => self.pane_pipe_writable(PaneId((t & 0xffff_ffff) as u32)),
+            Token(t) if t & PANE_PIPE_IN_TOKEN != 0 => self.pane_pipe_readable(PaneId((t & 0xffff_ffff) as u32)),
             Token(t) if t & JOB_TOKEN != 0 => self.read_job((t & 0xffff_ffff) as u32),
             Token(t) if t & PIPE_TOKEN != 0 => self.rt.pipe_writable((t & 0xffff_ffff) as u32),
             Token(t) if t & TTY_TOKEN != 0 => {
@@ -274,6 +286,10 @@ impl Server {
                 let id = ClientId((t & 0xffff_ffff) as u32);
                 if writable {
                     self.rt.flush_client(id);
+                    if self.rt.control_on {
+                        self.control_drained(id);
+                        self.rt.flush_client(id);
+                    }
                 }
                 if readable {
                     self.read_client(id, now);
@@ -285,7 +301,14 @@ impl Server {
                     self.pane_writable(id);
                 }
                 if readable {
-                    self.read_pane(id, now, crate::PANE_READ_BUDGET);
+                    if self.echo_pause(id, now).is_some() {
+                        // Edge-triggered: remember it, it is not reported again.
+                        if let Some(p) = self.rt.panes.get_mut(&id) {
+                            p.read_more = true;
+                        }
+                    } else {
+                        self.read_pane(id, now, crate::PANE_READ_BUDGET);
+                    }
                 }
             }
             _ => {}
@@ -295,11 +318,21 @@ impl Server {
     /// Everything that happens after the ready events of an iteration:
     /// leftover reads, expired deadlines, view updates, frames, clean-up.
     fn service(&mut self, now: Instant) {
+        // A prompt closed by a key (cancelled, replaced) outside a model
+        // call: what waited for it goes on now.
+        if !self.rt.prompts_done.borrow().is_empty() || !self.rt.prompt_runs.is_empty() {
+            self.after_model();
+        }
         let mut panes = std::mem::take(&mut self.scratch_panes);
         panes.clear();
+        if self.rt.echo_wait.is_some_and(|(_, until)| now >= until) {
+            self.rt.echo_wait = None;
+        }
         panes.extend(self.rt.panes.values().filter(|p| p.read_more).map(|p| p.id));
         for &p in &panes {
-            self.read_pane(p, now, crate::PANE_READ_BUDGET);
+            if self.echo_pause(p, now).is_none() {
+                self.read_pane(p, now, crate::PANE_READ_BUDGET);
+            }
         }
         self.scratch_panes = panes;
         let mut clients = std::mem::take(&mut self.scratch_clients);
@@ -326,6 +359,9 @@ impl Server {
         self.timers(now);
         self.step_searches();
         self.refresh_clocks(now);
+        if self.lock_on {
+            self.check_locks(now);
+        }
         self.refresh_choosers();
         self.sync_views();
         self.frame_tick(now);
@@ -367,7 +403,11 @@ impl Server {
             }
         };
         for p in self.rt.panes.values() {
-            if p.read_more || p.searching {
+            if p.read_more
+                && let Some(until) = self.echo_pause(p.id, now)
+            {
+                min(Some(until));
+            } else if p.read_more || p.searching {
                 return Some(now);
             }
             min(p.compact_at);
@@ -391,6 +431,7 @@ impl Server {
             }
         }
         min(self.rt.dying.iter().map(|d| d.1).min());
+        min(self.lock_deadline);
         if self.rt.jobs.values().any(|j| j.read_more) {
             return Some(now);
         }
@@ -557,11 +598,36 @@ impl Server {
 
     fn pane_writable(&mut self, id: PaneId) {
         self.rt.flush_pane(id);
+        // Room in the input queue again: the pipe-pane -I output that waited.
+        if self.rt.panes.get(&id).and_then(|p| p.pipe.as_ref()).is_some_and(|x| x.rx_more) {
+            self.pane_pipe_readable(id);
+        }
+    }
+
+    /// When pane `id` may be read again, if it has to wait for another
+    /// pane's echo now (`crate::ECHO_PAUSE`).
+    fn echo_pause(&self, id: PaneId, now: Instant) -> Option<Instant> {
+        self.rt.echo_wait.filter(|&(w, until)| w != id && now < until).map(|(_, until)| until)
     }
 
     pub(crate) fn read_pane(&mut self, id: PaneId, now: Instant, budget: usize) {
+        let control = self.rt.control_on;
         let Some(p) = self.rt.panes.get_mut(&id) else { return };
+        if control && p.tap.is_none() {
+            p.tap = Some(Vec::new());
+        }
         let r = p.read(&mut self.read_buf, budget);
+        if control
+            && r.bytes > 0
+            && let Some(mut tap) = p.tap.take()
+        {
+            self.control_output(id, &tap);
+            tap.clear();
+            if let Some(p) = self.rt.panes.get_mut(&id) {
+                p.tap = Some(tap);
+            }
+        }
+        let Some(p) = self.rt.panes.get_mut(&id) else { return };
         if p.pipe.as_ref().is_some_and(|x| x.dead) {
             self.close_dead_pipe(id);
         }
@@ -692,14 +758,61 @@ impl Server {
         self.close_dead_pipe(pane);
     }
 
-    /// Close `pane`'s pipe if its command stopped reading.
+    /// The output of `pane`'s `pipe-pane -I` command: typed into the pane
+    /// as long as its input queue has room (`PANE_INPUT_MAX`); the rest
+    /// waits in the pipe, and the command with it.
+    fn pane_pipe_readable(&mut self, pane: PaneId) {
+        let limit = crate::PANE_INPUT_MAX - crate::PANE_INPUT_RESERVE;
+        loop {
+            let Some(p) = self.rt.panes.get_mut(&pane) else { return };
+            let room = limit.saturating_sub(p.wq.len()).min(self.read_buf.len());
+            let Some(pipe) = p.pipe.as_mut() else { return };
+            let Some(rx) = pipe.rx.as_mut() else { return };
+            if room == 0 {
+                pipe.rx_more = true;
+                return;
+            }
+            pipe.rx_more = false;
+            match rx.read(&mut self.read_buf[..room]) {
+                Ok(0) => {
+                    // The command closed its output: the input side is over.
+                    if let Some(mut rx) = pipe.rx.take() {
+                        let _ = self.rt.registry.deregister(&mut rx);
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    // Fits: `room` was measured against the same queue.
+                    self.rt.write_pane(pane, &self.read_buf[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    if let Some(mut rx) = pipe.rx.take() {
+                        let _ = self.rt.registry.deregister(&mut rx);
+                    }
+                    break;
+                }
+            }
+        }
+        self.close_dead_pipe(pane);
+    }
+
+    /// Close `pane`'s pipe if it is over: its command stopped reading (or
+    /// exited) and everything it printed was read.
     fn close_dead_pipe(&mut self, pane: PaneId) {
         let Some(p) = self.rt.panes.get_mut(&pane) else { return };
-        if p.pipe.as_ref().is_some_and(|x| x.dead)
+        let Some(pipe) = p.pipe.as_mut() else { return };
+        if pipe.dead
+            && let Some(mut tx) = pipe.tx.take()
+        {
+            let _ = self.rt.registry.deregister(&mut tx);
+        }
+        if pipe.finished()
             && let Some(mut old) = p.pipe.take()
         {
-            let _ = self.rt.registry.deregister(&mut old.tx);
-            log!("pipe-pane: pane {pane}: pid {} stopped reading", old.pid);
+            old.deregister(&self.rt.registry);
+            log!("pipe-pane: pane {pane}: pid {} done", old.pid);
         }
     }
 
@@ -782,6 +895,8 @@ impl Server {
             if let Some(pipe) = pane.pipe.as_mut() {
                 pipe.dead = true;
             }
+            // What it printed before it exited is still typed in (-I).
+            self.pane_pipe_readable(id);
             self.close_dead_pipe(id);
             return;
         }
@@ -841,6 +956,15 @@ impl Server {
             }
             return;
         };
+        // A control client's command that waited: its %end (or %error) now.
+        if let Some(n) = self.rt.clients.get_mut(&id).and_then(|c| c.control.as_mut()).and_then(|ctl| ctl.pending.pop_front()) {
+            let r = match f.error {
+                Some(e) => Err(format!("{}{e}", f.stdout)),
+                None => Ok(f.stdout),
+            };
+            self.control_end(id, n, r);
+            return;
+        }
         let attached = self.rt.clients.get(&id).is_some_and(|c| c.att.is_some());
         if attached {
             match f.error {
@@ -946,6 +1070,12 @@ impl Server {
                 }
                 ClientMsg::Input(bytes) => self.client_input(id, &bytes, now),
                 ClientMsg::Resize { size, pixels: _ } => self.client_size(id, size),
+                // A control client's end of input: %exit and Exit, as for
+                // the empty line that ends control mode.
+                ClientMsg::Detach if self.rt.clients.get(&id).is_some_and(|c| c.control.is_some() && c.att.is_some()) => {
+                    self.control_input(id, b"\n");
+                    return;
+                }
                 ClientMsg::Detach => {
                     self.disconnect(id);
                     return;
@@ -1106,6 +1236,20 @@ impl Server {
         // Only what a lif client may send reaches session environments
         // (and so every later pane): never LD_PRELOAD, PATH, SHELL...
         h.size = lif_core::clamp_size(h.size);
+        // update-environment names more, which the model copies into the
+        // session environment (set-environment's) when the client creates,
+        // attaches to or switches to a session; nothing else is kept.
+        let mut wanted: Vec<String> = Vec::new();
+        let sessions: Vec<_> = self.model.sessions().map(|s| Some(s.id())).collect();
+        for s in std::iter::once(None).chain(sessions) {
+            for n in self.model.option_text("update-environment", s, None).unwrap_or_default().split_whitespace() {
+                if !wanted.iter().any(|w| w == n) {
+                    wanted.push(n.to_string());
+                }
+            }
+        }
+        let update_env: Vec<(String, String)> =
+            h.env.iter().filter(|(k, v)| wanted.iter().any(|w| w == k) && !v.contains('\0') && v.len() <= 4096).cloned().collect();
         h.env.retain(|(k, v)| {
             (lif_proto::ENV_ALLOW_LIST.contains(&k.as_str()) || k == "LIF_PANE") && !v.contains('\0') && v.len() <= 4096
         });
@@ -1123,15 +1267,26 @@ impl Server {
             self.rt.flush_client(id);
             return;
         }
+        let control = c.caps.contains(Caps::CONTROL);
+        if control {
+            c.control = Some(Box::default());
+        }
         let info = ClientInfo {
             name: format!("client-{}", h.pid),
             term: h.term.clone(),
             size: h.size,
             cwd: h.cwd.clone(),
             pid: h.pid,
-            terminal: h.is_tty,
+            // A control client attaches without a terminal.
+            terminal: h.is_tty || control,
+            control,
         };
         c.hello = Some(h);
+        if control {
+            self.model.set_control_events(true);
+            self.rt.control_on = true;
+        }
+        c.update_env = update_env;
         self.model.client_connect(id, info);
         self.rt.flush_client(id);
     }
@@ -1206,7 +1361,10 @@ impl Server {
                 self.sync_mode_config(p);
             }
         }
-        let r = self.model.execute_list(list, &ctx, &mut self.rt);
+        let r = match self.release_after.take() {
+            Some(job) => self.model.execute_list_then(list, &ctx, job, &mut self.rt),
+            None => self.model.execute_list(list, &ctx, &mut self.rt),
+        };
         // Options may have changed the styles views are drawn with, and
         // the scrollback limits of existing panes.
         if list.commands().iter().any(|c| matches!(c.name(), "set-option" | "set-window-option" | "source-file")) {
@@ -1221,9 +1379,58 @@ impl Server {
     /// `scrollback-bytes` / `history-limit` of each pane's session, applied
     /// to panes whose limits differ (tmux applies `history-limit` only to
     /// new panes; lif's engine can change them in place).
+    fn lock_secs(&self, session: Option<lif_core::SessionId>) -> u64 {
+        self.model.option_text("lock-after-time", session, None).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+
+    /// `lock-after-time`: a session none of whose clients has typed for
+    /// that many seconds is locked (all its clients, as `lock-session`).
+    /// Runs only while some session has the option set.
+    fn check_locks(&mut self, now: Instant) {
+        let mut idle: Vec<(lif_core::SessionId, Instant)> = Vec::new();
+        for c in self.rt.clients.values() {
+            let Some(a) = c.att.as_ref().filter(|a| a.suspended.is_none()) else { continue };
+            match idle.iter_mut().find(|(s, _)| *s == a.session) {
+                Some((_, last)) => *last = (*last).max(a.last_input),
+                None => idle.push((a.session, a.last_input)),
+            }
+        }
+        let mut next: Option<Instant> = None;
+        for (sid, last) in idle {
+            let secs = self.lock_secs(Some(sid));
+            if secs == 0 {
+                continue;
+            }
+            let due = last + Duration::from_secs(secs);
+            if now < due {
+                next = Some(next.map_or(due, |n| n.min(due)));
+                continue;
+            }
+            log!("session {sid}: idle {secs} s, locking");
+            let clients: Vec<ClientId> =
+                self.rt.clients.values().filter(|c| c.att.as_ref().is_some_and(|a| a.session == sid && a.suspended.is_none())).map(|c| c.id).collect();
+            for c in clients {
+                if let Err(e) = self.model.lock_client(c, &mut self.rt) {
+                    log!("client {c}: {e}");
+                    // Not lockable (an older client): not again every turn.
+                    if let Some(a) = self.rt.clients.get_mut(&c).and_then(|c| c.att.as_mut()) {
+                        a.last_input = now;
+                    }
+                }
+            }
+        }
+        self.lock_deadline = next;
+    }
+
     fn apply_options(&mut self) {
         if let Some(ms) = self.model.option_text("escape-time", None, None).and_then(|v| v.parse::<u64>().ok()) {
             self.rt.escape_time = Duration::from_millis(ms);
+        }
+        // lock-after-time anywhere: only then does the loop look at it.
+        let sessions: Vec<_> = self.model.sessions().map(|s| Some(s.id())).collect();
+        self.lock_on = std::iter::once(None).chain(sessions).any(|s| self.lock_secs(s) > 0);
+        if !self.lock_on {
+            self.lock_deadline = None;
         }
         for p in self.rt.panes.values_mut() {
             let Some(sid) = self.model.pane(p.id).and_then(|m| self.model.window(m.window())).map(|w| w.session()) else { continue };
@@ -1252,13 +1459,30 @@ impl Server {
         self.rt.respawn_stash = None;
         // destroy-unattached: sessions the last client just left.
         self.model.check_unattached(&mut self.rt);
-        // Popups that closed: the commands that waited for them go on.
-        while !self.rt.popups_done.is_empty() {
+        // Popups and prompts that closed: the commands that waited for them go on.
+        while !self.rt.popups_done.is_empty() || !self.rt.prompts_done.borrow().is_empty() {
             for (job, status) in std::mem::take(&mut self.rt.popups_done) {
                 self.model.job_done(job, lif_core::JobStatus::Exited(status), &[], sys::wall_clock(), &mut self.rt);
             }
+            let prompts = std::mem::take(&mut *self.rt.prompts_done.borrow_mut());
+            for job in prompts {
+                self.model.job_done(job, lif_core::JobStatus::Exited(0), &[], sys::wall_clock(), &mut self.rt);
+            }
             self.rt.views_stale = true;
             self.apply_options();
+        }
+        // Control clients: their first lines, then what happened.
+        for (c, s) in std::mem::take(&mut self.rt.control_attached) {
+            self.control_attached(c, s);
+        }
+        if self.rt.control_on {
+            self.control_notify(Instant::now());
+        }
+        // command-prompt -i: its first run, with "=".
+        while !self.rt.prompt_runs.is_empty() {
+            for (client, run) in std::mem::take(&mut self.rt.prompt_runs) {
+                self.run_string(client, &run);
+            }
         }
         if self.model.has_finished() {
             for f in self.model.take_finished() {
@@ -1349,6 +1573,15 @@ impl Server {
         // What it showed may now be hidden (see Server::release_hidden_panes).
         self.rt.views_stale = true;
         self.model.client_disconnect(id, &mut self.rt);
+        // The last control client gone: no more events or output copies.
+        let control = self.rt.clients.values().any(|c| c.control.is_some() && !c.dead);
+        if !control && self.rt.control_on {
+            self.rt.control_on = false;
+            self.model.set_control_events(false);
+            for p in self.rt.panes.values_mut() {
+                p.tap = None;
+            }
+        }
         self.after_model();
     }
 
@@ -1395,6 +1628,11 @@ impl Server {
     /// Orderly exit: deliver what is pending to clients, hang up every
     /// pane, remove the socket and lock file.
     fn finish(&mut self) {
+        // The socket goes first: a client that connects while the panes are
+        // being killed would only have its connection dropped at exit. With
+        // the path gone it starts a new server instead, which waits for this
+        // one's lock (issues/0004).
+        self.remove_socket();
         for c in self.rt.clients.values_mut() {
             c.flush_blocking(500);
         }
@@ -1409,9 +1647,16 @@ impl Server {
         }
         self.await_hung_up();
         self.rt.respawn_stash = None;
-        // Only our own socket: if another server was started on this path
-        // (it could only after this one stopped holding the lock, but a
-        // user may also have moved things around), its socket stays.
+        // The lock file stays: removing it would let a client that already
+        // opened it and one that creates a new one both get "the" lock.
+        // The lock itself goes with this process.
+        self.log_stats();
+    }
+
+    /// Removes the socket path, if it is still the socket this server bound:
+    /// a user may have moved things around and put another one there (no
+    /// other server can have, while this one holds the lock).
+    fn remove_socket(&mut self) {
         let ours = std::fs::symlink_metadata(&self.opts.socket).ok().map(|m| {
             use std::os::unix::fs::MetadataExt;
             (m.dev(), m.ino())
@@ -1419,10 +1664,6 @@ impl Server {
         if ours.is_some() && ours == self.socket_id {
             let _ = std::fs::remove_file(&self.opts.socket);
         }
-        // The lock file stays: removing it would let a client that already
-        // opened it and one that creates a new one both get "the" lock.
-        // The lock itself goes with this process.
-        self.log_stats();
     }
 }
 

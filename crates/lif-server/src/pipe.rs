@@ -1,16 +1,21 @@
 //! `copy-pipe` and `pipe-pane`: text written to a command's standard
-//! input (the copied text; a pane's output as it arrives).
+//! input (the copied text; a pane's output as it arrives), and for
+//! `pipe-pane -I` a command's output written to a pane as its input.
 //!
 //! The command runs as `/bin/sh -c command` (as tmux runs it), as the
-//! server's user, with output discarded. Its stdin is a non-blocking pipe
-//! the event loop writes when it is writable, so a command that reads
-//! slowly (or never) cannot stall the server; the reaper collects it.
+//! server's user. Its stdin is a non-blocking pipe the event loop writes
+//! when it is writable, so a command that reads slowly (or never) cannot
+//! stall the server; the reaper collects it. Its output is discarded,
+//! except with `-I`: then the event loop reads it only while the pane's
+//! input queue has room, so a program that does not read its input holds
+//! up the command (in the kernel's pipe buffer), not the server.
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use mio::unix::pipe::Sender;
+use mio::Registry;
+use mio::unix::pipe::{Receiver, Sender};
 
 /// Commands still being written to at once; more are refused. Each holds
 /// its copy until the command took it, so this bounds what commands that
@@ -68,19 +73,42 @@ pub(crate) const PANE_PIPE_MAX: usize = 1024 * 1024;
 /// A `pipe-pane` command and what it has not read yet.
 pub(crate) struct PanePipe {
     pub(crate) pid: u32,
-    pub(crate) tx: Sender,
+    /// Its standard input, which gets the pane's output (`-O`, the default).
+    pub(crate) tx: Option<Sender>,
+    /// Its standard output, which goes to the pane as input (`-I`).
+    pub(crate) rx: Option<Receiver>,
+    /// `rx` had more to read when the pane's input queue was full: read
+    /// it when the queue has room (the readiness edge is not repeated).
+    pub(crate) rx_more: bool,
     queue: Vec<u8>,
     off: usize,
     /// Bytes left out because the queue was full.
     pub(crate) dropped: u64,
-    /// The command closed its input (or writing failed): close the pipe.
+    /// The command closed its input (or writing failed), or it exited:
+    /// the pane's output goes no further.
     pub(crate) dead: bool,
 }
 
 impl PanePipe {
+    /// Both directions are over (what the command printed has all been
+    /// read): the pipe can go.
+    pub(crate) fn finished(&self) -> bool {
+        (self.dead || self.tx.is_none()) && self.rx.is_none()
+    }
+
+    /// Stops polling the pipes; dropping `self` then closes them.
+    pub(crate) fn deregister(&mut self, registry: &Registry) {
+        if let Some(tx) = self.tx.as_mut() {
+            let _ = registry.deregister(tx);
+        }
+        if let Some(rx) = self.rx.as_mut() {
+            let _ = registry.deregister(rx);
+        }
+    }
+
     /// More output of the pane: queue it and write what the pipe takes.
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        if self.dead {
+        if self.dead || self.tx.is_none() {
             return;
         }
         // Written data leaves the front; compact when it is all gone.
@@ -97,8 +125,9 @@ impl PanePipe {
 
     /// Write what the pipe takes now.
     pub(crate) fn flush(&mut self) {
+        let Some(tx) = self.tx.as_mut() else { return };
         while self.off < self.queue.len() {
-            match self.tx.write(&self.queue[self.off..]) {
+            match tx.write(&self.queue[self.off..]) {
                 Ok(0) => {
                     self.dead = true;
                     return;
@@ -122,9 +151,27 @@ impl PanePipe {
     }
 }
 
-/// Start `command` for `pipe-pane`: its stdin is a pipe the pane's
-/// output is written to.
-pub(crate) fn spawn_pane_pipe(command: &str, cwd: Option<&Path>) -> io::Result<PanePipe> {
-    let (pid, job) = spawn(command, cwd, Vec::new())?;
-    Ok(PanePipe { pid, tx: job.tx, queue: Vec::new(), off: 0, dropped: 0, dead: false })
+/// Start `command` for `pipe-pane`: with `output` its stdin is a pipe
+/// the pane's output is written to, with `input` its stdout is a pipe
+/// read into the pane.
+pub(crate) fn spawn_pane_pipe(command: &str, cwd: Option<&Path>, input: bool, output: bool) -> io::Result<PanePipe> {
+    let piped = |on: bool| if on { Stdio::piped() } else { Stdio::null() };
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(command).stdin(piped(output)).stdout(piped(input)).stderr(Stdio::null());
+    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+        c.current_dir(dir);
+    }
+    let mut child = c.spawn()?;
+    let pid = child.id();
+    let tx = child.stdin.take().map(Sender::from);
+    let rx = child.stdout.take().map(Receiver::from);
+    if let Some(tx) = tx.as_ref() {
+        tx.set_nonblocking(true)?;
+    }
+    if let Some(rx) = rx.as_ref() {
+        rx.set_nonblocking(true)?;
+    }
+    // As in spawn: the reaper collects the exit status.
+    drop(child);
+    Ok(PanePipe { pid, tx, rx, rx_more: false, queue: Vec::new(), off: 0, dropped: 0, dead: false })
 }

@@ -1,4 +1,4 @@
-.Dd November 15, 2026
+.Dd November 19, 2026
 .Dt LIF 1
 .Os
 .Sh NAME
@@ -6,7 +6,7 @@
 .Nd terminal multiplexer with tmux commands and key bindings
 .Sh SYNOPSIS
 .Nm
-.Op Fl 2uvV
+.Op Fl 2CuvV
 .Op Fl f Ar file
 .Op Fl L Ar socket-name
 .Op Fl S Ar socket-path
@@ -42,6 +42,15 @@ keys pressed after it run the commands of the prefix key table (see
 .Bl -tag -width "-S socket-path"
 .It Fl 2 , Fl u
 Accepted for tmux compatibility; 256 colors and UTF-8 are always on.
+.It Fl C
+Control mode, as tmux's: commands are read one per line from standard
+input and answered with
+.Ql %begin ... %end
+lines; pane output and changes are reported as
+.Ql %output
+and other notifications. An empty line or the end of input detaches.
+.Fl CC
+wraps it all in tmux's DCS sequence.
 .It Fl f Ar file
 Configuration file for a server started by this command.
 A relative path is relative to the current directory.
@@ -179,7 +188,7 @@ Any unambiguous prefix of a command name works.
 .Bl -tag -width Ds
 .It Xo
 .Ic attach-session Pq Ic attach
-.Op Fl dx
+.Op Fl dEx
 .Op Fl c Ar working-directory
 .Op Fl t Ar target-session
 .Xc
@@ -297,7 +306,7 @@ Show a large clock in the pane until a key is pressed there.
 set how it looks.
 .It Xo
 .Ic command-prompt
-.Op Fl 1FkNP
+.Op Fl 1bCeFiklNP
 .Op Fl I Ar inputs
 .Op Fl p Ar prompts
 .Op Fl T Ar prompt-type
@@ -306,9 +315,14 @@ set how it looks.
 .Xc
 Open the command prompt on the status line, optionally with a template in
 which %% or %1 is replaced by the answer.
--P and -T are accepted: the prompt is always on the status line and there
-is no completion.
--i (incremental) is not supported outside copy mode's searches.
+Without -b the commands after it wait until the prompt closes.
+-i runs the template whenever the text changes, with %% as =text (+text
+for C-s, -text for C-r), and once with = as it opens; Enter and Escape only
+close it.
+-e makes BSpace on an empty line cancel; -l takes -p and -I literally
+(no splitting at commas).
+-C, -P and -T are accepted: panes are always updated, the prompt is always
+on the status line and there is no completion.
 .It Xo
 .Ic confirm-before Pq Ic confirm
 .Op Fl by
@@ -319,6 +333,18 @@ is no completion.
 .Xc
 Ask y/n on the status line and run command on y.
 The command that asks never waits for the answer, so -b changes nothing.
+.It Xo
+.Ic customize-mode
+.Op Fl NZ
+.Op Fl F Ar format
+.Op Fl f Ar filter
+.Op Fl t Ar target-pane
+.Xc
+Show the options of the server, of the session and of the window, the
+global hooks, the global and the session environment and every key table,
+one line per setting (C-b C). Enter edits the selected one on the status
+line, d or u puts its default back; the mode stays up. -F and -f change
+nothing.
 .It Xo
 .Ic copy-mode
 .Op Fl deHMqu
@@ -421,14 +447,15 @@ With -N keys are not looked at and the numbers stay up for the whole
 duration.
 .It Xo
 .Ic find-window Pq Ic findw
-.Op Fl CiNTZ
+.Op Fl CiNrTZ
 .Op Fl t Ar target-pane
 .Ar match-string
 .Xc
 Open tree mode with the windows that match
 .Ar match-string ,
 a shell pattern looked for in window names (-N), pane titles (-T) and
-visible pane contents (-C); all three by default. -i ignores case.
+visible pane contents (-C); all three by default. -r makes it a regular
+expression (the syntax of copy-mode search). -i ignores case.
 .It Xo
 .Ic has-session Pq Ic has
 .Op Fl t Ar target-session
@@ -502,6 +529,16 @@ Select the previously active pane of the window.
 .Xc
 Select the previously current window.
 .It Xo
+.Ic link-window Pq Ic linkw
+.Op Fl abdk
+.Op Fl s Ar src-window
+.Op Fl t Ar dst-window
+.Xc
+Link a window into another session (or at another index of the same):
+the same window, shown in both. -a, -b and -k as for
+.Ic move-window ;
+-d does not select it.
+.It Xo
 .Ic list-buffers Pq Ic lsb
 .Op Fl F Ar format
 .Op Fl f Ar filter
@@ -571,6 +608,49 @@ attached terminals' clipboard (OSC 52) unless
 .Ic set-clipboard
 is off.
 .It Xo
+.Ic lock-client Pq Ic lockc
+.Op Fl t Ar target-client
+.Xc
+Lock a client: it restores its terminal and runs
+.Ic lock-command
+(with
+.Pa /bin/sh )
+on it, and comes back when that exits. The session's
+.Ic lock-after-time
+does the same for its idle clients.
+.It Xo
+.Ic lock-server Pq Ic lock
+.Xc
+Lock every attached client.
+.It Xo
+.Ic lock-session Pq Ic locks
+.Op Fl t Ar target-session
+.Xc
+Lock the clients attached to a session.
+.It Xo
+.Ic move-pane Pq Ic movep
+.Op Fl bdfhv
+.Op Fl DLRU
+.Op Fl P Ar position
+.Op Fl X Ar x
+.Op Fl Y Ar y
+.Op Fl z Ar depth
+.Op Fl s Ar src-pane
+.Op Fl t Ar dst-pane
+.Op Ar amount
+.Xc
+As
+.Ic join-pane ,
+or with -D, -L, -P, -R, -U, -X, -Y or -z move the floating pane
+.Ar dst-pane :
+down, left, right or up by
+.Ar amount
+(1), to a
+.Ar position
+(top-left, centre, bottom-right and the others of tmux; front, back,
+forward, backward), to a column or line (cells or N%), or to a depth (0 is
+the front).
+.It Xo
 .Ic move-window Pq Ic movew
 .Op Fl abdkr
 .Op Fl s Ar src-window
@@ -578,24 +658,47 @@ is off.
 .Xc
 Move a window to another index; -r renumbers the windows of a session.
 .It Xo
+.Ic new-pane Pq Ic newp
+.Op Fl bdLP
+.Op Fl c Ar start-directory
+.Op Fl e Ar environment
+.Op Fl F Ar format
+.Op Fl t Ar target-pane
+.Op Fl T Ar title
+.Op Fl x Ar width
+.Op Fl y Ar height
+.Op Fl X Ar x
+.Op Fl Y Ar y
+.Op Ar shell-command
+.Xc
+A floating pane, in a box over the tiled ones: -x and -y its size, -X and
+-Y its position, border included (cells or N%); by default half the window
+wide and a quarter high, cascaded from the top left. -L makes a split
+instead, as
+.Ic split-window .
+.It Xo
 .Ic new-session Pq Ic new
-.Op Fl ADdPX
+.Op Fl ADdEPX
 .Op Fl c Ar start-directory
 .Op Fl e Ar environment
 .Op Fl F Ar format
 .Op Fl n Ar window-name
 .Op Fl s Ar session-name
+.Op Fl t Ar group-target
 .Op Fl x Ar width
 .Op Fl y Ar height
 .Oo Ar shell-command Oo Ar argument Ar ... Oc Oc
 .Xc
 Create a session and attach to it unless -d is given. -A attaches if the
 session named with -s exists; then -D and -X act as attach-session's -d and
--x. -x and -y set the size of a detached session.
+-x. -x and -y set the size of a detached session. -t makes the session part
+of the target session's group: it shares the target's windows (no window
+name or command then).
 -e
 .Ar VARIABLE=value
 sets a variable for the session's first pane (it may be repeated).
--E is not supported (there is no update-environment option).
+-E does not copy the variables of update-environment from the client
+(neither does it for attach-session and switch-client).
 .It Xo
 .Ic new-window Pq Ic neww
 .Op Fl abdkPS
@@ -629,7 +732,7 @@ Paste a buffer into a pane. -p uses bracketed paste if the program asked for
 it, -d deletes the buffer, -r keeps line feeds, -s sets the separator.
 .It Xo
 .Ic pipe-pane Pq Ic pipep
-.Op Fl \&Oo
+.Op Fl \&IOo
 .Op Fl t Ar target-pane
 .Op Ar shell-command
 .Xc
@@ -639,6 +742,8 @@ input of
 (a format, run with
 .Pa /bin/sh ) ;
 without a command, stop.
+With -I what the command prints is typed into the pane instead (-I -O: both
+ways); it is read only while the pane's input queue (1 MiB) has room.
 A pane has one pipe: a new command replaces the old.
 With -o a pipe that is open is only closed, so one key can toggle it.
 At most 1 MiB waits for a command that reads slowly; output beyond that is
@@ -975,7 +1080,7 @@ Swap two panes, or with -U / -D the pane and its neighbour.
 Swap two windows.
 .It Xo
 .Ic switch-client Pq Ic switchc
-.Op Fl lnpZ
+.Op Fl ElnpZ
 .Op Fl c Ar target-client
 .Op Fl t Ar target-session
 .Op Fl T Ar key-table
@@ -984,6 +1089,13 @@ Switch the client to another session (-n next, -p previous, -l last), or set
 its key table with -T.
 Switching to another pane of a zoomed window unzooms it; with -Z the window
 stays zoomed on that pane.
+.It Xo
+.Ic unlink-window Pq Ic unlinkw
+.Op Fl k
+.Op Fl t Ar target-window
+.Xc
+Take a window out of a session; it stays in the others it is linked into.
+Its last place only with -k, which kills it.
 .It Xo
 .Ic unbind-key Pq Ic unbind
 .Op Fl anq
@@ -1006,16 +1118,8 @@ The other
 .Xr tmux 1
 commands are recognized and fail with
 .Dq unsupported command :
-.Ic customize-mode ,
-.Ic link-window ,
-.Ic lock-client ,
-.Ic lock-server ,
-.Ic lock-session ,
-.Ic move-pane ,
-.Ic new-pane ,
 .Ic server-access ,
-.Ic switch-mode ,
-.Ic unlink-window .
+.Ic switch-mode .
 .Sh KEY BINDINGS
 The default prefix table.
 Keys marked repeatable can be pressed again without the prefix within

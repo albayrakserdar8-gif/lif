@@ -42,6 +42,8 @@ pub(crate) const TTY_TOKEN: usize = 4 << 32;
 pub(crate) const PIPE_TOKEN: usize = 8 << 32;
 /// The stdin of a `pipe-pane` command, by pane.
 pub(crate) const PANE_PIPE_TOKEN: usize = 32 << 32;
+/// The output of a pane's `pipe-pane -I` command (pane id in the low bits).
+pub(crate) const PANE_PIPE_IN_TOKEN: usize = 64 << 32;
 /// The output of a shell command (`crate::job`).
 pub(crate) const JOB_TOKEN: usize = 16 << 32;
 
@@ -62,6 +64,9 @@ pub(crate) struct Rt {
     /// when each gets SIGKILL (`PANE_KILL_GRACE`). At most one entry per
     /// killed pane whose process is still alive.
     pub(crate) dying: Vec<(u32, std::time::Instant)>,
+    /// The pane last typed into and when its `ECHO_PAUSE` ends: until then
+    /// other panes with more to read wait.
+    pub(crate) echo_wait: Option<(PaneId, std::time::Instant)>,
     pub(crate) clients: BTreeMap<ClientId, ClientRt>,
     pub(crate) reaper: ChildReaper,
     pub(crate) socket: String,
@@ -121,6 +126,20 @@ pub(crate) struct Rt {
     pub(crate) next_popup: u32,
     /// Popups that closed, for the model: (job, exit status).
     pub(crate) popups_done: Vec<(u64, i32)>,
+    /// Jobs of `command-prompt`s that closed (without `-b` the commands
+    /// after one wait for it): see `PromptState::report_to`.
+    pub(crate) prompts_done: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+    /// `command-prompt -i` runs its command as it opens: these run after
+    /// the command that opened it.
+    pub(crate) prompt_runs: Vec<(ClientId, String)>,
+    /// Control clients just attached: their first lines are due.
+    pub(crate) control_attached: Vec<(ClientId, SessionId)>,
+    /// Some control client is connected: panes keep a copy of their output
+    /// for `%output`.
+    pub(crate) control_on: bool,
+    /// A control client's command is running: notifications wait for its
+    /// answer.
+    pub(crate) control_hold: bool,
     /// While a popup's program is spawned: the pane it was opened for,
     /// which is its `LIF_PANE`.
     popup_for: Option<PaneId>,
@@ -160,6 +179,7 @@ impl Rt {
             panes: HashMap::new(),
             pids: HashMap::new(),
             dying: Vec::new(),
+            echo_wait: None,
             clients: BTreeMap::new(),
             reaper,
             socket,
@@ -202,6 +222,11 @@ impl Rt {
             popups: Vec::new(),
             next_popup: 0,
             popups_done: Vec::new(),
+            prompts_done: Default::default(),
+            prompt_runs: Vec::new(),
+            control_attached: Vec::new(),
+            control_on: false,
+            control_hold: false,
             popup_for: None,
             pending_choose: Vec::new(),
             chooser_panes: Vec::new(),
@@ -334,7 +359,9 @@ impl Rt {
             return true;
         }
         if let Some(p) = self.panes.get_mut(&pane) {
-            p.note_input(Instant::now());
+            let now = Instant::now();
+            p.note_input(now);
+            self.echo_wait = Some((pane, now + crate::ECHO_PAUSE));
         }
         self.write_pane(pane, bytes)
     }
@@ -344,9 +371,22 @@ impl Rt {
     /// (the bytes for that go out before the message), no frame, other
     /// output or read touches it until `Rt::resume`.
     pub(crate) fn suspend(&mut self, id: ClientId) -> Result<(), String> {
+        self.give_up_terminal(id, lif_proto::Caps::SUSPEND, "suspend-client: this client cannot be suspended (it is an older lif)", ServerMsg::Suspended)
+    }
+
+    /// `lock-client` and the rest: as [`Rt::suspend`], but the client runs
+    /// `command` on its terminal instead of stopping, and then resumes.
+    pub(crate) fn lock(&mut self, id: ClientId, command: &str) -> Result<(), String> {
+        let msg = ServerMsg::Lock { command: command.to_string() };
+        self.give_up_terminal(id, lif_proto::Caps::LOCK, "lock-client: this client cannot be locked (it is an older lif)", msg)
+    }
+
+    /// Restore `id`'s terminal, stop touching it until `Rt::resume`, and
+    /// send `msg` (`Suspended` or `Lock`), which the client needs `cap` for.
+    fn give_up_terminal(&mut self, id: ClientId, cap: lif_proto::Caps, too_old: &str, msg: ServerMsg) -> Result<(), String> {
         let Some(c) = self.clients.get_mut(&id) else { return Err("no such client".into()) };
-        if !c.caps.contains(lif_proto::Caps::SUSPEND) {
-            return Err("suspend-client: this client cannot be suspended (it is an older lif)".into());
+        if !c.caps.contains(cap) {
+            return Err(too_old.into());
         }
         let Some(a) = c.att.as_mut() else { return Err("client is not attached".into()) };
         if a.suspended.is_none() {
@@ -361,9 +401,9 @@ impl Rt {
                 t.reading = false;
                 t.read_more = false;
             }
-            log!("client {id}: suspended");
+            log!("client {id}: terminal given up");
         }
-        c.send(&ServerMsg::Suspended);
+        c.send(&msg);
         self.flush_client(id);
         self.end_paste(id);
         Ok(())
@@ -402,6 +442,8 @@ impl Rt {
             lif_input::write_kitty_upgrade(&mut b);
         }
         a.suspended = None;
+        // Back from a lock (or a stop): idle time counts from now.
+        a.last_input = Instant::now();
         // draw_client sends the mouse mode again.
         a.mouse = (false, false);
         a.renderer.invalidate();
@@ -603,6 +645,8 @@ impl Rt {
             paste: None,
             paste_dropping: false,
             suspended: None,
+            floating: Vec::new(),
+            last_input: Instant::now(),
             clip_reads: Default::default(),
             theme: lif_render::Theme::default(),
             msg_style: crate::prompt::message_style(),
@@ -618,6 +662,15 @@ impl Rt {
             att.message = Some(Message { line: vec![Span::new(text, att.msg_style)], expires: None });
         }
         c.send(&ServerMsg::Attached);
+        if c.control.is_some() {
+            // No terminal to set up or draw on: the protocol text only.
+            att.needs_frame = false;
+            c.att = Some(att);
+            self.session_env.insert(session, hello.env.clone());
+            self.control_attached.push((client, session));
+            self.flush_client(client);
+            return;
+        }
         if c.caps.contains(lif_proto::Caps::TTY) {
             // Nothing reaches the terminal before the client put it in raw
             // mode and said which one it is (UseTty).
@@ -674,6 +727,10 @@ fn exit_message(reason: &DetachReason) -> (ExitReason, String) {
 impl Host for Rt {
     fn suspend_client(&mut self, client: ClientId) -> Result<(), String> {
         self.suspend(client)
+    }
+
+    fn lock_client(&mut self, client: ClientId, command: &str) -> Result<(), String> {
+        self.lock(client, command)
     }
 
     fn command_stdin(&mut self) -> Option<Vec<u8>> {
@@ -932,10 +989,10 @@ impl Host for Rt {
         self.mark_all(true);
     }
 
-    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str) -> Result<(), String> {
+    fn pipe_pane(&mut self, pane: PaneId, command: Option<&str>, cwd: &str, input: bool, output: bool) -> Result<(), String> {
         let Some(p) = self.panes.get_mut(&pane) else { return Err(format!("can't find pane: {pane}")) };
         if let Some(mut old) = p.pipe.take() {
-            let _ = self.registry.deregister(&mut old.tx);
+            old.deregister(&self.registry);
             log!("pipe-pane: pane {pane}: pid {} closed, {} bytes not piped", old.pid, old.dropped);
         }
         let Some(command) = command else { return Ok(()) };
@@ -946,12 +1003,15 @@ impl Host for Rt {
             }
         }
         let dir = (!cwd.is_empty()).then(|| std::path::Path::new(cwd));
-        let mut pipe = crate::pipe::spawn_pane_pipe(command, dir).map_err(|e| format!("{command}: {e}"))?;
+        let mut pipe = crate::pipe::spawn_pane_pipe(command, dir, input, output).map_err(|e| format!("{command}: {e}"))?;
         self.reaper.watch(pipe.pid);
         // Edge-triggered: an event comes when a full pipe has room again.
-        self.registry
-            .register(&mut pipe.tx, Token(PANE_PIPE_TOKEN | pane.0 as usize), Interest::WRITABLE)
-            .map_err(|e| format!("{command}: {e}"))?;
+        if let Some(tx) = pipe.tx.as_mut() {
+            self.registry.register(tx, Token(PANE_PIPE_TOKEN | pane.0 as usize), Interest::WRITABLE).map_err(|e| format!("{command}: {e}"))?;
+        }
+        if let Some(rx) = pipe.rx.as_mut() {
+            self.registry.register(rx, Token(PANE_PIPE_IN_TOKEN | pane.0 as usize), Interest::READABLE).map_err(|e| format!("{command}: {e}"))?;
+        }
         log!("pipe-pane: pane {pane}: pid {}: {command}", pipe.pid);
         if let Some(p) = self.panes.get_mut(&pane) {
             p.pipe = Some(pipe);
@@ -988,7 +1048,7 @@ impl Host for Rt {
         log!("pane {pane} killed");
         // Its pipe-pane command sees the end of its input.
         if let Some(mut pipe) = p.pipe.take() {
-            let _ = self.registry.deregister(&mut pipe.tx);
+            pipe.deregister(&self.registry);
         }
         if let Some(pty) = p.pty.take() {
             let fd = std::os::fd::AsRawFd::as_raw_fd(&pty);
@@ -1167,6 +1227,9 @@ impl Host for Rt {
             }
             c.disarm_panic();
         }
+        if c.control.is_some() {
+            c.send_control(b"%exit\n", true);
+        }
         c.send(&ServerMsg::Exit { reason: why, message });
         c.closing = true;
         log!("client {client} detached: {why:?}");
@@ -1248,9 +1311,19 @@ impl Host for Rt {
     }
 
     fn prompt(&mut self, client: ClientId, prompt: Prompt) {
+        let mut p = PromptState::new(prompt);
+        // Dropped without a client to show it: its job is reported at once.
+        p.report_to(&self.prompts_done);
         let Some(a) = self.clients.get_mut(&client).and_then(|c| c.att.as_mut()) else { return };
-        a.prompt = Some(PromptState::new(prompt));
+        if let Some(run) = p.initial_run() {
+            self.prompt_runs.push((client, run));
+        }
+        a.prompt = Some(p);
         a.needs_frame = true;
+    }
+
+    fn client_env(&self, client: ClientId) -> Vec<(String, String)> {
+        self.clients.get(&client).map(|c| c.update_env.clone()).unwrap_or_default()
     }
 
     fn display_panes(&mut self, client: ClientId, duration_ms: u64, template: &str, keys: bool) {
