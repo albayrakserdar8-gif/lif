@@ -249,5 +249,8 @@ fix, what is not fixed, and measured cost. See `issues/0001-*` as the model.
 ## Git
 
 - Do not commit, push or amend unless the user asks explicitly.
+- When asked to commit and push, commit on `main` and push to
+  `origin/main`. Do not create a feature branch or a pull request unless
+  the user asks for one.
 - The working tree often has uncommitted work from other sessions; do not
   revert or reformat files you were not asked to touch.
