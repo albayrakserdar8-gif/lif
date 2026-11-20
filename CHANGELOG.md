@@ -2,6 +2,14 @@
 
 ## 0.5.0 (unreleased)
 
+- Security: a program could run lif commands (and through `run-shell`,
+  shell commands) by setting its pane's title (OSC 0/2) to something like
+  `a"; run-shell "..."`: prefix `T` offers the title in a prompt, and
+  Enter put it back into `select-pane -T "%%"` unescaped. The default
+  prompts that offer a name for editing (prefix `$`, `,`, `T` and Rename
+  in the window and session menus) now use `%%%`, which escapes the
+  answer. Bindings of your own that pass `#T` or another format through
+  `command-prompt -I` need the same change.
 - Fixed: an exiting server kept its socket until its panes had died (up
   to 500 ms), so a client arriving meanwhile had its connection dropped.
   The socket now goes first, and a new server starts as soon as the old

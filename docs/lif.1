@@ -315,6 +315,9 @@ set how it looks.
 .Xc
 Open the command prompt on the status line, optionally with a template in
 which %% or %1 is replaced by the answer.
+%%% (or %1%) inserts it with ", \e, $, ; and ~ escaped, which keeps an answer
+inside double quotes one argument; the default rename and title prompts use
+it, since a program can set its pane's title.
 Without -b the commands after it wait until the prompt closes.
 -i runs the template whenever the text changes, with %% as =text (+text
 for C-s, -text for C-r), and once with = as it opens; Enter and Escape only
@@ -1135,7 +1138,7 @@ split-window
 .It Li #
 list-buffers
 .It Li $
-command-prompt -I "#S" { rename-session "%%" }
+command-prompt -I "#S" { rename-session "%%%" }
 .It Li %
 split-window -h
 .It Li &
@@ -1147,7 +1150,7 @@ switch-client -p
 .It Li \&)
 switch-client -n
 .It Li \&,
-command-prompt -I "#W" { rename-window "%%" }
+command-prompt -I "#W" { rename-window "%%%" }
 .It Li -
 delete-buffer
 .It Li \&.
@@ -1185,7 +1188,7 @@ switch-client -l
 .It Li M
 select-pane -M
 .It Li T
-command-prompt -I "#T" { select-pane -T "%%" }
+command-prompt -I "#T" { select-pane -T "%%%" }
 .It Li \&[
 copy-mode
 .It Li \&]

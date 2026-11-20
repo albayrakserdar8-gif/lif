@@ -202,6 +202,12 @@ tmux, for example `lif split-window -h -t work:1.0 -c ~/src` or
   `client-attached`, `client-detached`, `client-session-changed`,
   `client-resized`, `pane-exited`, `pane-died`, `alert-bell` and
   `alert-activity`.
+- **The rename and title prompts escape what they are given.** Prefix `$`,
+  `,` and `T` (and Rename in the two menus) open a prompt holding the
+  current name, and a program sets its pane's title itself. Their templates
+  use `%%%` where tmux's have `%%`, so a title such as
+  `a"; run-shell "..."` becomes the title again when Enter is pressed and
+  is not run as commands.
 - **The mouse inside copy mode is built in.** Mouse keys are bound in the
   root table as in tmux, but the copy-mode tables have no mouse entries:
   what a click, a drag or the wheel does once a pane is in copy mode is

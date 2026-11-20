@@ -90,6 +90,23 @@ fn windows_status_line_rename_and_zoom() {
     t.wait_for("unzoomed", secs(10), |t| t.screen().contains('│'));
 }
 
+// A program sets its pane's title (OSC 2); the prompts that offer a name for
+// editing must put it back as one argument, never as more commands.
+#[test]
+fn pane_title_in_the_title_prompt_is_not_a_command() {
+    let env = Env::new();
+    let mut t = attach_new(&env, "ti", Size::new(80, 24));
+    let title = "a\"; set -g @owned \"yes";
+    t.type_str("printf '\\033]2;a\"; set -g @owned \"yes\\007'\r");
+    let shown = |env: &Env, f: &str| env.ok(&["display-message", "-p", "-t", "ti:", f]);
+    assert!(env.wait(secs(10), || shown(&env, "#{pane_title}").trim_end() == title), "{}", shown(&env, "#{pane_title}"));
+    t.write(b"\x02T");
+    t.wait_text("(select-pane)");
+    t.write(b"\r");
+    t.wait_for("prompt closed", secs(10), |t| t.lines()[23].starts_with("[ti]"));
+    assert_eq!(shown(&env, "#{@owned}|#{pane_title}"), format!("|{title}\n"));
+}
+
 #[test]
 fn command_prompt_runs_commands() {
     let env = Env::new();

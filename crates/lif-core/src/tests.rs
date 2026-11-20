@@ -951,9 +951,14 @@ fn keys_bindings_and_prompts() {
             assert_eq!(prompts, &vec!["(rename-window) ".to_string()]);
             assert_eq!(inputs, &vec!["zsh".to_string()]);
             let cmd = expand_prompt_template(template, &["code"]);
-            assert_eq!(cmd, "rename-window \"%%\"".replace("%%", "code"));
+            assert_eq!(cmd, "rename-window \"code\"");
+            // A name is one argument whatever it holds, never more commands.
+            let hostile = "a\"; set -g @owned \"yes\\ $HOME ~ b;";
+            let hostile_cmd = expand_prompt_template(template, &[hostile]);
             t.ok(&cmd);
             assert_eq!(t.ok("display -p '#W'"), "code\n");
+            t.ok(&hostile_cmd);
+            assert_eq!(t.ok("display -p '#W|#{@owned}'"), format!("{hostile}|\n"));
         }
         other => panic!("{other:?}"),
     }

@@ -146,8 +146,12 @@ behaves (or something lif does not have):
 
 ## Default prefix key table
 
-Prefix `C-b` in both. 73 bindings are identical, 9 differ (6 only in
-form, plus `?` and the two menus, which leave out what lif lacks), and 11
+Prefix `C-b` in both. 70 bindings are identical, 12 differ (6 only in
+form; `$`, `,` and `T`, whose prompts put the answer back escaped,
+`%%%` where tmux has `%%`, so that a name or a pane title holding `"` or
+`;` stays one argument and is never run as commands; plus `?` and the two
+menus, which leave out what lif lacks, and whose Rename entries use `%%%`
+too), and 11
 tmux bindings have no lif equivalent (they use
 commands or flags lif lacks). The mouse keys of the root table are listed
 under [Mouse](#mouse). Long tmux
@@ -160,14 +164,14 @@ commands are cut at 70 characters.
 | `!` | `break-pane` | `break-pane` | same |
 | `"` | `split-window` | `split-window` | same |
 | `#` | `list-buffers` | `list-buffers` | same |
-| `$` | `command-prompt -I "#S" { rename-session "%%" }` | `command-prompt -I "#S" { rename-session "%%" }` | same |
+| `$` | `command-prompt -I "#S" { rename-session "%%" }` | `command-prompt -I "#S" { rename-session "%%%" }` | different |
 | `%` | `split-window -h` | `split-window -h` | same |
 | `&` | `confirm-before -p "kill-window #W? (y/n)" kill-window` | `confirm-before -p "kill-window #W? (y/n)" kill-window` | same |
 | `'` | `command-prompt -p index { select-window -t ":%%" }` | `command-prompt -p index { select-window -t ":%%" }` | same |
 | `(` | `switch-client -p` | `switch-client -p` | same |
 | `)` | `switch-client -n` | `switch-client -n` | same |
 | `*` | `new-pane` |  | missing in lif |
-| `,` | `command-prompt -I "#W" { rename-window "%%" }` | `command-prompt -I "#W" { rename-window "%%" }` | same |
+| `,` | `command-prompt -I "#W" { rename-window "%%" }` | `command-prompt -I "#W" { rename-window "%%%" }` | different |
 | `-` | `delete-buffer` | `delete-buffer` | same |
 | `.` | `command-prompt { move-window -t "%%" }` | `command-prompt { move-window -t "%%" }` | same |
 | `/` | `command-prompt -k -p key { list-keys -1N "%%" }` | `command-prompt -k -p key { list-keys -1N "%%" }` | same |
@@ -193,7 +197,7 @@ commands are cut at 70 characters.
 | `E` | `select-layout -E` | `select-layout -E` | same |
 | `L` | `switch-client -l` | `switch-client -l` | same |
 | `M` | `select-pane -M` | `select-pane -M` | same |
-| `T` | `command-prompt -I "#T" { select-pane -T "%%" }` | `command-prompt -I "#T" { select-pane -T "%%" }` | same |
+| `T` | `command-prompt -I "#T" { select-pane -T "%%" }` | `command-prompt -I "#T" { select-pane -T "%%%" }` | different |
 | `[` | `copy-mode` | `copy-mode` | same |
 | `]` | `paste-buffer -p` | `paste-buffer -p` | same |
 | `c` | `new-window` | `new-window` | same |
